@@ -535,7 +535,8 @@ pub fn store_and_inject(
 ///
 /// Injection into the env file happens last, outside the lock: if it fails the task is
 /// already answered and the value already stored, so a re-run of `need` hits and injects
-/// rather than asking the human again.
+/// rather than asking the human again. It writes what the stash holds when the env file's
+/// lock is taken, which is a newer store's value if one committed in the meantime.
 #[allow(clippy::too_many_arguments)]
 fn store_and_inject_gated(
     ctx: &Ctx,
@@ -582,10 +583,15 @@ fn store_and_inject_gated(
         }
         Err(e) => return Err(rollback_store(ctx, e)),
     }
+    // Another store may have committed a newer value since this one did, and written it
+    // here already. Reading the stash under the env file's lock, as `need::deliver` does,
+    // keeps this write from putting the older value back.
     let injected_to = if project.is_dir() {
-        let p = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
-        ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
-        Some(p)
+        let p = crate::envfile::write_with(project, &ctx.cfg.env_file, name, || ctx.stash.get(&stash_key(name, identity)))?;
+        if p.is_some() {
+            ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
+        }
+        p
     } else {
         None
     };

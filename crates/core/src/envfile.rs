@@ -80,6 +80,20 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
     crate::fsutil::with_lock_elsewhere(&target, move || upsert(project, env_file, name, value, path))
 }
 
+/// [`write`], with the value chosen while the env file's lock is held. `value` returns what
+/// to write, or `None` to leave the file alone. A delivery and a store of the same key both
+/// read the stash in here, so whichever writes last writes what the stash holds then, never
+/// a value it read before another process stored a newer one.
+pub fn write_with(project: &Path, env_file: &str, name: &str, value: impl FnOnce() -> Result<Option<SecretString>>) -> Result<Option<PathBuf>> {
+    let env_file = &normalize(env_file)?;
+    let path = resolve(project, env_file)?;
+    let target = path.clone();
+    crate::fsutil::with_lock_elsewhere(&target, move || match value()? {
+        Some(v) => upsert(project, env_file, name, &v, path).map(Some),
+        None => Ok(None),
+    })
+}
+
 fn upsert(project: &Path, env_file: &str, name: &str, value: &SecretString, path: PathBuf) -> Result<PathBuf> {
     if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to write a secret through it", path.display());

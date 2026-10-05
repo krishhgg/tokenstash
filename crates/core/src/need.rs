@@ -8,7 +8,7 @@ use crate::db::GRANT_PASTE;
 use crate::registry;
 use crate::validate::Liveness;
 use anyhow::{Context, Result};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -535,8 +535,9 @@ pub enum Delivery {
     /// The provider rejected the stored value just now. It is marked stale; the caller files
     /// the replacement card. Nothing was written.
     Rejected { reason: String },
-    /// An on-disk delivery found the stash value changed under it: the directory never held
-    /// the new value, so nothing was written; the caller treats it as a first delivery.
+    /// The stash value changed under a delivery whose grant does not cover the new one (an
+    /// on-disk match, or a broad grant and a sensitive value). Nothing was written; the
+    /// caller treats it as a first delivery.
     NotDelivered,
 }
 
@@ -545,8 +546,6 @@ enum AtUse {
     Verified,
     Unverified,
     Rejected(String),
-    /// The stash changed under the probe: deliver what is stored now, unverified.
-    Changed(SecretString),
 }
 
 /// Hand a stash value to a project. Every path that writes a stored key into an env file
@@ -563,31 +562,47 @@ pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
             return Ok(Delivery::Rejected { reason: m.stale_reason.unwrap_or_else(|| "the stored key was marked stale".into()) });
         }
     }
-    let mut current = value.clone();
     let unverified = match verify_at_use(ctx, project, agent, name, identity, value, budget)? {
         AtUse::Rejected(reason) => return Ok(Delivery::Rejected { reason }),
-        AtUse::Changed(v) => {
-            // The replacement may itself have been marked stale in the meantime.
-            if let Some(m) = ctx.db.get_secret(name, identity)? {
-                if m.stale {
-                    return Ok(Delivery::Rejected { reason: m.stale_reason.unwrap_or_else(|| "the stored key was marked stale".into()) });
-                }
-            }
-            // On-disk equivalence proved the directory held the OLD value; it says nothing
-            // about the new one.
-            if grant == crate::db::GRANT_ON_DISK {
-                return Ok(Delivery::NotDelivered);
-            }
-            current = v;
-            true
-        }
         AtUse::Unverified => true,
         AtUse::NotDue | AtUse::Verified => false,
     };
-    let path = crate::envfile::write(project, &ctx.cfg.env_file, name, &current)?;
+    // The value written is read from the stash under the env file's lock, not taken from the
+    // caller, who read it some time ago. A store writes this file under the same lock after
+    // its COMMIT and reads the stash there too, so whichever write comes last writes what the
+    // stash holds then. Without this, a delivery that read A could write A over the B a
+    // human had just stored and written, and report success.
+    let mut refused = None;
+    let mut changed = false;
+    let written = crate::envfile::write_with(project, &ctx.cfg.env_file, name, || {
+        let Some(now) = ctx.stash.get(&stash_key(name, identity))? else {
+            anyhow::bail!("{name}@{identity} was removed from the stash while it was being delivered; nothing was written");
+        };
+        if now.expose_secret() == value.expose_secret() {
+            return Ok(Some(now));
+        }
+        // Stored since the caller read it. The new value may itself be stale by now.
+        if let Some(m) = ctx.db.get_secret(name, identity)? {
+            if m.stale {
+                refused = Some(Delivery::Rejected { reason: m.stale_reason.unwrap_or_else(|| "the stored key was marked stale".into()) });
+                return Ok(None);
+            }
+        }
+        // On-disk equivalence proved the directory held the OLD value; it says nothing about
+        // the new one. A broad grant covers the name only while the value is not sensitive,
+        // and a live-mode key can replace a test-mode one.
+        if grant == crate::db::GRANT_ON_DISK || (grant == crate::db::GRANT_BROAD && registry::is_sensitive(registry::lookup(name), &now)?) {
+            refused = Some(Delivery::NotDelivered);
+            return Ok(None);
+        }
+        changed = true;
+        Ok(Some(now))
+    })?;
+    let Some(path) = written else { return Ok(refused.unwrap_or(Delivery::NotDelivered)) };
     ctx.db.touch_secret(name, identity)?;
     ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), note, grant)?;
-    Ok(Delivery::Injected { path, unverified })
+    // A value that changed under the delivery was not the one probed.
+    Ok(Delivery::Injected { path, unverified: unverified || changed })
 }
 
 /// Re-check a stored key with its provider before delivering it, when due.
@@ -641,9 +656,9 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
     let Some(verdict) = verdict else { return Ok(AtUse::NotDue) };
     let pid = project.to_string_lossy().to_string();
     // Another process may have replaced the value while the probe was in flight (the human
-    // answered a card): a verdict about the old value says nothing about the new one, and
-    // the old one must not be written over the new. The comparison and the update share
-    // one index write lock, so a store cannot land between them.
+    // answered a card): a verdict about the old value says nothing about the new one. The
+    // comparison and the update share one index write lock, so a store cannot land between
+    // them.
     let applied = tasks::if_still_stored(ctx, name, identity, Some(value), || match &verdict {
         Liveness::Ok => {
             ctx.db.set_verified(name, identity)?;
@@ -665,13 +680,9 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
             Ok(AtUse::Unverified)
         }
     })?;
-    match applied {
-        Some(at_use) => Ok(at_use),
-        None => match ctx.stash.get(&stash_key(name, identity))? {
-            Some(v) => Ok(AtUse::Changed(v)),
-            None => Ok(AtUse::Unverified),
-        },
-    }
+    // A dropped verdict leaves the new value unchecked; `deliver` writes it, read again
+    // under the env file's lock.
+    Ok(applied.unwrap_or(AtUse::Unverified))
 }
 
 /// The stash holds a value the project may have, but it is stale: regenerate a generated

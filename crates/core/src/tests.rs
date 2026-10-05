@@ -1621,6 +1621,64 @@ fn an_at_use_verdict_and_its_comparison_share_one_lock() {
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
+/// `need` read A from the stash. Before it writes the env file, the human stores B and B is
+/// written there. The delivery then writes what the stash holds under the env file's lock,
+/// so it cannot put A back over B and report success.
+#[test]
+fn a_delivery_never_writes_an_older_value_over_a_newer_store() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("deliver-older");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let human_db = Db::open(&home.join("t.db")).unwrap();
+    let human_stash = stash::open(&cfg).unwrap();
+    let human = tasks::Ctx { cfg: &cfg, db: &human_db, stash: human_stash.as_ref(), probe: tasks::Probe::Off };
+    let new_value = SecretString::from("sk-new-bbbbbbbbbbbbbbbbbbbbb".to_string());
+    let stash = GetHookStash {
+        inner: stash::open(&cfg).unwrap(),
+        armed: std::cell::Cell::new(false),
+        hook: || { tasks::store_and_inject(&human, "OPENAI_API_KEY", "default", &new_value, None, None, false, &proj, "human", None, tasks::Verified::Unknown, db::GRANT_PASTE).unwrap(); },
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+    seed(&db, &stash, &proj, "OPENAI_API_KEY", "sk-old-aaaaaaaaaaaaaaaaaaaaa", None);
+    // The hook runs right after `need` reads the stash.
+    stash.armed.set(true);
+    let out = need::need(&ctx, &proj, "agent", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let written = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert!(written.contains("sk-new-") && !written.contains("sk-old-"), "the env file holds what the stash holds: {written}");
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: true, .. }), "a value the caller did not read is delivered unverified: {out:?}");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// A broad grant covers a name only while its value is not sensitive. When a live-mode key
+/// replaces a test-mode one between the gate and the write, the broad grant does not
+/// deliver it, and the directory is asked instead.
+#[test]
+fn a_broad_delivery_does_not_write_a_sensitive_value_stored_under_it() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("deliver-broad");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let human_stash = stash::open(&cfg).unwrap();
+    let key = stash::stash_key("CLERK_SECRET_KEY", "default");
+    // A human's store has written a live-mode key to the stash and not yet committed its
+    // index row, so the gate still reads the test-mode key's record.
+    let stash = GetHookStash {
+        inner: stash::open(&cfg).unwrap(),
+        armed: std::cell::Cell::new(false),
+        hook: || human_stash.set(&key, &SecretString::from("sk_live_bbbbbbbbbbbbbbbbbbbbb".to_string())).unwrap(),
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+    stash.set(&key, &SecretString::from("sk_test_aaaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+    let ws = db.workspace_for(&proj).unwrap();
+    db.grant(&ws.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    stash.armed.set(true);
+    let out = need::need(&ctx, &proj, "agent", &["CLERK_SECRET_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Pending { .. }), "{out:?}");
+    assert!(!envfile::has(&proj, ".env.local", "CLERK_SECRET_KEY"), "nothing is written here");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
 /// A report's probe takes seconds. When the human stores a new value meanwhile, the verdict
 /// about the old one changes nothing: a 401 does not mark the new value stale (which would
 /// file a Replace card for it), and an Ok does not clear a flag the new value earned.
