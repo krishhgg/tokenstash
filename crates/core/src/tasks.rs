@@ -592,6 +592,33 @@ fn store_and_inject_gated(
     Ok(injected_to)
 }
 
+/// Run `apply` under the index write lock, but only if the stash still holds `probed` for
+/// this key. Returns `None`, with nothing applied, when it holds something else. A probe
+/// takes seconds and runs outside any lock, so a human can store a new value while it is in
+/// flight. A 401 for the old value must not mark the new one stale, and an Ok must not
+/// clear a flag the new one earned. [`store_and_inject_gated`] writes the stash under this
+/// same lock, so no store can land between the comparison here and `apply`.
+pub fn if_still_stored<T>(ctx: &Ctx, name: &str, identity: &str, probed: Option<&SecretString>, apply: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    if !ctx.db.conn.is_autocommit() {
+        bail!("if_still_stored called inside a transaction");
+    }
+    ctx.db.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
+    let applied = (|| -> Result<Option<T>> {
+        let now = ctx.stash.get(&stash_key(name, identity))?;
+        if now.as_ref().map(|v| v.expose_secret()) != probed.map(|v| v.expose_secret()) {
+            return Ok(None);
+        }
+        apply().map(Some)
+    })();
+    match applied {
+        Ok(v) => match ctx.db.conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(v),
+            Err(e) => Err(rollback_store(ctx, anyhow!(e).context("recording the probe verdict"))),
+        },
+        Err(e) => Err(rollback_store(ctx, e)),
+    }
+}
+
 /// Restore autocommit after any failure in the raw `BEGIN IMMEDIATE` transaction. SQLite
 /// leaves a transaction active after some COMMIT failures (notably deferred constraints),
 /// so the COMMIT error path must explicitly roll back just like a statement error does.
@@ -973,7 +1000,10 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
         _ => None,
     };
     let date = crate::now();
-    match verdict {
+    // The verdict is about the value read above. If a human stored another one while the
+    // probe ran, it says nothing about that one. No flag changes, and the audit row left
+    // behind is not one the cooldown counts against reports about the new value.
+    let applied = if_still_stored(ctx, name, identity, value.as_ref(), || match verdict {
         Some(Liveness::Ok) => {
             ctx.db.set_verified(name, identity)?;
             ctx.db.audit(Some(&pid), Some(agent), "false_report", Some(name), Some(identity), Some(&detail))?;
@@ -1000,5 +1030,12 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
             Ok(ReportOutcome::MarkedStale)
         }
         None => Ok(ReportOutcome::Ignored),
+    })?;
+    match applied {
+        Some(outcome) => Ok(outcome),
+        None => {
+            ctx.db.audit(Some(&pid), Some(agent), "report.superseded", Some(name), Some(identity), Some(&format!("{detail}; the stored value changed while the report was checked")))?;
+            Ok(ReportOutcome::Ignored)
+        }
     }
 }

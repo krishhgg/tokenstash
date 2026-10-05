@@ -8,7 +8,7 @@ use crate::db::GRANT_PASTE;
 use crate::registry;
 use crate::validate::Liveness;
 use anyhow::{Context, Result};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -639,16 +639,12 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
     let verdict = ctx.probe.run(check, value, timeout);
     budget.spent += started.elapsed();
     let Some(verdict) = verdict else { return Ok(AtUse::NotDue) };
+    let pid = project.to_string_lossy().to_string();
     // Another process may have replaced the value while the probe was in flight (the human
     // answered a card): a verdict about the old value says nothing about the new one, and
-    // the old one must not be written over the new.
-    match ctx.stash.get(&stash_key(name, identity))? {
-        Some(v) if v.expose_secret() == value.expose_secret() => {}
-        Some(v) => return Ok(AtUse::Changed(v)),
-        None => return Ok(AtUse::Unverified),
-    }
-    let pid = project.to_string_lossy().to_string();
-    match verdict {
+    // the old one must not be written over the new. The comparison and the update share
+    // one index write lock, so a store cannot land between them.
+    let applied = tasks::if_still_stored(ctx, name, identity, Some(value), || match &verdict {
         Liveness::Ok => {
             ctx.db.set_verified(name, identity)?;
             ctx.db.set_next_probe(name, identity, &rfc3339(chrono::Utc::now() + PROBE_FLOOR))?;
@@ -668,6 +664,13 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
             ctx.db.set_next_probe(name, identity, &rfc3339(chrono::Utc::now() + wait))?;
             Ok(AtUse::Unverified)
         }
+    })?;
+    match applied {
+        Some(at_use) => Ok(at_use),
+        None => match ctx.stash.get(&stash_key(name, identity))? {
+            Some(v) => Ok(AtUse::Changed(v)),
+            None => Ok(AtUse::Unverified),
+        },
     }
 }
 

@@ -466,6 +466,7 @@ pub fn sweep_pairs(app: &App, pairs: &[(String, String)], print: bool) -> Result
 }
 
 fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
+    let ctx = app.ctx();
     let mut rows = vec![];
     for m in app.db.list_secrets()? {
         if !select(&m) { continue; }
@@ -477,7 +478,10 @@ fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> b
             rows.push((m.name.clone(), m.identity.clone(), "not in stash".to_string(), m.stale));
             continue;
         };
-        let status = match tokenstash_core::validate::liveness(&check, &v, tokenstash_core::validate::TIMEOUT_HUMAN) {
+        let verdict = tokenstash_core::validate::liveness(&check, &v, tokenstash_core::validate::TIMEOUT_HUMAN);
+        // Recorded only if the stash still holds the value just probed. A key pasted while
+        // the request was out is not judged by its predecessor's answer.
+        let status = tokenstash_core::tasks::if_still_stored(&ctx, &m.name, &m.identity, Some(&v), || Ok(match verdict {
             tokenstash_core::validate::Liveness::Ok => { app.db.set_verified(&m.name, &m.identity)?; "ok".to_string() }
             tokenstash_core::validate::Liveness::Rejected(code) => {
                 let reason = format!("rejected by the provider (HTTP {code}) on {} during a check", tokenstash_core::now());
@@ -486,7 +490,7 @@ fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> b
                 format!("REJECTED (HTTP {code}) → stale")
             }
             tokenstash_core::validate::Liveness::Unknown(e) => format!("unknown ({})", e.chars().take(40).collect::<String>()),
-        };
+        }))?.unwrap_or_else(|| "replaced during the check; not judged".to_string());
         let stale_now = app.db.get_secret(&m.name, &m.identity)?.map(|x| x.stale).unwrap_or(false);
         rows.push((m.name.clone(), m.identity.clone(), status, stale_now));
         std::thread::sleep(std::time::Duration::from_millis(200));

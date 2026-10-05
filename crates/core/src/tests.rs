@@ -98,6 +98,28 @@ impl<F: Fn() -> anyhow::Result<()>> stash::Stash for HookStash<F> {
     }
 }
 
+/// A real stash with a hook that runs once, on the first `get` after `armed` is set and
+/// after that read. Tests use it to make another process act at the moment a caller has
+/// read a value but not yet acted on it.
+struct GetHookStash<F> {
+    inner: Box<dyn stash::Stash>,
+    armed: std::cell::Cell<bool>,
+    hook: F,
+}
+
+impl<F: Fn()> stash::Stash for GetHookStash<F> {
+    fn backend(&self) -> &'static str { "get-hook" }
+    fn get(&self, key: &str) -> anyhow::Result<Option<SecretString>> {
+        let v = self.inner.get(key)?;
+        if self.armed.replace(false) {
+            (self.hook)();
+        }
+        Ok(v)
+    }
+    fn set(&self, key: &str, value: &SecretString) -> anyhow::Result<()> { self.inner.set(key, value) }
+    fn delete(&self, key: &str) -> anyhow::Result<bool> { self.inner.delete(key) }
+}
+
 #[test]
 fn registry_is_sane() {
     assert!(registry::count() >= 40);
@@ -1560,6 +1582,84 @@ fn a_verdict_for_a_value_no_longer_stored_is_discarded() {
     let written = std::fs::read_to_string(proj.join(".env.local")).unwrap();
     assert!(written.contains("sk-new-"), "the value stored now is what lands, not the one probed: {written}");
     assert!(!written.contains("sk-old-"));
+}
+
+/// Verify-on-use compares the stash with the probed value and applies the verdict under one
+/// index write lock. A store that tries to land between the two waits for it, so the 401
+/// is recorded against the value it was about and never against the new one.
+#[test]
+fn an_at_use_verdict_and_its_comparison_share_one_lock() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("at-use-lock");
+    let cfg = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let human_db = Db::open(&home.join("t.db")).unwrap();
+    human_db.conn.busy_timeout(std::time::Duration::from_millis(10)).unwrap();
+    let human_stash = stash::open(&cfg).unwrap();
+    let human = tasks::Ctx { cfg: &cfg, db: &human_db, stash: human_stash.as_ref(), probe: tasks::Probe::Off };
+    let new_value = SecretString::from("sk-new-bbbbbbbbbbbbbbbbbbbbb".to_string());
+    let store_new = || tasks::store_and_inject(&human, "OPENAI_API_KEY", "default", &new_value, None, None, false, &proj, "human", None, tasks::Verified::Unknown, db::GRANT_PASTE);
+    // The human stores a new value just after verify-on-use reads the stash back.
+    let attempt = std::cell::RefCell::new(None::<String>);
+    let stash = GetHookStash {
+        inner: stash::open(&cfg).unwrap(),
+        armed: std::cell::Cell::new(false),
+        hook: || *attempt.borrow_mut() = Some(match store_new() { Ok(_) => "stored".into(), Err(e) => format!("{e:#}") }),
+    };
+    let stub = |_: &registry::Check| { stash.armed.set(true); validate::Liveness::Rejected(401) };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Stub(&stub) };
+    seed(&db, &stash, &proj, "OPENAI_API_KEY", "sk-old-aaaaaaaaaaaaaaaaaaaaa", None);
+    let out = need::need(&ctx, &proj, "agent", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let attempt = attempt.borrow().clone().expect("the hook ran");
+    assert!(attempt.contains("locked"), "a store landed between the comparison and the verdict: {attempt}");
+    // The 401 was about the value still stored, so it stands.
+    assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale);
+    assert!(matches!(out[0], need::Outcome::Pending { .. }), "{out:?}");
+    // The call released the lock, so the human's store goes through now and is not stale.
+    store_new().unwrap();
+    assert!(!db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale);
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// A report's probe takes seconds. When the human stores a new value meanwhile, the verdict
+/// about the old one changes nothing: a 401 does not mark the new value stale (which would
+/// file a Replace card for it), and an Ok does not clear a flag the new value earned.
+#[test]
+fn a_report_verdict_for_a_replaced_value_changes_nothing() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("report-race");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let human_db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let human = tasks::Ctx { cfg: &cfg, db: &human_db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let store = |v: &str| {
+        tasks::store_and_inject(&human, "OPENAI_API_KEY", "default", &SecretString::from(v.to_string()), None, None, false, &proj, "human", None, tasks::Verified::Unknown, db::GRANT_PASTE).unwrap();
+    };
+    store("sk-old-aaaaaaaaaaaaaaaaaaaaa");
+
+    // The provider's 401 for the old value comes back after the human stored a new one.
+    let rejecting = |_: &registry::Check| { store("sk-new-bbbbbbbbbbbbbbbbbbbbb"); validate::Liveness::Rejected(401) };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&rejecting) };
+    assert_eq!(tasks::report_bad(&ctx, &proj, "agent", "OPENAI_API_KEY", "default", Some(401)).unwrap(), tasks::ReportOutcome::Ignored);
+    assert!(!db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale, "the old value's 401 must not mark the new value stale");
+    assert!(db.recent_audit(5).unwrap().iter().any(|r| r.3 == "report.superseded"));
+    let off = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let out = need::need(&off, &proj, "agent", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }), "no Replace card for the new value: {out:?}");
+
+    // The provider's Ok for that value comes back after a third one was stored and found dead.
+    let accepting = |_: &registry::Check| {
+        store("sk-third-ccccccccccccccccccc");
+        human_db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected by OpenAI (HTTP 401)"), Some(db::STALE_PROBE)).unwrap();
+        validate::Liveness::Ok
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&accepting) };
+    assert_eq!(tasks::report_bad(&ctx, &proj, "agent", "OPENAI_API_KEY", "default", Some(401)).unwrap(), tasks::ReportOutcome::Ignored);
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    assert!(m.stale, "the old value's Ok must not clear the new value's stale flag");
+    assert!(m.last_verified.is_none());
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 #[test]
