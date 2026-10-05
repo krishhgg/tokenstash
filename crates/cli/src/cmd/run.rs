@@ -153,6 +153,12 @@ fn should_redact_inherited(name: &str, value: &str) -> bool {
     if BENIGN_ENV.contains(&u.as_str()) || u.starts_with("LC_") || u.starts_with("XDG_") || u.starts_with("TOKENSTASH_") {
         return false;
     }
+    // An exported shell function (`export -f`, RHEL's `which`, Lmod's `module`) is a
+    // multi-line value of code. The redactor masks each line of a multi-line value, and lines
+    // like `return 0;` would be masked in every compiler error the child prints.
+    if u.starts_with("BASH_FUNC_") {
+        return false;
+    }
     // Redaction replaces the value wherever it appears as a substring, so a variable whose
     // value is an existing DIRECTORY (HOMEBREW_PREFIX=/opt/homebrew, JAVA_HOME, ...) would
     // garble every longer path that starts with it (PATH itself). A secret is never an

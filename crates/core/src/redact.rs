@@ -20,10 +20,24 @@ impl Redactor {
         self.add(v);
         self
     }
+    /// Register `v`, and also each line of it when it spans several. `run` redacts a child's
+    /// output one line at a time, so a printed PEM key or service-account JSON never shows the
+    /// whole value to a single `redact` call. Each line is trimmed and kept if it is at least
+    /// as long as the shortest secret the stash accepts and is not PEM armor.
     pub fn add(&mut self, v: &SecretString) {
         let s = v.expose_secret();
-        if !s.is_empty() {
-            self.values.push(s.to_string());
+        if s.is_empty() {
+            return;
+        }
+        // The whole value first, so text that holds all of it becomes one `[redacted]`.
+        self.values.push(s.to_string());
+        if !s.contains(['\n', '\r']) {
+            return;
+        }
+        for line in s.split(['\n', '\r']).map(str::trim) {
+            if line.chars().count() >= crate::tasks::MIN_SECRET_CHARS && !is_pem_armor(line) {
+                self.values.push(line.to_string());
+            }
         }
     }
     pub fn redact(&self, text: &str) -> String {
@@ -40,6 +54,12 @@ impl Redactor {
         }
         out
     }
+}
+
+/// `-----BEGIN PRIVATE KEY-----` and its END line are the same in every key. Left readable,
+/// they show where a masked key was printed.
+fn is_pem_armor(line: &str) -> bool {
+    (line.starts_with("-----BEGIN ") || line.starts_with("-----END ")) && line.ends_with("-----")
 }
 
 /// Replace `v` only where it is not glued to other alphanumerics.

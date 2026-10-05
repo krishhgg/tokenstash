@@ -254,6 +254,33 @@ fn redactor_handles_short_values_and_unicode() {
 }
 
 #[test]
+fn redactor_masks_each_line_of_a_multiline_value() {
+    // `run` redacts the child's output one line at a time, and no single line of a printed
+    // PEM key holds the whole value.
+    let body: Vec<String> = (0..3).map(|i| format!("MIIfake{i}").repeat(8)).collect();
+    for sep in ["\n", "\r\n"] {
+        let pem = format!("-----BEGIN PRIVATE KEY-----{sep}{}{sep}-----END PRIVATE KEY-----{sep}", body.join(sep));
+        let r = redact::Redactor::new().with(&SecretString::from(pem.clone()));
+        for line in &body {
+            assert_eq!(r.redact(line), "[redacted]", "{sep:?}");
+        }
+        // `echo $KEY` unquoted joins the lines with spaces
+        assert_eq!(r.redact(&body.join(" ")), "[redacted] [redacted] [redacted]", "{sep:?}");
+        // the armor is not secret and stays readable
+        assert_eq!(r.redact("-----BEGIN PRIVATE KEY-----"), "-----BEGIN PRIVATE KEY-----");
+        assert_eq!(r.redact("-----END PRIVATE KEY-----"), "-----END PRIVATE KEY-----");
+        // the whole value is still one match
+        assert_eq!(r.redact(&format!("key: {pem}")), "key: [redacted]");
+    }
+    // Indentation is not part of a line's pattern, and lines shorter than a stored secret
+    // can be (JSON braces) are not patterns at all.
+    let json = "{\n  \"private_key_id\": \"0123456789abcdef\",\n  \"type\": \"x\"\n}";
+    let r = redact::Redactor::new().with(&SecretString::from(json.to_string()));
+    assert_eq!(r.redact("\"private_key_id\": \"0123456789abcdef\","), "[redacted]");
+    assert_eq!(r.redact("{ } x"), "{ } x");
+}
+
+#[test]
 fn envfile_round_trips_adversarial_values() {
     let dir = tmp("envfile-rt");
     let cases = [
