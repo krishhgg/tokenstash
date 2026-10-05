@@ -451,7 +451,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     }
                     _ => (None, String::new()),
                 };
-                v["next"] = json!(crate::guide::next(o, &env_file, task.as_ref(), &card, crate::guide::Recheck::Mcp, &waited_note));
+                v["next"] = json!(crate::guide::next(o, &env_file, task.as_ref(), &card, crate::guide::Recheck::Mcp, &waited_note, &app.cfg));
                 out_results.push(v);
             }
             let summary = crate::guide::summary(&results, crate::guide::Recheck::Mcp);

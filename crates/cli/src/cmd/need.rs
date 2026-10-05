@@ -143,7 +143,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
             }
             _ => (None, String::new()),
         };
-        let next = crate::guide::next(o, &env_file, task.as_ref(), &card, crate::guide::Recheck::Cli, "");
+        let next = crate::guide::next(o, &env_file, task.as_ref(), &card, crate::guide::Recheck::Cli, "", &app.cfg);
         v["next"] = serde_json::json!(next);
         results.push((v, next));
     }

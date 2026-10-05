@@ -50,7 +50,7 @@ use secrecy::SecretString;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokenstash_core::db::{Task, TaskKind, TaskStatus};
@@ -117,9 +117,12 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
         }
     };
     eprintln!("tokenstash inbox → http://127.0.0.1:{port}/");
-    let requests = spawn_readers(listener);
+    let (req_tx, requests) = mpsc::sync_channel::<Request>(READERS);
+    spawn_readers(listener, false, req_tx.clone());
+    let mut tailnet_bound = false;
     let mut last_activity = Instant::now();
     loop {
+        listen_tailnet(port, &mut tailnet_bound, &req_tx);
         match requests.recv_timeout(Duration::from_secs(1)) {
             Ok(req) => {
                 last_activity = Instant::now();
@@ -166,9 +169,29 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
         };
     }
 
-    // Defence in depth against DNS rebinding: a hostname that resolves to 127.0.0.1 carries
-    // the attacker's origin (so none of our cookies), but there is no reason to serve it.
-    if !host_is_loopback(&req) {
+    // A request over the tailnet is answered only while remote access is on, only for this
+    // machine's tailnet name (the DNS-rebinding defence below, for that listener), and only
+    // from this machine or from another device signed in as the owner. Tailscale names the
+    // login behind every tailnet address, and nothing on this machine can send from another
+    // device, so the owner's other devices are the person.
+    let mut person_device = false;
+    if req.tailnet {
+        let cfg = tokenstash_core::Config::load().unwrap_or_else(|_| app.cfg.clone());
+        if cfg.remote != tokenstash_core::config::Remote::Tailscale || !host_is_one_of(&req, &[cfg.remote_host.as_deref(), cfg.remote_ip.as_deref()]) {
+            return not_found(req);
+        }
+        let peer = req.peer.map(|p| p.ip());
+        let own_machine = peer.is_some() && peer == cfg.remote_ip.as_deref().and_then(|i| i.parse().ok());
+        if !own_machine {
+            match (peer.and_then(crate::remote::whois), cfg.remote_login.as_deref()) {
+                (Some(login), Some(owner)) if login == owner => person_device = true,
+                _ => return not_found(req),
+            }
+        }
+    } else if !host_is_loopback(&req) {
+        // Defence in depth against DNS rebinding: a hostname that resolves to 127.0.0.1
+        // carries the attacker's origin (so none of our cookies), but there is no reason to
+        // serve it.
         return not_found(req);
     }
 
@@ -182,11 +205,32 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     // person opens its full route from the index, the notification or `tokenstash open`.
     let route = match Route::of(&path) { Some(r) => r, None => return not_found(req) };
     let lookup = |id: &str| app.db.get_task(id).ok().flatten();
-    let presented = cookie(&req, route.cookie_name());
-    // What the cookie proves, on this route: a session is Full; a capability is Task(id)
-    // only when it names the card this path names, verified against that card's row (fetched
-    // by exact id — never a prefix, so nothing resolves an id the caller half knows).
-    let scope = presented.as_deref().and_then(|c| tokens.scope_of(c, lookup)).filter(|s| route.admits(s));
+    // The person on another of their devices holds the full session on every route, as the
+    // desktop notification would give it to them. A GET is enough to read (nothing a GET
+    // does changes state) and sets the session cookie on the same response; a redirect would
+    // not do, since a browser withholds SameSite=Strict cookies on a navigation that started
+    // on another site (the chat the link was clicked in). A POST still needs that cookie and
+    // the matching hidden field, so a page open in the same browser cannot post an answer.
+    let mut req = req;
+    let (presented, scope) = if person_device {
+        req.set_cookie = Some(format!("{}={}; Path=/; HttpOnly; SameSite=Strict", inbox_auth::COOKIE, tokens.session()));
+        if method == "GET" && q.contains_key("t") {
+            // The agent's link carried a card credential the person does not need: drop it
+            // from the address bar, and land on the card's full route.
+            let dest = match &route { Route::Scoped(id) | Route::Full(id) => format!("/t/{id}"), Route::Index => "/".into() };
+            return redirect(req, &dest);
+        }
+        let session = tokens.session().to_string();
+        let held = method == "GET" || cookie(&req, inbox_auth::COOKIE).is_some_and(|c| inbox_auth::ct_eq(&c, &session));
+        (Some(session), held.then_some(Scope::Full))
+    } else {
+        let presented = cookie(&req, route.cookie_name());
+        // What the cookie proves, on this route: a session is Full; a capability is Task(id)
+        // only when it names the card this path names, verified against that card's row
+        // (fetched by exact id — never a prefix, so nothing resolves an id the caller half knows).
+        let scope = presented.as_deref().and_then(|c| tokens.scope_of(c, lookup)).filter(|s| route.admits(s));
+        (presented, scope)
+    };
     let cookie_ok = scope.is_some();
     // A body declared over the cap was refused by the reader before a byte of it was read, so
     // there is no form to authenticate with and nothing that could have been stored in part.
@@ -264,6 +308,12 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
         // or a full login in another tab leaves it where it is.
         (Route::Scoped(id), Scope::Task(own)) if id == own => match app.db.get_task(own)? {
             Some(t) => (t, Actor::Requester, format!("/p/{own}")),
+            None => return not_found(req),
+        },
+        // The person on another of their devices, on the agent's link: the card itself, with
+        // their full authority, by the exact id in the path.
+        (Route::Scoped(id), Scope::Full) if person_device => match app.db.get_task(id)? {
+            Some(t) => (t, Actor::Human, "/".to_string()),
             None => return not_found(req),
         },
         _ => return not_found(req),
@@ -440,6 +490,13 @@ fn cookie(req: &Request, name: &'static str) -> Option<String> {
     })
 }
 
+/// The Host header names one of `hosts` (any port).
+fn host_is_one_of(req: &Request, hosts: &[Option<&str>]) -> bool {
+    let Some(v) = header(req, "Host") else { return false };
+    let host = v.rsplit_once(':').map(|(h, port)| if port.bytes().all(|b| b.is_ascii_digit()) { h } else { v }).unwrap_or(v);
+    hosts.iter().flatten().any(|h| h.eq_ignore_ascii_case(host))
+}
+
 fn host_is_loopback(req: &Request) -> bool {
     let Some(v) = header(req, "Host") else { return false };
     let host = match v.strip_prefix('[') {
@@ -520,6 +577,13 @@ struct Request {
     /// The declared `Content-Length` was over [`MAX_BODY`]; none of the body was read.
     oversized: bool,
     stream: Option<TcpStream>,
+    /// Who connected.
+    peer: Option<std::net::SocketAddr>,
+    /// It came in on the Tailscale listener, not loopback.
+    tailnet: bool,
+    /// A cookie every response to this request carries: the session, for the person on
+    /// another of their devices (see `handle`).
+    set_cookie: Option<String>,
 }
 
 /// A response: status, our headers, body. `Content-Length` and `Connection: close` are added
@@ -541,7 +605,10 @@ impl Reply {
 }
 
 impl Request {
-    fn respond(mut self, reply: Reply) -> Result<()> {
+    fn respond(mut self, mut reply: Reply) -> Result<()> {
+        if let Some(c) = self.set_cookie.take() {
+            reply = reply.with("Set-Cookie", c);
+        }
         let mut stream = self.stream.take().expect("a request is answered once");
         let head_only = self.method == "HEAD";
         let written = write_reply(&mut stream, &reply, head_only, Instant::now() + RESPONSE_DEADLINE);
@@ -609,20 +676,21 @@ fn reason(code: u16) -> &'static str {
 
 /// Accept connections and read complete requests off them on threads of their own, so the
 /// main thread only ever sees whole requests. Returns the receiving end of that hand-off.
-fn spawn_readers(listener: TcpListener) -> Receiver<Request> {
+/// Readers for one listener, all handing complete requests to `req_tx`. `tailnet` marks the
+/// requests from the Tailscale listener.
+fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<Request>) {
     // A rendezvous: the acceptor hands a connection over only when a reader is free to take
     // it; until then new connections wait in the kernel's listen backlog. No queue of our
     // own, so nothing here grows with the number of clients.
     let (conn_tx, conn_rx) = mpsc::sync_channel::<TcpStream>(0);
     let conn_rx = Arc::new(Mutex::new(conn_rx));
-    let (req_tx, req_rx) = mpsc::sync_channel::<Request>(READERS);
     for _ in 0..READERS {
         let conn_rx = Arc::clone(&conn_rx);
         let req_tx = req_tx.clone();
         std::thread::spawn(move || loop {
             let next = conn_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
             let Ok(stream) = next else { return };
-            if let Some(req) = read_request(stream) {
+            if let Some(req) = read_request(stream, tailnet) {
                 if req_tx.send(req).is_err() {
                     return;
                 }
@@ -641,7 +709,29 @@ fn spawn_readers(listener: TcpListener) -> Receiver<Request> {
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
     });
-    req_rx
+}
+
+/// Listen on this machine's Tailscale address too, when remote access is on and nothing
+/// listens there yet. Checked at start and once a second, so `tokenstash remote tailscale`
+/// takes effect in a running inbox. Turning it off needs no unbinding: every tailnet request
+/// is checked against the setting as it is then.
+fn listen_tailnet(port: u16, bound: &mut bool, req_tx: &mpsc::SyncSender<Request>) {
+    if *bound {
+        return;
+    }
+    let Ok(cfg) = tokenstash_core::Config::load() else { return };
+    if cfg.remote != tokenstash_core::config::Remote::Tailscale {
+        return;
+    }
+    let Some(ip) = cfg.remote_ip.as_deref().and_then(|i| i.parse::<std::net::IpAddr>().ok()) else { return };
+    match TcpListener::bind((ip, port)) {
+        Ok(l) => {
+            eprintln!("tokenstash inbox → {}/ (Tailscale)", crate::remote::base_url(&cfg));
+            spawn_readers(l, true, req_tx.clone());
+            *bound = true;
+        }
+        Err(e) => eprintln!("inbox: cannot listen on {ip}:{port}: {e}"),
+    }
 }
 
 /// Why a request did not arrive.
@@ -657,7 +747,8 @@ enum Incomplete {
 /// Every wait for bytes is bounded by [`IO_TIMEOUT`] (the socket's read timeout) and checked
 /// against the whole-request deadline before the next, so a client that drips one byte per
 /// wait is cut off within `REQUEST_DEADLINE + IO_TIMEOUT`, like one that goes silent.
-fn read_request(mut stream: TcpStream) -> Option<Request> {
+fn read_request(mut stream: TcpStream, tailnet: bool) -> Option<Request> {
+    let peer = stream.peer_addr().ok();
     // A socket that cannot take a timeout is not one to read from.
     if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err() || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err() {
         return None;
@@ -705,7 +796,7 @@ fn read_request(mut stream: TcpStream) -> Option<Request> {
             }
         }
     }
-    Some(Request { method: head.method, url: head.url, headers: head.headers, body, oversized, stream: Some(stream) })
+    Some(Request { method: head.method, url: head.url, headers: head.headers, body, oversized, stream: Some(stream), peer, tailnet, set_cookie: None })
 }
 
 /// One read of up to `max` bytes appended to `buf`, or why there was none. Returns within
@@ -1186,7 +1277,7 @@ mod tests {
     fn the_reader_delivers_whole_bodies_and_refuses_oversized_ones_unread() {
         let (mut c, s) = pair();
         c.write_all(b"POST /t/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello").unwrap();
-        let reader = std::thread::spawn(move || read_request(s));
+        let reader = std::thread::spawn(move || read_request(s, false));
         std::thread::sleep(Duration::from_millis(100));
         c.write_all(b" world").unwrap();
         let req = reader.join().unwrap().expect("a request");
@@ -1203,7 +1294,7 @@ mod tests {
         let (mut c, s) = pair();
         c.write_all(format!("POST /t/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1).as_bytes()).unwrap();
         let started = Instant::now();
-        let req = read_request(s).expect("the head is fine; the body is refused, not awaited");
+        let req = read_request(s, false).expect("the head is fine; the body is refused, not awaited");
         assert!(req.oversized && req.body.is_empty());
         assert!(started.elapsed() < Duration::from_secs(1), "waited for a body it must not read: {:?}", started.elapsed());
 
@@ -1213,7 +1304,7 @@ mod tests {
             c.write_all(&vec![b'a'; MAX_BODY as usize]).unwrap();
             c
         });
-        let req = read_request(s).unwrap();
+        let req = read_request(s, false).unwrap();
         assert_eq!(req.body.len(), MAX_BODY as usize);
         assert!(!req.oversized);
         drop(writer.join().unwrap());
@@ -1224,7 +1315,7 @@ mod tests {
     fn a_request_dropped_unanswered_gets_a_bare_500() {
         let (mut c, s) = pair();
         c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-        drop(read_request(s).unwrap());
+        drop(read_request(s, false).unwrap());
         let mut out = String::new();
         c.read_to_string(&mut out).unwrap();
         assert_eq!(out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -1236,10 +1327,10 @@ mod tests {
         let (mut c, s) = pair();
         c.write_all(b"GET / HTTP/1.1\r\nHost: lo").unwrap();
         drop(c);
-        assert!(read_request(s).is_none());
+        assert!(read_request(s, false).is_none());
         let (mut c, s) = pair();
         c.write_all(b"PRI * HTTP/2.0\r\n\r\n").unwrap();
-        assert!(read_request(s).is_none());
+        assert!(read_request(s, false).is_none());
         let mut out = String::new();
         c.read_to_string(&mut out).unwrap();
         assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
@@ -1320,7 +1411,7 @@ mod tests {
         ] {
             let (mut c, s) = pair();
             c.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-            redirect_authed(read_request(s).unwrap(), to, name, cookie_path, "PLACEHOLDER").unwrap();
+            redirect_authed(read_request(s, false).unwrap(), to, name, cookie_path, "PLACEHOLDER").unwrap();
             let mut out = String::new();
             c.read_to_string(&mut out).unwrap();
             assert!(out.starts_with("HTTP/1.1 303 See Other\r\n"), "{out}");

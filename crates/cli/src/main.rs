@@ -4,6 +4,7 @@ mod cmd;
 mod guide;
 mod inbox_auth;
 mod notify;
+mod remote;
 mod util;
 
 use anyhow::Result;
@@ -62,6 +63,8 @@ enum Cmd {
     Inbox(cmd::inbox::InboxArgs),
     /// Open the inbox in your browser.
     Open,
+    /// Reach the inbox from another computer over Tailscale: `remote tailscale`, `remote off`, or no argument for the setting.
+    Remote(remote::RemoteArgs),
     /// Print the provider registry (names and signup URLs).
     Registry,
 }
@@ -119,6 +122,7 @@ fn run(cli: Cli) -> Result<i32> {
             println!("{url}");
             Ok(0)
         }
+        Cmd::Remote(a) => remote::remote(a),
         Cmd::Registry => {
             for p in tokenstash_core::registry::all() {
                 println!("{:<36} {:<22} {}{}", p.name, p.provider, p.url, if p.sensitive { "  [sensitive]" } else { "" });

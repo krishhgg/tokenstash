@@ -32,7 +32,8 @@ pub fn needs_full_session(task: Option<&Task>) -> bool {
 
 /// `card` is the agent's link to the card (or, with the inbox unavailable, the reason there
 /// is none); `task` is the card itself; `waited` is a note about time already spent waiting.
-pub fn next(o: &Outcome, env_file: &Path, task: Option<&Task>, card: &str, recheck: Recheck, waited: &str) -> String {
+/// `cfg` decides whether to add that the person may be on another computer.
+pub fn next(o: &Outcome, env_file: &Path, task: Option<&Task>, card: &str, recheck: Recheck, waited: &str, cfg: &tokenstash_core::Config) -> String {
     match o {
         Outcome::Injected { name, unverified, .. } => format!(
             "{name} is in {}. Load it with your runtime (dotenv, process.env, os.environ, or `tokenstash run -- <command>`); never read, print or quote that file.{}",
@@ -60,7 +61,8 @@ pub fn next(o: &Outcome, env_file: &Path, task: Option<&Task>, card: &str, reche
             } else {
                 format!("Show the user this link: {card}")
             };
-            format!("{why} ({task_id}).{waited} {link} Keep working on everything that does not need it, and {}. Do not wait in a loop, and {NO_STAND_IN}", recheck.later(task_id))
+            let elsewhere = if card.starts_with("http") { crate::remote::hint(cfg) } else { String::new() };
+            format!("{why} ({task_id}).{waited} {link}{elsewhere} Keep working on everything that does not need it, and {}. Do not wait in a loop, and {NO_STAND_IN}", recheck.later(task_id))
         }
         Outcome::Denied { name, .. } => format!("The user declined {name} for this project. Do not ask again, and {NO_STAND_IN} {INSTEAD}"),
         Outcome::Expired { name, .. } => format!("The request for {name} expired unanswered. Summarise what is blocked and stop; {NO_STAND_IN}"),
@@ -81,11 +83,11 @@ pub fn summary(outcomes: &[Outcome], recheck: Recheck) -> &'static str {
 }
 
 /// A card an agent filed for the person to confirm (`forget`, `bind`, `init --mode`, ...).
-pub fn confirm_next(task: &Task, card: &str) -> String {
+pub fn confirm_next(task: &Task, card: &str, cfg: &tokenstash_core::Config) -> String {
     let link = if !card.starts_with("http") {
         format!("The inbox is unavailable ({card}).")
     } else {
-        format!("Confirming takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}")
+        format!("Confirming takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg))
     };
     format!(
         "The user has been asked to confirm \"{}\" ({}). {link} Keep working, and check on card {} later with `tokenstash tasks --history`. If the user declines, leave it: do not ask again unless they tell you to.",
@@ -95,9 +97,9 @@ pub fn confirm_next(task: &Task, card: &str) -> String {
 
 /// A replacement the agent asked for (`rotate`): the key still works, so nothing is wrong
 /// with it as far as the agent can tell the person.
-pub fn rotation_next(name: &str, task: &Task, card: &str) -> String {
+pub fn rotation_next(name: &str, task: &Task, card: &str, cfg: &tokenstash_core::Config) -> String {
     let link = if card.starts_with("http") {
-        format!("Pasting it takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}")
+        format!("Pasting it takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg))
     } else {
         format!("The inbox is unavailable ({card}).")
     };

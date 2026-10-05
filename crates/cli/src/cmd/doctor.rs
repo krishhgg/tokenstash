@@ -53,6 +53,23 @@ pub fn doctor() -> Result<i32> {
         format!("{}  {}", crate::util::inbox_url_tty(&cfg, None, None, inbox, crate::util::Stream::Stdout), notify::describe(inbox)),
     );
 
+    match cfg.remote {
+        tokenstash_core::config::Remote::Off => {
+            check("remote access", true, match crate::remote::looks_remote() {
+                Some(why) => format!("off; {why}, so if you open links on another computer, `tokenstash remote tailscale` makes them open there"),
+                None => "off (links point at 127.0.0.1)".into(),
+            });
+        }
+        tokenstash_core::config::Remote::Tailscale => {
+            let base = crate::remote::base_url(&cfg);
+            let login = cfg.remote_login.clone().unwrap_or_default();
+            ok &= match crate::remote::status() {
+                Ok(net) if Some(net.ip.to_string()) == cfg.remote_ip => check("remote access", true, format!("tailscale: {base}/ opens as you on devices signed in as {login}")),
+                Ok(net) => check("remote access", false, format!("tailscale: this machine's address is now {}, not {}; run `tokenstash remote tailscale` again", net.ip, cfg.remote_ip.clone().unwrap_or_default())),
+                Err(e) => check("remote access", false, format!("tailscale: {e:#}")),
+            };
+        }
+    }
     check("agent mode", true, crate::cmd::init::describe_mode(cfg.agent_mode).into());
     check("mcp server", true, if cfg.mcp { "registered with each agent (`init --mcp`)".into() } else { "off: agents use the CLI (`init --mcp` to register it)".to_string() });
     let home = dirs::home_dir().unwrap_or_default();

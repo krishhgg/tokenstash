@@ -48,6 +48,34 @@ pub struct Config {
     /// default: agents run the CLI. Not written while off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mcp: bool,
+    /// Where the inbox can be reached besides 127.0.0.1 (`tokenstash remote tailscale`).
+    /// `tailscale`: it also listens on this machine's Tailscale address, every link uses
+    /// `remote_host`, and a request from another device logged into `remote_login` counts as
+    /// the person. Not written while off.
+    #[serde(default, skip_serializing_if = "Remote::is_off")]
+    pub remote: Remote,
+    /// The name links use: the MagicDNS name, or the Tailscale address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_host: Option<String>,
+    /// This machine's Tailscale address, where the inbox listens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ip: Option<String>,
+    /// The Tailscale login whose other devices count as the person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_login: Option<String>,
+}
+
+/// See [`Config::remote`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Remote {
+    #[default]
+    Off,
+    Tailscale,
+}
+
+impl Remote {
+    pub fn is_off(&self) -> bool { *self == Remote::Off }
 }
 
 /// See [`Config::agent_mode`].
@@ -150,6 +178,10 @@ impl Default for Config {
             verify_every: VerifyEvery::default(),
             agent_mode: AgentMode::Auto,
             mcp: false,
+            remote: Remote::Off,
+            remote_host: None,
+            remote_ip: None,
+            remote_login: None,
         }
     }
 }

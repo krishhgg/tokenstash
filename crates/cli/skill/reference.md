@@ -97,6 +97,10 @@ Runs COMMAND with the env file loaded into its environment. Its output reaches y
 
 Checks the setup, one line each: config file, stash backend (and how long keys last in it), database, provider registry, inbox, agent mode, the skill and any MCP registration per agent, this directory (refused, paired, or not yet), and the binary path. Exit 0 when nothing is wrong, 1 otherwise. Safe to run at any time.
 
+### `tokenstash remote [tailscale [--login LOGIN] | off]`
+
+Whether the inbox can be reached from the user's other computers. With no argument, prints the setting. `tailscale`: the inbox also listens on this machine's Tailscale address, every link and notification uses that address, and a request from another device signed in to the owner's Tailscale account (`--login`, or the account this machine is signed in with) counts as the user, so it can approve. Nothing else on the tailnet gets an answer. A running inbox picks the change up within a second; links printed before still point at 127.0.0.1. `off`: back to 127.0.0.1 only. You may run it when the user is on another computer; it needs `tailscale` connected here.
+
 ### `tokenstash registry`
 
 Lists the providers tokenstash knows: env var name, provider, signup URL, and `[sensitive]` for keys that ask in every folder.
@@ -159,6 +163,7 @@ The user never needs these: everything they decide happens on a card in the brow
 | `stash_backend` | chosen by `init` | `keyring` (OS keychain or Secret Service), `keyutils` (Linux kernel keyring), `insecure-file` (tests only) |
 | `agent_mode` | `auto` | `auto`: the skill loads by itself. `explicit`: only when the user invokes it |
 | `mcp` | `false` | Whether `init` registers the MCP server |
+| `remote` | off | `tailscale` once `tokenstash remote tailscale` ran; with `remote_host`, `remote_ip`, `remote_login` |
 
 ## Files and environment
 

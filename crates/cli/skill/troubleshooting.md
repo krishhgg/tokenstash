@@ -22,9 +22,10 @@ A few commands are the user's alone: they approve, show every directory, or move
 
 ## The user cannot open the link
 
-The inbox listens on `127.0.0.1` of the machine tokenstash runs on, so a link only opens in a browser on that machine.
+Unless remote access is on, the inbox listens on `127.0.0.1` of the machine tokenstash runs on, so a link only opens in a browser on that machine.
 
-- The user is on another computer (SSH, Tailscale, a remote dev box): they can forward the port with `ssh -L 7433:127.0.0.1:7433 <this-machine>` and open the link on their computer. Port `7433` is the default `inbox_port`.
+- The user is on another computer and both machines are on Tailscale: run `tokenstash remote tailscale`, then run the same `tokenstash need` again for a link with this machine's Tailscale name. On any device signed in to the same Tailscale account, that link opens as the user and can approve; nothing else on the tailnet gets in. `tokenstash remote` shows the setting, `tokenstash remote off` turns it off. On a tagged Tailscale node, the user names their login: `tokenstash remote tailscale --login them@example.com`.
+- No Tailscale: they can forward the port with `ssh -L 7433:127.0.0.1:7433 <this-machine>` and open the link on their computer. Port `7433` is the default `inbox_port`. Over the forwarded port the inbox cannot tell them from this machine, so an approval still needs their own link (the card's "Send the link to my desktop" button needs a desktop on this machine); `tokenstash remote tailscale` avoids that.
 - `next` says "The inbox is unavailable": the inbox could not start, or another process holds the port. `tokenstash doctor` shows which. Another tokenstash under a different `TOKENSTASH_HOME` is the usual culprit; the user can stop it or set another `inbox_port`.
 - The page says the link is old or invalid: the inbox restarted, which retires earlier full-session links. Card links from `need` keep working, and a card's "Send the link to my desktop" button sends a fresh full link.
 

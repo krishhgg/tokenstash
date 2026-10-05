@@ -150,6 +150,7 @@ Keys already written into projects' `.env.local` files stay there until you dele
 | `tokenstash workspaces [list\|revoke DIR\|forget DIR]` | Which folders are approved for which keys; take a folder's approvals away |
 | `tokenstash export` · `import BUNDLE` | Move your stash to another machine in a passphrase-encrypted bundle |
 | `tokenstash run -- COMMAND` | Run a program with `.env.local` loaded; see below |
+| `tokenstash remote [tailscale\|off]` | Open the inbox from your other devices over Tailscale |
 | `tokenstash init [--mode auto\|explicit] [--mcp] [--undo]` · `doctor` · `audit` · `registry` | Install or remove the agent skill, automatic or on your command only, and optionally the MCP server; check the setup; see every delivery; list known providers |
 | `tokenstash mcp` · `inbox` | The MCP server (after `init --mcp`) and the inbox (started for you) |
 
@@ -179,7 +180,9 @@ With `init --mcp`, agents that speak MCP also get six tools: `secrets_request`, 
 
 The project is the git checkout you're in, so in a monorepo `apps/web` and `apps/api` share one `.env.local` at the repo root. A folder that isn't a checkout is its own project.
 
-**Over SSH or in a container:** the inbox runs on the remote machine's localhost, so forward port 7433, or answer from the terminal with `tokenstash answer`. In a container without a keychain, set `TOKENSTASH_STASH=insecure-file` (plaintext) or run tokenstash on the host.
+**From another computer:** the inbox runs on the machine tokenstash runs on, at 127.0.0.1. If you reach that machine over Tailscale, `tokenstash remote tailscale` (your agent can run it) makes the inbox answer on its Tailscale address too, and every link point there; a link opened on any of your devices signed in to the same Tailscale account opens as you and can approve, and nothing else on the tailnet gets an answer. Without Tailscale, forward port 7433 over SSH.
+
+**In a container** without a keychain, set `TOKENSTASH_STASH=insecure-file` (plaintext) or run tokenstash on the host.
 
 </details>
 

@@ -26,7 +26,7 @@ pub fn print_pending(app: &App, project: &Path, agent: &str, t: &Task) -> Result
     }
     let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), state);
     println!("⏳ {} (card {})", t.title, t.id);
-    println!("  next: {}", crate::guide::confirm_next(t, &card));
+    println!("  next: {}", crate::guide::confirm_next(t, &card, &app.cfg));
     Ok(tokenstash_core::exit::PENDING)
 }
 

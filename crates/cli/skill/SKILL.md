@@ -49,7 +49,7 @@ A pending key has a card, and `next` says which kind:
 - **Approval.** The key is stored, but this folder has not received it before, or it is a sensitive key (live payment keys, cloud and deploy credentials, any key tokenstash does not recognise), which every folder asks for separately. The link you get shows the card but cannot approve it, so an agent can never approve its own request. The user approves from the link in the desktop notification; if they opened your link instead, the card has a button that sends that notification again.
 - **Replace.** The provider rejected the stored key. The user pastes a new one, and every folder that had the old key gets the new one.
 
-Tell the user in a sentence or two what the card is for and give the link. Then keep working. Check with `tokenstash tasks` (this project's open cards), or run the same `tokenstash need` again: it never files a second card or notifies twice. Use `--blocking --timeout 600` only when nothing else can proceed.
+Tell the user in a sentence or two what the card is for and give the link. Then keep working. If `next` says the user may be on another computer (an SSH login, a machine with no desktop), the link points at this machine's 127.0.0.1 and will not open there: ask them, and if so run `tokenstash remote tailscale` (when Tailscale is set up on both machines) and give them the new link. Check with `tokenstash tasks` (this project's open cards), or run the same `tokenstash need` again: it never files a second card or notifies twice. Use `--blocking --timeout 600` only when nothing else can proceed.
 
 ## Use the key
 
@@ -107,6 +107,6 @@ Each one files a card and exits 10. Nothing changes until the user confirms it f
 Run `tokenstash doctor` first. It checks the stash, the database, the inbox, the agent setup and this folder, and its last line names the binary in use. Then look up the symptom in `troubleshooting.md`, beside this file. Two common ones:
 
 - `... is for a person at a terminal, not an agent`: a few commands are the user's alone (`open`, approving with `answer`, `tasks --all`, `workspaces`, `export`, `import`). `troubleshooting.md` lists what to do instead.
-- The link does not open for the user: the inbox listens on this machine's localhost only. If the user is on another computer, see "The user cannot open the link" in `troubleshooting.md`.
+- The link does not open for the user: the inbox listens on this machine's localhost unless remote access is on. If the user is on another computer, see "The user cannot open the link" in `troubleshooting.md`.
 
 `reference.md`, beside this file, lists every command, flag, exit code, JSON field, setting and file location.

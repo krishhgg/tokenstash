@@ -111,7 +111,8 @@ impl Tokens {
         Ok(Self { session, cap_key, proof })
     }
 
-    #[cfg(test)]
+    /// The session itself. The inbox hands it, as a cookie, to the person on another of their
+    /// devices (remote access); nothing else outside this module reads it.
     pub fn session(&self) -> &str {
         &self.session
     }

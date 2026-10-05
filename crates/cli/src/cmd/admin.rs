@@ -365,7 +365,7 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
         let state = crate::notify::inbox_state(&app.cfg);
         let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), state);
         println!("⏳ {} replacement requested (card {})", a.name, t.id);
-        println!("  next: {}", crate::guide::rotation_next(&a.name, &t, &card));
+        println!("  next: {}", crate::guide::rotation_next(&a.name, &t, &card, &app.cfg));
         return Ok(tokenstash_core::exit::PENDING);
     }
     let project = util::project_from(&a.project);
