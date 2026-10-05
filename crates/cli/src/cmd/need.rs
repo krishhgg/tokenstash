@@ -100,7 +100,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
             "env_file": app.cfg.env_file,
             "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
             "results": results.iter().map(|(v, _)| v).collect::<Vec<_>>(),
-            "next": crate::guide::summary(pending, crate::guide::Recheck::Cli),
+            "next": crate::guide::summary(&outcomes, crate::guide::Recheck::Cli),
         }))?);
     } else {
         for (o, (_, next)) in outcomes.iter().zip(&results) {

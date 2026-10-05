@@ -67,11 +67,15 @@ pub fn next(o: &Outcome, env_file: &Path, task: Option<&Task>, card: &str, reche
     }
 }
 
-/// The summary line over several results.
-pub fn summary(any_pending: bool, recheck: Recheck) -> &'static str {
-    match (any_pending, recheck) {
-        (true, Recheck::Mcp) => "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, call task_check later.",
-        (true, Recheck::Cli) => "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, check later with `tokenstash tasks`.",
-        (false, _) => "Done — follow each result's `next`.",
+/// The summary line over several results. "Done" only when every key arrived: a declined or
+/// expired key is not done, and an agent reading the summary alone must not take it as such.
+pub fn summary(outcomes: &[Outcome], recheck: Recheck) -> &'static str {
+    let pending = outcomes.iter().any(|o| o.is_pending());
+    let missing = outcomes.iter().any(|o| matches!(o, Outcome::Denied { .. } | Outcome::Expired { .. }));
+    match (pending, missing, recheck) {
+        (true, _, Recheck::Mcp) => "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, call task_check later.",
+        (true, _, Recheck::Cli) => "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, check later with `tokenstash tasks`.",
+        (false, true, _) => "Not every key arrived: one or more were declined or expired. Follow each result's `next`; work that needs those keys is blocked.",
+        (false, false, _) => "Done — follow each result's `next`.",
     }
 }

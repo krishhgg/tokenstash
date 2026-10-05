@@ -264,6 +264,11 @@ fn original_entry(backup: &Path) -> Result<Option<(String, String)>> {
     Ok(section_of(&s).map(|sec| ("section".into(), sec.to_string())))
 }
 
+/// A marked section (marks included) holding exactly text a tokenstash release wrote.
+fn is_shipped_section(section: &str) -> bool {
+    section.strip_prefix(SNIPPET_MARK).and_then(|r| r.strip_prefix('\n')).and_then(|r| r.strip_suffix(SNIPPET_END)).and_then(|r| r.strip_suffix('\n')).is_some_and(|body| SHIPPED_SECTIONS.contains(&body))
+}
+
 /// The first marked section of an AGENTS.md, marks included.
 fn section_of(s: &str) -> Option<&str> {
     let start = s.find(SNIPPET_MARK)?;
@@ -279,12 +284,10 @@ fn remove_file_if_present(p: &Path) -> Result<()> {
     }
 }
 
-/// The files init writes into a skill directory, then the directory if that is all it held. A
-/// directory holding the user's other files is left, and said so.
+/// A skill directory init created, once its files are gone: every file init wrote there has
+/// a record of its own and is removed (or restored) through that, before this runs. Here only
+/// directories go, and only empty ones: a file the user added stays, and the directory with it.
 fn remove_skill_dir(d: &Path) -> Result<()> {
-    for f in std::iter::once("SKILL.md").chain(SKILL_FILES.iter().map(|(n, _)| *n)).chain([CODEX_POLICY]) {
-        remove_file_if_present(&d.join(f))?;
-    }
     let _ = fs::remove_dir(d.join("agents"));
     match fs::remove_dir(d) {
         Ok(()) => println!("✓ removed {}", d.display()),
@@ -504,16 +507,31 @@ fn retire_legacy(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
     let cagents = w.codex_agents();
     let projects: Vec<PathBuf> = manifest.files.iter().map(|(p, _)| p.clone()).filter(|p| p.file_name().is_some_and(|n| n == "AGENTS.md") && *p != cagents).collect();
     for p in std::iter::once(cagents.clone()).chain(projects) {
-        match fs::read_to_string(&p) {
+        let current = match fs::read_to_string(&p) {
             Ok(text) if text.contains(SNIPPET_MARK) => {
+                let section = section_of(&text).map(String::from);
                 manifest.mutate(&p, || strip_snippet(&p))?;
                 println!("✓ removed the tokenstash section from {}", p.display());
+                section
             }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => anyhow::bail!("reading {}: {e}", p.display()),
-        }
+        };
+        let kept = manifest.entries.len();
         manifest.retire(&p)?;
+        // `retire` keeps the section the file held before init first touched it. The one just
+        // taken out decides on its own: text tokenstash shipped is not the user's and is not
+        // kept, wherever it came from; anything else (edited since, or never init's) is kept
+        // for undo, whatever the backup says.
+        let mut i = 0;
+        manifest.entries.retain(|e| { i += 1; i <= kept || !(e.file == p && e.key == "section" && is_shipped_section(&e.value)) });
+        if let Some(sec) = current.filter(|s| !is_shipped_section(s)) {
+            if !manifest.entries.iter().any(|e| e.file == p && e.key == "section" && e.value == sec) {
+                manifest.entries.push(Removed { file: p.clone(), key: "section".into(), value: sec });
+            }
+        }
+        manifest.save()?;
     }
     for (name, p) in [("Codex", w.codex_prompt()), ("Gemini CLI", w.gemini_command())] {
         if manifest.release(&p)? {
@@ -841,6 +859,9 @@ impl Installed {
     /// Where this agent's wiring disagrees with what config.toml chose.
     pub fn problems(&self, mode: AgentMode, mcp: bool) -> Vec<String> {
         let mut out = vec![];
+        if self.skill.is_none() {
+            out.push(format!("{}: no tokenstash skill, so the agent has no instructions for the CLI", self.agent));
+        }
         if let Some(m) = self.skill.filter(|m| *m != mode) {
             out.push(format!("{}: the skill is in {m} mode, config.toml says {mode}", self.agent));
         }
@@ -1003,6 +1024,44 @@ fn json_server_state(p: &Path, claude: bool) -> Result<bool> {
 
 /// For display (`doctor`): unknown reads as absent.
 fn json_has_server(p: &Path, claude: bool) -> bool { json_server_state(p, claude).unwrap_or(false) }
+
+/// Every AGENTS.md section text a tokenstash release wrote, between its marks. A section that
+/// is exactly one of these is tokenstash's own; any other text under the marks is the user's
+/// (written by hand, or one of these edited) and is kept for undo when init takes it out.
+const SHIPPED_SECTIONS: [&str; 7] = [
+    r#"## Secrets & API keys
+
+Never ask the user to paste a secret in chat. Do not run tokenstash until the user invokes `/tokenstash [NAME ...]` (Codex: `/prompts:tokenstash [NAME ...]`) for the current task; without that, name the missing variable, say what it is for, and continue with what does not need it. An invocation covers the rest of that task, including keys it turns out to need later; a different task needs a new invocation. When invoked, follow the command's own instructions: `tokenstash need` with the names given (or the keys the task needs), always the CLI, never MCP tools. Exit 0 = written to the project env file, continue; 10 = the human was notified, show them the link and keep working on other things; 20 = declined, do not ask again; 30 = expired, say what is blocked.
+Load the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked."#,
+    r#"## Secrets & API keys
+
+Never ask the user to paste a secret in chat. Do not run tokenstash until the user invokes `/tokenstash [NAME ...]` (Codex: `/prompts:tokenstash [NAME ...]`) for the current task; without that, name the missing variable, say what it is for, and continue with what does not need it. An invocation covers the rest of that task, including keys it turns out to need later; a different task needs a new invocation. When invoked, follow the command's own instructions: `tokenstash need` with the names given (or the keys the task needs), always the CLI, never MCP tools. Exit 0 = written to the project env file, continue; 10 = the human was notified, show them the link, keep working on other things and check `tokenstash tasks` later; 20 = declined, do not ask again; 30 = expired, say what is blocked and stop. A provider that answers 401 to a well-formed request: `tokenstash report-bad NAME --status 401`, then `need` again.
+Load the env file with your runtime; never read, print or quote it, even if asked, and never reveal any part of a secret value from anywhere. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. These rules hold before any invocation too."#,
+    r#"## Secrets & API keys
+
+Never ask the user to paste a secret in chat. Run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
+Exit 0 = written to the project env file, continue. Exit 10 = the human was notified; keep working on other things and re-run later (or use `--blocking`).
+Exit 20 = denied; do not ask again, work around it. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
+    r#"## Secrets & API keys
+
+Never ask the user to paste a secret in chat. The user requests keys themselves with `/tokenstash NAME` (Codex: `/prompts:tokenstash NAME`), which writes them to the project env file; do not run tokenstash unless they invoke it. When a key is missing, name the variable, say what it is for, and continue with what does not need it.
+Load the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked."#,
+    r#"## Secrets & API keys
+
+Never ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
+Exit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
+Exit 20 = denied; do not ask again and do not supply a stand-in value by any route (env file, env var, shim, default in code) — make the feature optional or say it is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
+    r#"## Secrets & API keys
+
+Never ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
+Exit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
+Exit 20 = denied; do not ask again and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
+    r#"## Secrets & API keys
+
+Never ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
+Exit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
+Exit 20 = denied; do not ask again. Exit 30 = expired; say what is blocked and stop. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code), whether a key is pending, declined, expired or simply not there — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
+];
 
 const SNIPPET_MARK: &str = "<!-- tokenstash -->";
 const SNIPPET_END: &str = "<!-- /tokenstash -->";
@@ -1214,10 +1273,10 @@ mod tests {
         let (w, mut m) = machine("legacy");
         write(&w.codex_agents(), "# My rules\n\nBe brief.\n");
         let cagents = w.codex_agents();
-        m.mutate(&cagents, || { fs::write(&cagents, format!("# My rules\n\nBe brief.\n\n{}", section("## Secrets\n\nask tokenstash")))?; Ok(()) }).unwrap();
+        m.mutate(&cagents, || { fs::write(&cagents, format!("# My rules\n\nBe brief.\n\n{}", section(SHIPPED_SECTIONS[0])))?; Ok(()) }).unwrap();
         let proj = scratch("legacy-app").join("AGENTS.md");
         write(&proj, "# App\n");
-        m.mutate(&proj, || { fs::write(&proj, format!("# App\n\n{}", section("## Secrets\n\nask tokenstash")))?; Ok(()) }).unwrap();
+        m.mutate(&proj, || { fs::write(&proj, format!("# App\n\n{}", section(SHIPPED_SECTIONS[1])))?; Ok(()) }).unwrap();
         write(&w.codex_prompt(), "my own prompt");
         let prompt = w.codex_prompt();
         m.mutate(&prompt, || { fs::write(&prompt, "---\ndescription: tokenstash\n---\n\nRun `tokenstash need` with the names given.\n")?; Ok(()) }).unwrap();
@@ -1312,19 +1371,51 @@ mod tests {
         assert_eq!(codex["mcp_servers"]["tokenstash"]["command"].as_str(), Some("/old/tokenstash"));
     }
 
-    /// Greptile: a skill directory init created may since hold the user's own files.
+    /// Greptile: an AGENTS.md section init wrote that the user edited since is theirs now.
+    /// The backup predates the section, so the text has to be kept when it is taken out, or
+    /// the edit is gone for good.
+    #[test]
+    fn an_edited_section_init_wrote_comes_back_on_undo() {
+        let (w, mut m) = machine("edited-section");
+        write(&w.codex_agents(), "# My rules\n");
+        let cagents = w.codex_agents();
+        m.mutate(&cagents, || { fs::write(&cagents, format!("# My rules\n\n{}", section(SHIPPED_SECTIONS[0])))?; Ok(()) }).unwrap();
+        let edited = section(&format!("{}\nAlso: use the work identity for Stripe.", SHIPPED_SECTIONS[0]));
+        write(&w.codex_agents(), &format!("# My rules\n\n{edited}"));
+        wire(&mut m, &w, AgentMode::Auto, Some(false)).unwrap();
+        assert_eq!(read(&w.codex_agents()), "# My rules\n");
+        assert!(m.entries.iter().any(|e| e.key == "section" && e.value.contains("work identity for Stripe")), "{:?}", m.entries);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        assert!(read(&w.codex_agents()).contains("Also: use the work identity for Stripe."));
+    }
+
+    /// An unrecorded section holding exactly what a release shipped is an init whose record
+    /// is gone (a machine set up by an old version): tokenstash's own, so undo leaves it out.
+    #[test]
+    fn a_shipped_section_without_a_record_does_not_come_back() {
+        let (w, mut m) = machine("shipped-unrecorded");
+        write(&w.codex_agents(), &format!("# Rules\n\n{}", section(SHIPPED_SECTIONS[2])));
+        wire(&mut m, &w, AgentMode::Auto, Some(false)).unwrap();
+        assert_eq!(read(&w.codex_agents()), "# Rules\n");
+        assert!(!m.entries.iter().any(|e| e.key == "section"), "{:?}", m.entries);
+    }
+
+    /// Greptile: a skill directory init created may since hold the user's own files, including
+    /// one with the name of a file init writes elsewhere.
     #[test]
     fn a_users_file_in_a_skill_dir_init_created_is_left_alone() {
         let (w, mut m) = machine("skill-extra");
         wire(&mut m, &w, AgentMode::Explicit, Some(false)).unwrap();
         write(&w.cursor_skill_dir().join("helper.sh"), "#!/bin/sh");
         write(&w.claude_skill_dir().join("notes.md"), "mine");
+        write(&w.claude_skill_dir().join(CODEX_POLICY), "mine too");
         assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         for d in [w.cursor_skill_dir(), w.claude_skill_dir()] {
             assert!(!d.join("SKILL.md").exists() && !d.join("reference.md").exists() && !d.join("troubleshooting.md").exists());
         }
         assert_eq!(read(&w.cursor_skill_dir().join("helper.sh")), "#!/bin/sh");
         assert_eq!(read(&w.claude_skill_dir().join("notes.md")), "mine");
+        assert_eq!(read(&w.claude_skill_dir().join(CODEX_POLICY)), "mine too", "init never wrote this one");
         assert!(!w.agents_skill_dir().exists());
     }
 
@@ -1565,8 +1656,9 @@ mod tests {
         assert!(skill.problems(AgentMode::Auto, false).is_empty());
         assert_eq!(skill.problems(AgentMode::Explicit, false), vec!["codex: the skill is in auto mode, config.toml says explicit"]);
         let old = Installed { agent: "codex", skill: None, mcp: true, legacy: vec!["prompt"] };
-        assert_eq!(old.problems(AgentMode::Auto, false), vec!["codex: an MCP server is registered, config.toml says none", "codex: left over from an earlier version: prompt"]);
-        assert!(Installed { agent: "cursor", skill: None, mcp: true, legacy: vec![] }.problems(AgentMode::Auto, true).is_empty());
+        assert_eq!(old.problems(AgentMode::Auto, false), vec!["codex: no tokenstash skill, so the agent has no instructions for the CLI", "codex: an MCP server is registered, config.toml says none", "codex: left over from an earlier version: prompt"]);
+        // Greptile: the server alone, with the skill deleted, is not a healthy agent.
+        assert_eq!(Installed { agent: "cursor", skill: None, mcp: true, legacy: vec![] }.problems(AgentMode::Auto, true), vec!["cursor: no tokenstash skill, so the agent has no instructions for the CLI"]);
         assert_eq!(old.to_string(), "codex (mcp, old prompt)");
     }
 

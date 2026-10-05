@@ -454,12 +454,13 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                 v["next"] = json!(crate::guide::next(o, &env_file, task.as_ref(), &card, crate::guide::Recheck::Mcp, &waited_note));
                 out_results.push(v);
             }
+            let summary = crate::guide::summary(&results, crate::guide::Recheck::Mcp);
             let results = out_results;
             let mut top = json!({
                 "results": results,
                 "env_file": env_file,
                 "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
-                "next": crate::guide::summary(pending, crate::guide::Recheck::Mcp)
+                "next": summary
             });
             if blocking { top["waited_s"] = json!(waited); top["timed_out"] = json!(pending); }
             Ok((top, false))
