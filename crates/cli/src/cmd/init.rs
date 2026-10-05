@@ -429,7 +429,7 @@ fn backup_name(p: &Path) -> String {
 /// Replace `p` with `contents` in one step: written beside it, then renamed over it, keeping
 /// the file's permissions. A full disk or a crash leaves the old file, never half of a new
 /// one; `~/.claude.json` is also written by every running Claude Code session.
-fn write_file(p: &Path, contents: &str) -> Result<()> {
+fn write_file(p: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     use std::io::Write;
     // A config that is a link (dotfiles kept in a repository) is updated where it points, and
     // stays a link.
@@ -448,7 +448,7 @@ fn write_file(p: &Path, contents: &str) -> Result<()> {
         if let Ok(md) = fs::metadata(p) {
             f.set_permissions(md.permissions())?;
         }
-        f.write_all(contents.as_bytes())?;
+        f.write_all(contents.as_ref())?;
         f.sync_all()?;
         fs::rename(&tmp, p)?;
         Ok(())
@@ -459,10 +459,11 @@ fn write_file(p: &Path, contents: &str) -> Result<()> {
     written.map_err(|e| e.context(format!("writing {}", p.display())))
 }
 
-/// Put a backup back in place, atomically.
+/// Put a backup back in place, atomically and byte for byte: what init replaced need not be
+/// text.
 fn restore(backup: &Path, p: &Path) -> Result<()> {
-    let s = fs::read_to_string(backup).map_err(|e| anyhow::anyhow!("reading {}: {e}", backup.display()))?;
-    write_file(p, &s)
+    let bytes = fs::read(backup).map_err(|e| anyhow::anyhow!("reading {}: {e}", backup.display()))?;
+    write_file(p, bytes)
 }
 
 /// A file other tools and the person also write: an agent's config or an AGENTS.md. Undo
@@ -2080,5 +2081,17 @@ mod tests {
         assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert_eq!(read(&proj), edited, "the person's edit stays");
     }
-}
 
+    /// Greptile on #70: a file init replaced need not be text; undo puts the original bytes back.
+    #[test]
+    fn undo_restores_a_replaced_file_byte_for_byte() {
+        let (w, mut m) = machine("bytes");
+        let original = b"---\nname: mine\n---\n\xff\xfe not utf-8\n".to_vec();
+        fs::create_dir_all(w.claude_skill_dir()).unwrap();
+        fs::write(w.claude_skill_dir().join("SKILL.md"), &original).unwrap();
+        wire(&mut m, &w, AgentMode::Auto, Some(false)).unwrap();
+        assert_eq!(read(&w.claude_skill_dir().join("SKILL.md")), SKILL_MD);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        assert_eq!(fs::read(w.claude_skill_dir().join("SKILL.md")).unwrap(), original);
+    }
+}
