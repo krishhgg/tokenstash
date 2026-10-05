@@ -569,8 +569,9 @@ fn is_inits_shape(entry: &serde_json::Value) -> bool {
 ///   person changed since stays. An older record without `wrote` takes out only an entry
 ///   that has exactly the shape init writes;
 /// - an AGENTS.md section goes if it is text a release shipped; one the person edited stays;
-/// - what the backup held under that name comes back, where init's was taken out (for an
-///   AGENTS.md, each section it held that is not shipped text and is not there already);
+/// - what the backup held under that name comes back, where init's was taken out;
+/// - an AGENTS.md gets back each section its backup held that is not shipped text and is
+///   not there already, whether or not a shipped section was left to take out;
 /// - a file init created that holds nothing else is removed.
 ///
 /// A file that is gone is restored from its backup, as before.
@@ -592,10 +593,11 @@ fn undo_shared(p: &Path, backup: Option<&Path>, wrote: Option<serde_json::Value>
         // Only sections that are text a release shipped go; any other section (the person's
         // own, or one of ours they edited) stays exactly where it is.
         let mut s = strip_sections_where(&text, is_shipped_section)?;
-        if s != text {
-            for (_, value) in original.iter().filter(|(k, v)| k == "section" && !is_shipped_section(v)) {
-                if !s.contains(value.as_str()) { append_section(&mut s, value); }
-            }
+        // The backup's own sections come back even when there was no shipped section left to
+        // take out (the person removed it by hand). This record is dropped once undo is done,
+        // so it is the last chance to restore them.
+        for (_, value) in original.iter().filter(|(k, v)| k == "section" && !is_shipped_section(v)) {
+            if !s.contains(value.as_str()) { append_section(&mut s, value); }
         }
         s
     } else {
@@ -1189,7 +1191,9 @@ pub fn apply_choice(mode: Option<AgentMode>, mcp: Option<bool>) -> Result<()> {
 
 /// [`apply_choice`] on a given machine. The setting is saved first and the agents rewired
 /// after. If the rewiring fails, the card goes back to pending for another try or a decline,
-/// so the setting goes back too, and the skills return to the mode it names. A card the
+/// so the setting goes back too and the agents are rewired for it. The skills return to the
+/// mode it names, and when the card changed the MCP setting, the registrations follow the
+/// restored one (an entry the failed run already took out is registered again). A card the
 /// person then declines has not changed how agents reach tokenstash.
 fn apply_choice_with(manifest: &mut Manifest, w: &Wiring, mode: Option<AgentMode>, mcp: Option<bool>) -> Result<()> {
     check_skill_home(w.ts_home.as_deref())?;
@@ -1212,12 +1216,14 @@ fn apply_choice_with(manifest: &mut Manifest, w: &Wiring, mode: Option<AgentMode
     let Err(e) = wire(manifest, w, chosen.0, Some(chosen.1)) else { return Ok(()) };
     let back = match put_back_choice(before, chosen) {
         Ok(false) => return Err(e.context("the agents could not be rewired; the setting was changed again meanwhile and stays as it is now")),
-        Ok(true) => if before.0 == chosen.0 { Ok(()) } else { wire(manifest, w, before.0, None).map(|_| ()) },
+        // MCP registrations are touched only when the card changed that setting.
+        Ok(true) if before != chosen => wire(manifest, w, before.0, (before.1 != chosen.1).then_some(before.1)).map(|_| ()),
+        Ok(true) => Ok(()),
         Err(e2) => return Err(e.context(format!("the agents could not be rewired, and the setting could not be put back ({e2:#}); `tokenstash doctor` shows where it stands"))),
     };
     Err(match back {
         Ok(()) => e.context("the agents could not be rewired, so the setting is back to what it was"),
-        Err(e2) => e.context(format!("the agents could not be rewired; the setting is back to what it was, but some skills could not be put back ({e2:#}); `tokenstash doctor` shows which")),
+        Err(e2) => e.context(format!("the agents could not be rewired; the setting is back to what it was, but some agents could not be put back in step with it ({e2:#}); `tokenstash doctor` shows which")),
     })
 }
 
@@ -2552,5 +2558,50 @@ mod tests {
         }
         assert!(!w.agents_skill_dir().join(CODEX_POLICY).exists());
         assert!(!put_back && theirs.agent_mode == AgentMode::Explicit && !theirs.mcp, "{theirs:?}");
+    }
+
+    /// Greptile on #74: with an older record, the person may have taken out the section init
+    /// wrote and kept the file. Undo drops the record when it is done, so it puts back the
+    /// sections the backup held even with no shipped section left to take out, and never
+    /// adds one the file already holds.
+    #[test]
+    fn undo_restores_saved_sections_after_the_person_removed_inits() {
+        let mine = section("## Keys\n\nMine: never use the prod key.");
+        for (name, now, expected) in [
+            ("removed-shipped", "# App\n\nBe brief.\n".to_string(), format!("# App\n\nBe brief.\n\n{mine}")),
+            ("removed-shipped-kept", format!("# App\n\n{mine}"), format!("# App\n\n{mine}")),
+        ] {
+            let (w, mut m) = machine(name);
+            let proj = scratch(&format!("{name}-app")).join("AGENTS.md");
+            write(&proj, &format!("# App\n\n{mine}"));
+            m.mutate(&proj, || { fs::write(&proj, format!("# App\n\n{}", section(SHIPPED_SECTIONS[0])))?; Ok(()) }).unwrap();
+            write(&proj, &now);
+            assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+            assert_eq!(read(&proj), expected, "{name}");
+        }
+    }
+
+    /// Greptile on #74: a card turning the MCP server off takes Claude Code's entry out, then
+    /// stops at Codex's config, which cannot be read. The setting goes back to on, and so
+    /// does the entry already taken out, so a declined card leaves every agent connected.
+    #[test]
+    fn a_failed_card_registers_again_what_it_took_out() {
+        let _g = crate::inbox_auth::env_lock();
+        let ts = scratch("card-mcp-fails-ts");
+        std::env::set_var("TOKENSTASH_HOME", &ts);
+        fs::write(ts.join("config.toml"), "mcp = true\n").unwrap();
+        let (w, mut m) = machine("card-mcp-fails");
+        wire(&mut m, &w, AgentMode::Auto, Some(true)).unwrap();
+        let broken = "[mcp_servers.tokenstash\n";
+        write(&w.codex().join("config.toml"), broken);
+        let err = apply_choice_with(&mut m, &w, None, Some(false)).map_err(|e| format!("{e:#}"));
+        let after = Config::load().unwrap();
+        std::env::remove_var("TOKENSTASH_HOME");
+        let err = err.unwrap_err();
+        assert!(err.contains("the setting is back to what it was") && err.contains("config.toml"), "{err}");
+        assert!(after.mcp, "{after:?}");
+        assert!(json_has_server(&w.claude_json(), true), "Claude Code's entry is back");
+        assert!(json_has_server(&w.cursor().join("mcp.json"), false) && json_has_server(&w.gemini().join("settings.json"), false));
+        assert_eq!(read(&w.codex().join("config.toml")), broken, "left as found");
     }
 }
