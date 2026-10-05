@@ -234,8 +234,11 @@ pub enum Decision {
 }
 
 /// One card per kind per workspace: a pairing card and a sensitive card merge with the
-/// open one of their kind; a one-time card never merges.
-pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[String], kind: ApprovalKind) -> Result<Task> {
+/// open one of their kind; a one-time card never merges. `asked_again` lists the entries
+/// an agent asks for again after the person declined them (`need --force`). The card says
+/// so first, one sentence per key, whether it is new or merged into, so a key asked for the
+/// first time on the same card is not called a second ask.
+pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[String], kind: ApprovalKind, asked_again: &[String]) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
     if kind != ApprovalKind::Once {
         // Read-merge-write under the write lock: two processes growing the same card must
@@ -250,11 +253,13 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
                     merged.push(n.clone());
                 }
             }
-            if merged == t.names {
+            let why = with_asked_again(t.why.as_deref().unwrap_or_default(), asked_again, agent);
+            if merged == t.names && t.why.as_deref() == Some(why.as_str()) {
                 return Ok(Some(t));
             }
-            if ctx.db.update_task_names(&t.id, &merged)? {
+            if ctx.db.update_task_names(&t.id, &merged)? && ctx.db.set_task_why(&t.id, &why)? {
                 t.names = merged;
+                t.why = Some(why);
                 return Ok(Some(t));
             }
             Ok(None) // answered between our read and this write: a new card, not a free ride
@@ -266,12 +271,14 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
             return Ok(t);
         }
     }
-    let shown: Vec<String> = names.iter().map(|n| n.strip_suffix("@default").unwrap_or(n).to_string()).collect();
+    let shown: Vec<String> = names.iter().map(|n| shown_entry(n).to_string()).collect();
     let short = crate::project::short(project);
+    // A card that only asks again does not call itself the directory's first ask.
+    let first = if names.iter().all(|n| asked_again.contains(n)) { "" } else { "First time this directory asks for stored keys. " };
     let (title, why) = match kind {
         ApprovalKind::Pairing => (
             format!("{short} wants {}", if shown.len() == 1 { shown[0].clone() } else { format!("{} keys", shown.len()) }),
-            format!("First time this directory asks for stored keys. \"Allow these\" writes exactly these into {}: {}. \"Allow these + any non-sensitive key here\" also lets this directory receive any registry-confirmed non-sensitive key for the same identity, without asking. Nothing applies to any other directory.", project.join(&ctx.cfg.env_file).display(), shown.join(", ")),
+            format!("{first}\"Allow these\" writes exactly these into {}: {}. \"Allow these + any non-sensitive key here\" also lets this directory receive any registry-confirmed non-sensitive key for the same identity, without asking. Nothing applies to any other directory.", project.join(&ctx.cfg.env_file).display(), shown.join(", ")),
         ),
         ApprovalKind::Sensitive => (
             format!("{short} wants sensitive key(s): {}", shown.join(", ")),
@@ -285,7 +292,7 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
     // The directory name is the agent's to choose (`mkdir`, `cd`): a card title must not
     // carry its control, bidi or zero-width characters into `tasks` output or the inbox.
     let title = clean_text(&title, MAX_TITLE_CHARS);
-    let why = clean_text(&why, MAX_APPROVAL_WHY_CHARS);
+    let why = with_asked_again(&why, asked_again, agent);
     let t = Task {
         id: new_id("a"),
         kind: TaskKind::Approval,
@@ -309,6 +316,24 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
     ctx.db.insert_task(&t)?;
     ctx.db.audit(Some(&pid), Some(agent), "task.approval", None, None, Some(&format!("{}: {}", kind.expects(), names.join(","))))?;
     Ok(t)
+}
+
+/// An approval entry as a card shows it: `NAME`, or `NAME@identity` for any other identity.
+fn shown_entry(entry: &str) -> &str {
+    entry.strip_suffix("@default").unwrap_or(entry)
+}
+
+/// An approval card's `why` with a sentence in front for each entry of `asked_again` it does
+/// not name yet, capped like any approval text.
+fn with_asked_again(why: &str, asked_again: &[String], agent: &str) -> String {
+    let mut notes = String::new();
+    for entry in asked_again {
+        let lead = format!("Asked again after you declined {},", shown_entry(entry));
+        if !why.contains(&lead) && !notes.contains(&lead) {
+            notes.push_str(&format!("{lead} because you asked {agent} to. "));
+        }
+    }
+    clean_text(&format!("{notes}{why}"), MAX_APPROVAL_WHY_CHARS)
 }
 
 pub struct HumanRequest {

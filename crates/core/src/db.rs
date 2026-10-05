@@ -874,10 +874,13 @@ impl Db {
     }
 
     /// The card the extra ask for (project, name, identity) was spent on within the window,
-    /// if it was spent ([`reserve_force`] then returns `None`).
+    /// if it was spent ([`reserve_force`] then returns `None`) on a card for that identity.
+    /// A row with no identity still spends the ask for every identity of the key, but the
+    /// card it names is returned only for the identity the card asks for.
     pub fn force_card(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row(
-            "SELECT detail FROM audit WHERE project=?1 AND name=?2 AND (identity=?3 OR identity IS NULL) AND action='need.force' AND ts >= ?4 AND detail IS NOT NULL ORDER BY id DESC LIMIT 1",
+            "SELECT t.id FROM audit a JOIN tasks t ON t.id = a.detail WHERE a.project=?1 AND a.name=?2 AND (a.identity=?3 OR a.identity IS NULL) AND a.action='need.force' AND a.ts >= ?4 \
+             AND ((t.name=?2 AND t.identity=?3) OR instr(t.names, '\"' || ?2 || '@' || ?3 || '\"') > 0) ORDER BY a.id DESC LIMIT 1",
             params![project, name, identity, since],
             |r| r.get(0),
         ).optional()?)
@@ -928,6 +931,11 @@ impl Db {
             params![id, serde_json::to_string(names)?],
         )?;
         Ok(n == 1)
+    }
+
+    /// Replace an open card's `why`. Returns false when the card is no longer pending.
+    pub fn set_task_why(&self, id: &str, why: &str) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE tasks SET why=?2 WHERE id=?1 AND status='pending'", params![id, why])? == 1)
     }
 
     /// Mark pending tasks past their deadline as expired. Returns count.

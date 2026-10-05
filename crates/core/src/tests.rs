@@ -1183,14 +1183,14 @@ fn a_run_shim_approval_is_not_a_standing_grant() {
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let ws = db.workspace_for(&proj).unwrap();
     // a program-derived approval is one-time
-    let t = tasks::create_approval_task(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Once).unwrap();
+    let t = tasks::create_approval_task(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Once, &[]).unwrap();
     assert_eq!(t.expects, tasks::APPROVAL_ONCE);
     tasks::answer_approval(&ctx, &t, tasks::Decision::Allow, None).unwrap();
     assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Answered, "the answer is recorded");
     assert!(db.grant_source(&ws.id, "STRIPE_SECRET_KEY", "default").unwrap().is_none(), "but no grant was written");
     assert!(matches!(trust::gate(&db, &ws, "STRIPE_SECRET_KEY", "default", true, true).unwrap(), trust::Gate::NeedsApproval { .. }), "the next bare request asks again");
     // an ordinary (human-facing) sensitive approval does persist
-    let t2 = tasks::create_approval_task(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Sensitive).unwrap();
+    let t2 = tasks::create_approval_task(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Sensitive, &[]).unwrap();
     tasks::answer_approval(&ctx, &t2, tasks::Decision::Allow, None).unwrap();
     assert_eq!(db.grant_source(&ws.id, "STRIPE_SECRET_KEY", "default").unwrap().as_deref(), Some(db::GRANT_SENSITIVE));
     std::env::set_var("TOKENSTASH_HOME", base_home());
@@ -1422,7 +1422,7 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
     let ws_b = db.workspace_for(&proj_b).unwrap();
-    let once = tasks::create_approval_task(&ctx, &proj_b, "run", &["GROQ_API_KEY@default".to_string()], tasks::ApprovalKind::Once).unwrap();
+    let once = tasks::create_approval_task(&ctx, &proj_b, "run", &["GROQ_API_KEY@default".to_string()], tasks::ApprovalKind::Once, &[]).unwrap();
     tasks::answer_approval(&ctx, &once, tasks::Decision::Allow, None).unwrap();
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
     assert!(db.grant_source(&ws_b.id, "GROQ_API_KEY", "default").unwrap().is_none(), "one-time approval left no grant");
@@ -2381,7 +2381,7 @@ fn rotation_with_a_broad_grant_never_writes_a_sensitive_key() {
     tasks::answer_secret(&ctx, &t, SecretString::from("sk_live_oldoldoldold".to_string()), true).unwrap();
     let ws_b = db.workspace_for(&proj_b).unwrap();
     db.grant(&ws_b.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
-    let once = tasks::create_approval_task(&ctx, &proj_b, "run", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Once).unwrap();
+    let once = tasks::create_approval_task(&ctx, &proj_b, "run", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Once, &[]).unwrap();
     tasks::answer_approval(&ctx, &once, tasks::Decision::Allow, None).unwrap();
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("sk_live_old"));
     let card = tasks::rotate(&ctx, &proj_a, "human", "STRIPE_SECRET_KEY", "default").unwrap();
@@ -3416,7 +3416,7 @@ fn an_approval_card_title_is_cleaned_of_the_directory_names_control_characters()
     let db = Db::open(&home.join("t.db")).unwrap();
     let st = stash::FileStash::new().unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &st, probe: tasks::Probe::Off };
-    let t = tasks::create_approval_task(&ctx, &proj, "agent", &["OPENAI_API_KEY@default".to_string()], tasks::ApprovalKind::Pairing).unwrap();
+    let t = tasks::create_approval_task(&ctx, &proj, "agent", &["OPENAI_API_KEY@default".to_string()], tasks::ApprovalKind::Pairing, &[]).unwrap();
     assert!(!t.title.contains('\u{202e}') && !t.title.contains('\u{1b}'), "{:?}", t.title);
     assert!(t.title.contains("dir") && t.title.contains("wants"), "{:?}", t.title);
     std::env::set_var("TOKENSTASH_HOME", base_home());
@@ -4251,7 +4251,7 @@ fn an_agents_force_sets_aside_only_the_no_it_holds_the_ask_for() {
         let t = tasks::create_secret_task(&ctx, &proj, "agent", name, "default", &tasks::SecretRequest::default()).unwrap();
         tasks::deny(&ctx, &t, None).unwrap();
     }
-    let sensitive = tasks::create_approval_task(&ctx, &proj, "agent", &["TWILIO_AUTH_TOKEN@default".to_string()], tasks::ApprovalKind::Sensitive).unwrap();
+    let sensitive = tasks::create_approval_task(&ctx, &proj, "agent", &["TWILIO_AUTH_TOKEN@default".to_string()], tasks::ApprovalKind::Sensitive, &[]).unwrap();
     tasks::deny(&ctx, &sensitive, None).unwrap();
     let names: Vec<String> = ["GROQ_API_KEY", "MISTRAL_API_KEY", "RESEND_API_KEY", "TWILIO_AUTH_TOKEN"].iter().map(|s| s.to_string()).collect();
     let opts = need::NeedOpts { ask_again: vec!["GROQ_API_KEY@default".into()], ..Default::default() };
@@ -4267,8 +4267,7 @@ fn an_agents_force_sets_aside_only_the_no_it_holds_the_ask_for() {
 
 /// Greptile on #67: the extra ask after a no is reserved per identity. The person declines
 /// each identity of a key on its own card, so asking again for one leaves the other's ask, and
-/// only a card for the reservation's own identity spends it. A reservation written before
-/// identities were recorded still counts for every identity of the key.
+/// only a card for the reservation's own identity spends it.
 #[test]
 fn the_extra_ask_is_reserved_per_identity() {
     let _env = env_lock();
@@ -4289,19 +4288,94 @@ fn the_extra_ask_is_reserved_per_identity() {
     let paste = tasks::create_secret_task(&ctx, &proj, "agent", "GROQ_API_KEY", "personal", &tasks::SecretRequest::default()).unwrap();
     assert_eq!(db.card_since_reservation(work, &pid, "GROQ_API_KEY").unwrap(), None);
     assert_eq!(db.card_since_reservation(personal, &pid, "GROQ_API_KEY").unwrap(), Some(paste.id.clone()));
-    let approval = tasks::create_approval_task(&ctx, &proj, "agent", &["GROQ_API_KEY@work".to_string()], tasks::ApprovalKind::Pairing).unwrap();
+    let approval = tasks::create_approval_task(&ctx, &proj, "agent", &["GROQ_API_KEY@work".to_string()], tasks::ApprovalKind::Pairing, &[]).unwrap();
     assert_eq!(db.card_since_reservation(work, &pid, "GROQ_API_KEY").unwrap(), Some(approval.id.clone()));
     db.bind_force(personal, &paste.id).unwrap();
     assert_eq!(db.force_card(&pid, "GROQ_API_KEY", "personal", &since).unwrap(), Some(paste.id.clone()));
     assert_eq!(db.force_card(&pid, "GROQ_API_KEY", "work", &since).unwrap(), None, "work's ask is not spent yet");
-    db.conn.execute(
-        "INSERT INTO audit (ts, project, agent, action, name, identity, detail) VALUES (?1, ?2, 'agent', 'need.force', 'MISTRAL_API_KEY', NULL, 't_legacy')",
-        rusqlite::params![now(), pid],
-    ).unwrap();
-    for identity in ["default", "work"] {
-        assert!(db.reserve_force(&pid, "agent", "MISTRAL_API_KEY", identity, &since).unwrap().is_none(), "{identity}");
-        assert_eq!(db.force_card(&pid, "MISTRAL_API_KEY", identity, &since).unwrap().as_deref(), Some("t_legacy"));
+}
+
+/// Greptile on #73: a reservation written before reservations named an identity still spends
+/// the extra ask for every identity of the key, but the card it names comes back only for the
+/// identity that card asks for. A retry for another identity gets no card of someone else's,
+/// so the CLI gives its "already asked" error.
+#[test]
+fn an_old_reservation_returns_only_a_card_for_the_identity_retried() {
+    let _env = env_lock();
+    let home = tmp("force-legacy-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("force-legacy-proj").canonicalize().unwrap();
+    let pid = proj.to_string_lossy().to_string();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let since = cfg.ttl_since();
+    let paste = tasks::create_secret_task(&ctx, &proj, "agent", "MISTRAL_API_KEY", "work", &tasks::SecretRequest::default()).unwrap();
+    let approval = tasks::create_approval_task(&ctx, &proj, "agent", &["GROQ_API_KEY@work".to_string()], tasks::ApprovalKind::Pairing, &[]).unwrap();
+    for (name, card) in [("MISTRAL_API_KEY", &paste.id), ("GROQ_API_KEY", &approval.id)] {
+        db.conn.execute(
+            "INSERT INTO audit (ts, project, agent, action, name, identity, detail) VALUES (?1, ?2, 'agent', 'need.force', ?3, NULL, ?4)",
+            rusqlite::params![now(), pid, name, card],
+        ).unwrap();
+        for identity in ["work", "personal", "default"] {
+            assert!(db.reserve_force(&pid, "agent", name, identity, &since).unwrap().is_none(), "{name}@{identity}: the old row still spends the ask");
+        }
+        assert_eq!(db.force_card(&pid, name, "work", &since).unwrap().as_ref(), Some(card), "{name}");
+        for identity in ["personal", "default"] {
+            assert_eq!(db.force_card(&pid, name, identity, &since).unwrap(), None, "{name}@{identity} gets no card for work");
+        }
     }
+}
+
+/// Greptile on #73: an agent asking again for a declined key that is stored gets an approval
+/// card, and that card says first that it is a second ask, naming the key. A key asked for the
+/// first time on the same card is not called a second ask, whether it was on the card before
+/// or joins it later.
+#[test]
+fn an_approval_card_says_which_keys_are_asked_again() {
+    let _env = env_lock();
+    let home = tmp("again-approval-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("again-approval-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    for (name, value) in [("GROQ_API_KEY", "gsk_approvalagain_0123456789"), ("MISTRAL_API_KEY", "mistral_approvalagain_0123456789"), ("OPENROUTER_API_KEY", "sk-or-approvalagain-0123456789")] {
+        stash.set(&stash::stash_key(name, "default"), &SecretString::from(value.to_string())).unwrap();
+        db.upsert_secret(&db::SecretMeta { name: name.into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+    }
+    let one = |n: &str| vec![n.to_string()];
+    // The person declined the pairing card for GROQ_API_KEY; the agent asks again.
+    let first = need::need(&ctx, &proj, "agent", &one("GROQ_API_KEY"), &need::NeedOpts::default()).unwrap();
+    let need::Outcome::Pending { task_id, .. } = &first[0] else { panic!("{first:?}") };
+    tasks::deny(&ctx, &db.get_task(task_id).unwrap().unwrap(), None).unwrap();
+    let again = need::NeedOpts { ask_again: vec!["GROQ_API_KEY@default".into()], ..Default::default() };
+    let out = need::need(&ctx, &proj, "claude-code", &one("GROQ_API_KEY"), &again).unwrap();
+    let need::Outcome::Pending { task_id, .. } = &out[0] else { panic!("{out:?}") };
+    let card = db.get_task(task_id).unwrap().unwrap();
+    let why = card.why.clone().unwrap();
+    assert!(why.starts_with("Asked again after you declined GROQ_API_KEY, because you asked claude-code to. \"Allow these\""), "{why}");
+    // A first ask for another key joins the same open card, and the card names only the key asked again.
+    let out = need::need(&ctx, &proj, "agent", &one("MISTRAL_API_KEY"), &need::NeedOpts::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Pending { task_id, .. } if task_id == &card.id), "{out:?}");
+    let why = db.get_task(&card.id).unwrap().unwrap().why.unwrap();
+    assert!(!why.contains("MISTRAL_API_KEY"), "{why}");
+    // An open first-ask card that a second ask joins gets the note for that key alone.
+    tasks::deny(&ctx, &db.get_task(&card.id).unwrap().unwrap(), None).unwrap();
+    let out = need::need(&ctx, &proj, "agent", &one("OPENROUTER_API_KEY"), &need::NeedOpts::default()).unwrap();
+    let need::Outcome::Pending { task_id: open, .. } = &out[0] else { panic!("{out:?}") };
+    let both = need::NeedOpts { ask_again: vec!["MISTRAL_API_KEY@default".into()], ..Default::default() };
+    let out = need::need(&ctx, &proj, "codex", &one("MISTRAL_API_KEY"), &both).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Pending { task_id, .. } if task_id == open), "{out:?}");
+    let merged = db.get_task(open).unwrap().unwrap();
+    let why = merged.why.unwrap();
+    assert!(why.starts_with("Asked again after you declined MISTRAL_API_KEY, because you asked codex to. First time this directory asks"), "{why}");
+    assert!(!why.contains("declined OPENROUTER_API_KEY") && !why.contains("declined GROQ_API_KEY"), "{why}");
+    assert_eq!(merged.names, vec!["OPENROUTER_API_KEY@default".to_string(), "MISTRAL_API_KEY@default".to_string()]);
 }
 
 

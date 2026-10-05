@@ -355,7 +355,8 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
         if still.is_empty() {
             continue;
         }
-        let t = tasks::create_approval_task(ctx, project, agent, &still, kind)?;
+        let again: Vec<String> = still.iter().filter(|g| opts.asks_again(g)).cloned().collect();
+        let t = tasks::create_approval_task(ctx, project, agent, &still, kind, &again)?;
         for o in outcomes.iter_mut() {
             if let Outcome::Pending { name, identity, task_id, title, .. } = o {
                 if task_id.is_empty() && still.contains(&format!("{name}@{identity}")) {
@@ -409,7 +410,7 @@ pub fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Durati
                         if !authorised {
                             // ask again, on a card of its own
                             let kind = if t.expects == tasks::APPROVAL_SENSITIVE { tasks::ApprovalKind::Sensitive } else { tasks::ApprovalKind::Pairing };
-                            let nt = tasks::create_approval_task(ctx, project, &t.agent, &[entry], kind)?;
+                            let nt = tasks::create_approval_task(ctx, project, &t.agent, &[entry], kind, &[])?;
                             *o = Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: nt.id, title: nt.title, url: nt.url };
                             any_pending = true;
                             continue;
