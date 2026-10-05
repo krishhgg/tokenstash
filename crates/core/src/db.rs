@@ -848,11 +848,12 @@ impl Db {
         Ok(())
     }
 
-    /// A card for `name` in `project` filed at or after reservation `row`, if any: what a
-    /// request that failed part way had already filed under it.
+    /// The card the request behind reservation `row` filed for `name`, if any: a card for that
+    /// key in `project`, from the same agent, filed within the minute after the reservation
+    /// (a request files its cards at once; anything later is another request's).
     pub fn card_since_reservation(&self, row: i64, project: &str, name: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row(
-            "SELECT t.id FROM tasks t, audit a WHERE a.id=?1 AND t.project=?2 AND t.created >= a.ts AND (t.name=?3 OR instr(t.names, '\"' || ?3 || '@') > 0) ORDER BY t.created LIMIT 1",
+            "SELECT t.id FROM tasks t, audit a WHERE a.id=?1 AND t.project=?2 AND t.agent=a.agent AND t.created >= a.ts AND t.created <= strftime('%Y-%m-%dT%H:%M:%SZ', a.ts, '+60 seconds') AND (t.name=?3 OR instr(t.names, '\"' || ?3 || '@') > 0) ORDER BY t.created LIMIT 1",
             params![row, project, name],
             |r| r.get(0),
         ).optional()?)
