@@ -2657,6 +2657,43 @@ fn a_generated_value_without_an_index_row_is_not_a_finished_store() {
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
+/// A store that wrote a new value to the stash and then failed its index COMMIT can leave
+/// that value beside an earlier store's row. The row was recorded before this request read
+/// the stash, so it says nothing about the value. The request stores its own value, with a
+/// fresh row and the grant.
+#[test]
+fn a_generated_value_beside_an_older_index_row_is_not_a_finished_store() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-older-row");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let other_stash = stash::open(&cfg).unwrap();
+    let identity = need::project_identity(&proj);
+    let key = stash::stash_key("JWT_SECRET", &identity);
+    let orphan = "orphaned-generated-value-0123456789";
+    // An earlier store's row. Its value has left the stash since (the kernel keyring does
+    // not survive a reboot).
+    db.upsert_secret(&db::SecretMeta { name: "JWT_SECRET".into(), identity: identity.clone(), provider: None, sensitive: false, source_url: None, created: "2020-01-01T00:00:00Z".into(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+    // Right after this `need` finds the stash empty, another store writes its value to the
+    // stash and then fails before its index COMMIT.
+    let stash = GetHookStash {
+        inner: stash::open(&cfg).unwrap(),
+        armed: std::cell::Cell::new(false),
+        hook: || other_stash.set(&key, &SecretString::from(orphan.to_string())).unwrap(),
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+    stash.armed.set(true);
+    let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    let stored = stash.get(&key).unwrap().unwrap();
+    assert_ne!(secrecy::ExposeSecret::expose_secret(&stored), orphan, "the value nothing recorded is replaced");
+    let ws = db.find_workspace(&proj).unwrap().unwrap();
+    assert!(db.grant_source(&ws.id, "JWT_SECRET", &identity).unwrap().is_some(), "the directory holds a grant for what it received");
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert_eq!(envfile::parse_line(text.lines().next().unwrap()).unwrap().1, secrecy::ExposeSecret::expose_secret(&stored), "the env file holds what the stash holds");
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
 /// The card is the human's read of what an agent asked for. The agent writes some of that
 /// text, so it may not carry a link the human clicks into anything but http(s), and may not
 /// contain characters that reorder or hide what is displayed.
