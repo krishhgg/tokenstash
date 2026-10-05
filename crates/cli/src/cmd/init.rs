@@ -394,7 +394,7 @@ fn undo_with(m: Manifest, claude_cli: bool, home: &Path) -> Result<i32> {
         cur.save()?;
     }
     if cur.claude_mcp_registered {
-        let ok = claude_cli && claude_mcp(&["remove", "-s", "user", "tokenstash"]);
+        let ok = claude_cli && claude_mcp(&["remove", "-s", "user", "tokenstash"])?;
         if ok { println!("✓ claude mcp remove tokenstash"); cur.claude_mcp_registered = false; cur.save()?; } else {
             println!("! could not run `claude mcp remove -s user tokenstash` (kept in the manifest; run it by hand or re-run --undo with `claude` on PATH)");
         }
@@ -667,9 +667,33 @@ fn reinsert(r: &Removed) -> Result<()> {
     Ok(())
 }
 
-fn claude_mcp(args: &[&str]) -> bool {
-    std::process::Command::new("claude").arg("mcp").args(args)
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+/// How long `claude mcp add` or `claude mcp remove` may run. An action card that runs one
+/// holds its claim meanwhile, so a hung `claude` must not hold it for as long as the inbox runs.
+const CLAUDE_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `claude mcp ARGS`. True if it succeeded, false if it failed or could not start, and an
+/// error if it ran past [`CLAUDE_MCP_TIMEOUT`]: the child is killed, and a confirm that ran it
+/// gives its card back.
+fn claude_mcp(args: &[&str]) -> Result<bool> {
+    claude_mcp_with(Path::new("claude"), args, CLAUDE_MCP_TIMEOUT)
+}
+
+fn claude_mcp_with(claude: &Path, args: &[&str], limit: std::time::Duration) -> Result<bool> {
+    let Ok(mut child) = std::process::Command::new(claude).arg("mcp").args(args)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() else { return Ok(false) };
+    // The output goes nowhere, so no pipe can fill and stall the child: polling is enough.
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(s) = child.try_wait()? {
+            return Ok(s.success());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("`claude mcp {}` did not finish within {limit:?} and was stopped", args.join(" "));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 
@@ -822,7 +846,9 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
             let mut args: Vec<String> = vec!["add".into(), "-s".into(), "user".into()];
             if let Some(h) = &w.ts_home { args.push("-e".into()); args.push(format!("TOKENSTASH_HOME={h}")); }
             args.extend(["tokenstash".into(), "--".into(), w.exe.clone(), "mcp".into()]);
-            let ok = claude_mcp(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            // A time-out is an error and keeps the record: the stopped command may have
+            // registered the server, and a record can be undone.
+            let ok = claude_mcp(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
             if !ok { manifest.claude_mcp_registered = false; manifest.save()?; }
             ok
         } else {
@@ -2278,5 +2304,33 @@ mod tests {
         assert_eq!(m.wrote_for(&p).unwrap()["command"], w.exe.as_str());
         assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert_eq!(read(&p), theirs, "their entry stays");
+    }
+
+    /// A `claude mcp` that hangs is stopped at the time limit and returns an error, so an
+    /// action card that runs it is given back and the person can decline it, instead of
+    /// staying claimed for as long as the inbox runs. One that finishes reports how it exited.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_claude_mcp_is_stopped_at_the_time_limit() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = scratch("hung-claude");
+        let fake = |name: &str, script: &str| {
+            let bin = dir.join(name).join("claude");
+            fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            fs::write(&bin, script).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        };
+        let hung = fake("hung", "#!/bin/sh\nexec sleep 30\n");
+        let limit = Duration::from_millis(300);
+        let started = Instant::now();
+        let err = claude_mcp_with(&hung, &["add", "-s", "user", "tokenstash"], limit).unwrap_err();
+        assert!(started.elapsed() < limit + Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(format!("{err:#}").contains("did not finish"), "{err:#}");
+        assert!(claude_mcp_with(&fake("ok", "#!/bin/sh\nexit 0\n"), &["remove"], limit).unwrap());
+        assert!(!claude_mcp_with(&fake("fails", "#!/bin/sh\nexit 1\n"), &["remove"], limit).unwrap());
+        assert!(!claude_mcp_with(&dir.join("missing/claude"), &["remove"], limit).unwrap(), "one that cannot start is a failure, as before");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
