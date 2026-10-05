@@ -10,7 +10,7 @@
 //! and undoing are a person's decisions: an agent with a shell could otherwise put automatic
 //! mode back, or point every agent at a binary of its choosing.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,6 +100,10 @@ struct Manifest {
     claude_mcp_registered: bool,
     #[serde(default)]
     entries: Vec<Removed>,
+    /// The MCP entry init wrote into each shared config, as JSON. Undo takes out only an entry
+    /// that still matches: one the person changed or re-added since is theirs.
+    #[serde(default)]
+    wrote: Vec<(PathBuf, serde_json::Value)>,
     /// Where this manifest and its backups live. Not part of the record.
     #[serde(skip)]
     root: PathBuf,
@@ -147,6 +151,18 @@ impl Manifest {
     }
     fn is_empty(&self) -> bool {
         self.files.is_empty() && self.dirs.is_empty() && !self.claude_mcp_registered && self.entries.is_empty()
+    }
+    /// Remember the tokenstash entry `p` holds now as the one init wrote.
+    fn record_wrote(&mut self, p: &Path) -> Result<()> {
+        if let Some(e) = mcp_entry(p)? {
+            self.wrote.retain(|(q, _)| q != p);
+            self.wrote.push((p.to_path_buf(), e));
+            self.save()?;
+        }
+        Ok(())
+    }
+    fn wrote_for(&self, p: &Path) -> Option<&serde_json::Value> {
+        self.wrote.iter().find(|(q, _)| q == p).map(|(_, e)| e)
     }
     fn save(&self) -> Result<()> {
         fs::create_dir_all(&self.root)?;
@@ -304,12 +320,16 @@ fn remove_skill_dir(d: &Path) -> Result<()> {
 /// `{"mcpServers": {}}`, a bare `[mcp_servers]` header, a blank AGENTS.md. Anything else —
 /// another key, an empty table of the user's, a comment — is theirs, and the file stays.
 fn effectively_empty(p: &Path) -> bool {
-    let s = match fs::read_to_string(p) {
-        Ok(s) => s,
-        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
-    };
+    match fs::read_to_string(p) {
+        Ok(s) => effectively_empty_text(p, &s),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// [`effectively_empty`] for text about to be written to `p`.
+fn effectively_empty_text(p: &Path, s: &str) -> bool {
     match p.extension().and_then(|e| e.to_str()) {
-        Some("json") => serde_json::from_str::<serde_json::Value>(&s).map(|v| v == serde_json::json!({}) || v == serde_json::json!({ "mcpServers": {} })).unwrap_or(false),
+        Some("json") => serde_json::from_str::<serde_json::Value>(s).map(|v| v == serde_json::json!({}) || v == serde_json::json!({ "mcpServers": {} })).unwrap_or(false),
         Some("toml") => { let t = s.trim(); t.is_empty() || t == "[mcp_servers]" }
         _ => s.trim().is_empty(),
     }
@@ -336,7 +356,7 @@ fn undo_with(m: Manifest, claude_cli: bool, home: &Path) -> Result<i32> {
     while i < cur.files.len() {
         let (p, backup) = cur.files[i].clone();
         let r: Result<()> = if is_shared(&p) {
-            undo_shared(&p, backup.as_deref())
+            undo_shared(&p, backup.as_deref(), cur.wrote_for(&p).cloned())
         } else {
             match &backup {
                 Some(b) if b.exists() => restore(b, &p),
@@ -411,11 +431,20 @@ fn backup_name(p: &Path) -> String {
 /// one; `~/.claude.json` is also written by every running Claude Code session.
 fn write_file(p: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
+    // A config that is a link (dotfiles kept in a repository) is updated where it points, and
+    // stays a link.
+    let target = match fs::symlink_metadata(p) {
+        Ok(md) if md.file_type().is_symlink() => fs::canonicalize(p).with_context(|| format!("{} is a link to a file that is not there", p.display()))?,
+        _ => p.to_path_buf(),
+    };
+    let p = target.as_path();
     let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".{}.tokenstash-{}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), std::process::id()));
+    // A name nobody can guess, created only if nothing is there: a link planted at a
+    // predictable temporary path in a shared directory would otherwise redirect the write.
+    let tmp = dir.join(format!(".{}.tokenstash-{}-{:016x}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), std::process::id(), rand::random::<u64>()));
     let written = (|| -> Result<()> {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         if let Ok(md) = fs::metadata(p) {
             f.set_permissions(md.permissions())?;
         }
@@ -443,11 +472,30 @@ fn is_shared(p: &Path) -> bool {
     name.ends_with(".json") || name == "config.toml" || name == "AGENTS.md"
 }
 
-/// Undo for a shared file: take tokenstash's entry or section out of the file as it is now,
-/// then put back what the backup held under that name, if anything. Whatever the person or
-/// another tool added since `init` stays. A file init created and that holds nothing else
-/// is removed. A file that is gone is restored from its backup, as before.
-fn undo_shared(p: &Path, backup: Option<&Path>) -> Result<()> {
+/// The tokenstash MCP entry a JSON or TOML config holds, as JSON; `None` without one.
+fn mcp_entry(p: &Path) -> Result<Option<serde_json::Value>> {
+    if p.file_name().is_some_and(|n| n == "config.toml") {
+        let doc: toml::Value = match fs::read_to_string(p) {
+            Ok(s) => toml::from_str(&s).map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e})", p.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        return Ok(doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).map(serde_json::to_value).transpose()?);
+    }
+    Ok(read_json(p)?.get("mcpServers").and_then(|m| m.get("tokenstash")).cloned())
+}
+
+/// Undo for a shared file. Everything is read and the new text worked out first, and the
+/// file is written once at the end, so an unreadable backup or a crash leaves the file as it
+/// was rather than half undone. In the file as it is now:
+/// - the tokenstash MCP entry goes if it is still the one init wrote (`wrote`; an older
+///   record without it counts any entry as init's); one the person changed since stays;
+/// - an AGENTS.md section goes if it is text a release shipped; one the person edited stays;
+/// - what the backup held under that name comes back, where init's was taken out;
+/// - a file init created that holds nothing else is removed.
+///
+/// A file that is gone is restored from its backup, as before.
+fn undo_shared(p: &Path, backup: Option<&Path>, wrote: Option<serde_json::Value>) -> Result<()> {
     if !p.exists() {
         return match backup {
             Some(b) if b.exists() => restore(b, p),
@@ -455,35 +503,74 @@ fn undo_shared(p: &Path, backup: Option<&Path>) -> Result<()> {
             None => Ok(()),
         };
     }
+    let original = match backup {
+        Some(b) => original_entry(b)?,
+        None => None,
+    };
+    let text = fs::read_to_string(p).map_err(|e| anyhow::anyhow!("reading {}: {e}", p.display()))?;
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if name == "AGENTS.md" {
-        if has_snippet(p) {
-            strip_snippet(p)?;
+    let out = if name == "AGENTS.md" {
+        match section_of(&text) {
+            Some(sec) if is_shipped_section(sec) => {
+                let mut s = strip_sections(&text)?;
+                if let Some((_, value)) = original.filter(|(k, _)| k == "section") {
+                    if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
+                    if !s.is_empty() { s.push('\n'); }
+                    s.push_str(&value);
+                    s.push('\n');
+                }
+                s
+            }
+            // No section, or the person's own text under the marks: nothing to take out.
+            _ => text.clone(),
         }
-    } else if name == "config.toml" {
-        let mut doc = read_toml(p)?;
-        if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) {
-            servers.remove("tokenstash");
-        }
-        write_file(p, &doc.to_string())?;
     } else {
-        let mut v = read_json(p)?;
-        if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-            m.remove("tokenstash");
+        let current = mcp_entry(p)?;
+        let ours = match (&current, &wrote) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(c), Some(w)) => c == w,
+        };
+        if name == "config.toml" {
+            let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e})", p.display()))?;
+            if ours {
+                if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) {
+                    servers.remove("tokenstash");
+                }
+                if let Some((_, value)) = original.filter(|(k, _)| k == "mcp_servers") {
+                    let snip: toml_edit::DocumentMut = value.parse().map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
+                    if let Some(item) = snip.get("mcp_servers").and_then(|m| m.get("tokenstash")).cloned() {
+                        let servers = doc.entry("mcp_servers").or_insert(toml_edit::table());
+                        if let Some(servers) = servers.as_table_like_mut() { servers.insert("tokenstash", item); }
+                    }
+                }
+            }
+            let out = doc.to_string();
+            toml::from_str::<toml::Value>(&out).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
+            out
+        } else {
+            let mut v: serde_json::Value = if text.trim().is_empty() { serde_json::json!({}) } else { serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e})", p.display()))? };
+            if ours {
+                if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+                    m.remove("tokenstash");
+                }
+                if let Some((_, value)) = original.filter(|(k, _)| k == "mcpServers") {
+                    let entry: serde_json::Value = serde_json::from_str(&value).map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
+                    if let Some(root) = v.as_object_mut() {
+                        if let Some(m) = root.entry("mcpServers").or_insert(serde_json::json!({})).as_object_mut() {
+                            m.insert("tokenstash".into(), entry);
+                        }
+                    }
+                }
+            }
+            serde_json::to_string_pretty(&v)?
         }
-        write_file(p, &serde_json::to_string_pretty(&v)?)?;
+    };
+    if backup.is_none() && effectively_empty_text(p, &out) {
+        return remove_file_if_present(p);
     }
-    match backup {
-        Some(b) => {
-            if let Some((key, value)) = original_entry(b)? {
-                reinsert(&Removed { file: p.to_path_buf(), key, value })?;
-            }
-        }
-        None => {
-            if effectively_empty(p) {
-                remove_file_if_present(p)?;
-            }
-        }
+    if out != text {
+        write_file(p, &out)?;
     }
     Ok(())
 }
@@ -694,7 +781,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
             if !ok { manifest.claude_mcp_registered = false; manifest.save()?; }
             ok
         } else {
-            match manifest.mutate(&cj, || merge_mcp_json_typed(&cj, &w.exe, true, w.ts_home.as_deref())) {
+            match manifest.mutate(&cj, || merge_mcp_json_typed(&cj, &w.exe, true, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&cj)) {
                 Ok(()) => { touched.push(cj); true }
                 Err(e) => { println!("! Claude Code: left {} untouched — {e}", cj.display()); false }
             }
@@ -708,7 +795,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let codex = w.codex();
     if codex.is_dir() {
         let ctoml = codex.join("config.toml");
-        match manifest.mutate(&ctoml, || merge_codex_toml(&ctoml, &w.exe, w.ts_home.as_deref())) {
+        match manifest.mutate(&ctoml, || merge_codex_toml(&ctoml, &w.exe, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&ctoml)) {
             Ok(()) => { touched.push(ctoml.clone()); println!("✓ Codex: MCP server registered ({})", ctoml.display()) }
             Err(e) => println!("! Codex: left {} untouched — {e}", ctoml.display()),
         }
@@ -716,7 +803,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let cursor = w.cursor();
     if cursor.is_dir() {
         let cj = cursor.join("mcp.json");
-        match manifest.mutate(&cj, || merge_mcp_json(&cj, &w.exe, w.ts_home.as_deref())) {
+        match manifest.mutate(&cj, || merge_mcp_json(&cj, &w.exe, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&cj)) {
             Ok(()) => { touched.push(cj.clone()); println!("✓ Cursor: MCP server registered ({})", cj.display()) }
             Err(e) => println!("! Cursor: left {} untouched — {e}", cj.display()),
         }
@@ -724,7 +811,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let gemini = w.gemini();
     if gemini.is_dir() {
         let gj = gemini.join("settings.json");
-        match manifest.mutate(&gj, || merge_mcp_json(&gj, &w.exe, w.ts_home.as_deref())) {
+        match manifest.mutate(&gj, || merge_mcp_json(&gj, &w.exe, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&gj)) {
             Ok(()) => { touched.push(gj.clone()); println!("✓ Gemini CLI: MCP server registered ({})", gj.display()) }
             Err(e) => println!("! Gemini CLI: left {} untouched — {e}", gj.display()),
         }
@@ -1264,10 +1351,18 @@ fn has_snippet(p: &Path) -> bool {
 /// hand-edited file) stops the whole thing: guessing where it ends could eat the user's
 /// text, and nothing is written.
 fn strip_snippet(p: &Path) -> Result<()> {
-    let mut s = fs::read_to_string(p)?;
+    let s = fs::read_to_string(p)?;
+    let out = strip_sections(&s).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
+    write_file(p, &out)
+}
+
+/// The text without its marked sections. A section without its end mark (a hand-edited
+/// file) is an error: guessing where it ends could eat the user's text.
+fn strip_sections(text: &str) -> Result<String> {
+    let mut s = text.to_string();
     while let Some(start) = s.find(SNIPPET_MARK) {
         let Some(end_rel) = s[start..].find(SNIPPET_END) else {
-            anyhow::bail!("{}: a tokenstash section has no closing `{SNIPPET_END}`; remove it by hand", p.display());
+            anyhow::bail!("a tokenstash section has no closing `{SNIPPET_END}`; remove it by hand");
         };
         let mut end = start + end_rel + SNIPPET_END.len();
         if s[end..].starts_with('\n') { end += 1; }
@@ -1277,8 +1372,7 @@ fn strip_snippet(p: &Path) -> Result<()> {
         if s[..start].ends_with("\n\n") { start -= 1; } else if start == 0 && s[end..].starts_with('\n') { end += 1; }
         s = format!("{}{}", &s[..start], &s[end..]);
     }
-    write_file(p, &s)?;
-    Ok(())
+    Ok(s)
 }
 
 fn frontmatter(skill: &str) -> &str {
@@ -1929,4 +2023,62 @@ mod tests {
         assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_dir(&d).unwrap().count(), 1, "no temporary file left behind");
     }
+
+    /// Greptile on #70: a config kept as a link stays a link, and the file it points to is
+    /// what changes.
+    #[test]
+    fn a_linked_config_is_written_through_and_stays_a_link() {
+        let d = scratch("linked");
+        let real = d.join("dotfiles/config.toml");
+        write(&real, "model = \"o3\"\n");
+        let link = d.join("codex/config.toml");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_file(&link, "model = \"o4\"\n").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(read(&real), "model = \"o4\"\n");
+    }
+
+    /// Greptile on #70: an entry the person changed or re-added after `init --mcp` is theirs,
+    /// and undo leaves it.
+    #[test]
+    fn undo_leaves_an_entry_the_person_changed_since() {
+        let (w, mut m) = machine("changed-entry");
+        write(&w.codex().join("config.toml"), "[mcp_servers.github]\ncommand = \"gh-mcp\"\n");
+        wire(&mut m, &w, AgentMode::Auto, Some(true)).unwrap();
+        let changed = read(&w.codex().join("config.toml")).replace("/opt/tokenstash", "/usr/local/bin/tokenstash");
+        write(&w.codex().join("config.toml"), &changed);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        let after = read(&w.codex().join("config.toml"));
+        assert!(after.contains("/usr/local/bin/tokenstash") && after.contains("gh-mcp"), "{after}");
+    }
+
+    /// Greptile on #70: undo reads everything before it writes, so a backup it cannot read
+    /// leaves the file exactly as it was.
+    #[test]
+    fn an_unreadable_backup_leaves_the_file_untouched() {
+        let (w, mut m) = machine("bad-backup-undo");
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"}}}");
+        wire(&mut m, &w, AgentMode::Auto, Some(true)).unwrap();
+        let backup = m.files.iter().find(|(p, _)| p == &w.cursor().join("mcp.json")).unwrap().1.clone().unwrap();
+        fs::write(&backup, "{ corrupt").unwrap();
+        let before = read(&w.cursor().join("mcp.json"));
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 1, "unfinished");
+        assert_eq!(read(&w.cursor().join("mcp.json")), before, "nothing was half undone");
+    }
+
+    /// Greptile on #70: undo straight from an older record keeps a section the person edited,
+    /// as an upgrade does.
+    #[test]
+    fn undo_keeps_an_edited_section_from_an_older_record() {
+        let (w, mut m) = machine("old-record-edited");
+        let proj = scratch("old-record-app").join("AGENTS.md");
+        write(&proj, "# App\n");
+        m.mutate(&proj, || { fs::write(&proj, format!("# App\n\n{}", section(SHIPPED_SECTIONS[0])))?; Ok(()) }).unwrap();
+        let edited = format!("# App\n\n{}", section(&format!("{}\nMine: never use the prod key.", SHIPPED_SECTIONS[0])));
+        write(&proj, &edited);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        assert_eq!(read(&proj), edited, "the person's edit stays");
+    }
 }
+
