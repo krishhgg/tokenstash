@@ -500,6 +500,14 @@ pub fn answer_secret_by(ctx: &Ctx, actor: Actor, task: &Task, value: SecretStrin
     Ok(AnswerResult::Stored { injected_to, sensitive, liveness, rotation })
 }
 
+// Test-only: runs once, on this thread, after a store commits and before it writes the env
+// file. Tests use it to make another process act in that gap, which has no stash or probe
+// call to hang a hook on.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AFTER_STORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Shared by `answer_secret` and auto-generated secrets. See [`store_and_inject_gated`].
 #[allow(clippy::too_many_arguments)]
 pub fn store_and_inject(
@@ -536,7 +544,8 @@ pub fn store_and_inject(
 /// Injection into the env file happens last, outside the lock: if it fails the task is
 /// already answered and the value already stored, so a re-run of `need` hits and injects
 /// rather than asking the human again. It writes what the stash holds when the env file's
-/// lock is taken, which is a newer store's value if one committed in the meantime.
+/// lock is taken, which is a newer store's value if one committed in the meantime. If the
+/// key was removed by then, it writes nothing and returns an error saying so.
 #[allow(clippy::too_many_arguments)]
 fn store_and_inject_gated(
     ctx: &Ctx,
@@ -583,15 +592,22 @@ fn store_and_inject_gated(
         }
         Err(e) => return Err(rollback_store(ctx, e)),
     }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_STORE_COMMIT.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
     // Another store may have committed a newer value since this one did, and written it
     // here already. Reading the stash under the env file's lock, as `need::deliver` does,
     // keeps this write from putting the older value back.
     let injected_to = if project.is_dir() {
-        let p = crate::envfile::write_with(project, &ctx.cfg.env_file, name, || ctx.stash.get(&stash_key(name, identity)))?;
-        if p.is_some() {
-            ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
-        }
-        p
+        let written = crate::envfile::write_with(project, &ctx.cfg.env_file, name, || ctx.stash.get(&stash_key(name, identity)))?;
+        // An empty stash here means the key was forgotten since the COMMIT. The caller
+        // must not report a delivery that did not happen.
+        let Some(p) = written else {
+            bail!("{name}@{identity} was stored, then removed from the stash before it was written to {}; nothing was written there", project.join(&ctx.cfg.env_file).display());
+        };
+        ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
+        Some(p)
     } else {
         None
     };

@@ -1679,6 +1679,51 @@ fn a_broad_delivery_does_not_write_a_sensitive_value_stored_under_it() {
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
+/// A store pauses after its COMMIT. Another process stores B and writes it to the env file.
+/// The first store then writes what the stash holds, B, not the A it stored.
+#[test]
+fn a_store_paused_after_its_commit_does_not_write_over_a_newer_store() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("store-order");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let (db_path, project) = (home.join("t.db"), proj.clone());
+    tasks::AFTER_STORE_COMMIT.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+        let cfg = Config::default();
+        let db = Db::open(&db_path).unwrap();
+        let stash = stash::open(&cfg).unwrap();
+        let other = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+        tasks::store_and_inject(&other, "OPENAI_API_KEY", "default", &SecretString::from("sk-second-bbbbbbbbbbbbbbbbbbbb".to_string()), None, None, false, &project, "human", None, tasks::Verified::Unknown, db::GRANT_PASTE).unwrap();
+    })));
+    tasks::store_and_inject(&ctx, "OPENAI_API_KEY", "default", &SecretString::from("sk-first-aaaaaaaaaaaaaaaaaaaaa".to_string()), None, None, false, &proj, "human", None, tasks::Verified::Unknown, db::GRANT_PASTE).unwrap();
+    let written = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert!(written.contains("sk-second-") && !written.contains("sk-first-"), "the env file holds what the stash holds: {written}");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// `forget` removes the key after the answer's store commits and before its env file write.
+/// The answer reports that nothing was written instead of reporting a delivery.
+#[test]
+fn an_answer_whose_key_is_forgotten_before_the_env_write_reports_it() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("store-forgotten");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let card = tasks::create_secret_task(&ctx, &proj, "agent", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
+    let key = stash::stash_key("OPENAI_API_KEY", "default");
+    tasks::AFTER_STORE_COMMIT.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+        stash::open(&Config::default()).unwrap().delete(&key).unwrap();
+    })));
+    let err = tasks::answer_secret(&ctx, &card, SecretString::from("sk-forgotten-aaaaaaaaaaaaaaaaa".to_string()), true).expect_err("nothing reached the env file");
+    assert!(format!("{err:#}").contains("removed from the stash"), "{err:#}");
+    assert!(!proj.join(".env.local").exists());
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
 /// A report's probe takes seconds. When the human stores a new value meanwhile, the verdict
 /// about the old one changes nothing: a 401 does not mark the new value stale (which would
 /// file a Replace card for it), and an Ok does not clear a flag the new value earned.
