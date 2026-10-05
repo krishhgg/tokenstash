@@ -2150,6 +2150,59 @@ fn a_card_that_grew_since_it_was_read_is_refused() {
     assert_eq!(db.grants_for(&ws.id).unwrap().len(), 2);
 }
 
+/// The answer re-reads the card, compares it with what the human was shown, and decides and
+/// closes it under one index write lock. An agent's merge that already holds the lock when
+/// the answer starts lands first, and the answer refuses the grown card. A denial never
+/// records a key the human was not shown, and an approval never closes one.
+#[test]
+fn an_answer_compares_and_closes_the_card_under_one_lock() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("answer-lock");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let pid = proj.to_string_lossy().to_string();
+    for n in ["OPENAI_API_KEY", "GROQ_API_KEY", "RESEND_API_KEY"] {
+        stash.set(&stash::stash_key(n, "default"), &SecretString::from("aaaaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+    }
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    let ws = db.find_workspace(&proj).unwrap().unwrap();
+    for (decision, added) in [(tasks::Decision::Deny, "GROQ_API_KEY@default"), (tasks::Decision::Allow, "RESEND_API_KEY@default")] {
+        let shown = db.get_task(&tid).unwrap().unwrap();
+        // Another process's `need` is growing the card. It holds the write lock when the
+        // human's answer starts and commits 300 ms later.
+        let agent = Db::open(&home.join("t.db")).unwrap();
+        let mut grown = shown.names.clone();
+        grown.push(added.to_string());
+        let card_id = tid.clone();
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let merge = std::thread::spawn(move || {
+            agent.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(agent.update_task_names(&card_id, &grown).unwrap());
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            agent.conn.execute_batch("COMMIT").unwrap();
+        });
+        wait_locked.recv().unwrap();
+        let answer = tasks::answer_approval(&ctx, &shown, decision, Some(&shown.names));
+        merge.join().unwrap();
+        let err = format!("{:#}", answer.expect_err("the card grew before the answer held the lock"));
+        assert!(err.contains("changed since you read it"), "{decision:?}: {err}");
+        let card = db.get_task(&tid).unwrap().unwrap();
+        assert_eq!(card.status, db::TaskStatus::Pending, "{decision:?}");
+        assert!(card.names.iter().any(|n| n == added));
+        assert!(db.recent_denied_approvals(&pid, "1970-01-01T00:00:00Z").unwrap().is_empty(), "nothing is denied that the human was not shown");
+        assert!(db.grants_for(&ws.id).unwrap().is_empty(), "nothing is granted");
+    }
+    // Re-read, the answer goes through and covers exactly what the human was shown.
+    let now = db.get_task(&tid).unwrap().unwrap();
+    tasks::answer_approval(&ctx, &now, tasks::Decision::Allow, Some(&now.names)).unwrap();
+    assert_eq!(db.grants_for(&ws.id).unwrap().len(), 3);
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
 #[test]
 fn refused_roots_include_home_and_tool_dirs_and_a_dotfiles_repo_is_not_a_project() {
     let _g = env_lock();

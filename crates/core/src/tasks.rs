@@ -662,6 +662,15 @@ fn record_stored(ctx: &Ctx, name: &str, identity: &str, provider: Option<String>
     Ok(())
 }
 
+/// The grant source an answered approval card records, by its kind.
+fn approval_grant_source(kind: &str) -> &'static str {
+    match kind {
+        APPROVAL_ONCE => crate::db::GRANT_ONCE,
+        APPROVAL_SENSITIVE => crate::db::GRANT_SENSITIVE,
+        _ => crate::db::GRANT_PAIRING,
+    }
+}
+
 /// `seen` is the list of names the human was shown; if the card grew since (an agent
 /// asked for more while the page was open) the answer is refused and the human re-reads.
 pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<&[String]>) -> Result<AnswerResult> {
@@ -671,38 +680,42 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
     if task.status != TaskStatus::Pending {
         bail!("task {} is already {}", task.id, task.status.as_str());
     }
-    let task = &ctx.db.get_task(&task.id)?.unwrap_or_else(|| task.clone());
-    if let Some(seen) = seen {
-        let mut a: Vec<&String> = task.names.iter().collect(); a.sort();
-        let mut b: Vec<&String> = seen.iter().collect(); b.sort();
-        if a != b {
-            bail!("this card changed since you read it (it now lists {}); reload it and decide again", task.names.iter().map(|n| n.strip_suffix("@default").unwrap_or(n)).collect::<Vec<_>>().join(", "));
+    // 1. Decide on the card as it is under the index write lock. The re-read, the comparison
+    //    with what the human was shown, the grants and the close all happen on that one
+    //    version. An agent growing the card takes the same lock (`create_approval_task`),
+    //    so its merge lands before the re-read, and the comparison refuses, or after the
+    //    close, and it files a new card. Compared outside the lock, a name added in between
+    //    was closed with the card, so a denial recorded a key the human never saw.
+    //    Every grant plus the task's answered status commit together. Once this commits the
+    //    human's answer is final and nothing can ask them again. A one-time approval
+    //    (program-derived, `run`) records the answer but no grant, so the next request for
+    //    the same key in this project asks again, by design.
+    if !ctx.db.conn.is_autocommit() {
+        bail!("answer_approval called inside a transaction");
+    }
+    ctx.db.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
+    let decided = (|| -> Result<Task> {
+        let task = ctx.db.get_task(&task.id)?.unwrap_or_else(|| task.clone());
+        if let Some(seen) = seen {
+            let mut a: Vec<&String> = task.names.iter().collect(); a.sort();
+            let mut b: Vec<&String> = seen.iter().collect(); b.sort();
+            if a != b {
+                bail!("this card changed since you read it (it now lists {}); reload it and decide again", task.names.iter().map(|n| n.strip_suffix("@default").unwrap_or(n)).collect::<Vec<_>>().join(", "));
+            }
         }
-    }
-    let pid = task.project.clone();
-    if decision == Decision::Deny {
-        if !ctx.db.close_task_if_open(&task.id, TaskStatus::Denied, None)? {
-            bail!("task {} was already answered somewhere else", task.id);
+        let pid = task.project.clone();
+        if decision == Decision::Deny {
+            if !ctx.db.close_task_if_open(&task.id, TaskStatus::Denied, None)? {
+                bail!("task {} was already answered somewhere else", task.id);
+            }
+            ctx.db.audit(Some(&pid), Some(&task.agent), "deny", None, None, Some(&task.names.join(",")))?;
+            return Ok(task);
         }
-        ctx.db.audit(Some(&pid), Some(&task.agent), "deny", None, None, Some(&task.names.join(",")))?;
-        return Ok(AnswerResult::Denied);
-    }
-    let project = Path::new(&pid);
-    let kind = task.expects.as_str();
-    if decision == Decision::AllowBroad && kind != APPROVAL_PAIRING {
-        bail!("only a pairing card can grant broadly");
-    }
-    // 1. Record the decision atomically: every grant plus the task's answered status.
-    //    Once this commits the human's answer is final and nothing can ask them again.
-    //    A one-time approval (program-derived, `run`) records the answer but no grant: the
-    //    next request for the same key in this project asks again, by design.
-    let grant_source = match kind {
-        APPROVAL_ONCE => crate::db::GRANT_ONCE,
-        APPROVAL_SENSITIVE => crate::db::GRANT_SENSITIVE,
-        _ => crate::db::GRANT_PAIRING,
-    };
-    {
-        let tx = ctx.db.conn.unchecked_transaction()?;
+        let project = Path::new(&pid);
+        let kind = task.expects.as_str();
+        if decision == Decision::AllowBroad && kind != APPROVAL_PAIRING {
+            bail!("only a pairing card can grant broadly");
+        }
         if kind != APPROVAL_ONCE {
             // The human is pairing THIS directory. If the record on file is for a directory
             // that no longer exists at this path, replace it (revoking the old grants).
@@ -713,7 +726,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
             };
             for entry in &task.names {
                 let (n, identity) = split_identity(entry);
-                ctx.db.grant(&ws.id, n, identity, crate::db::GRANT_KEY, grant_source)?;
+                ctx.db.grant(&ws.id, n, identity, crate::db::GRANT_KEY, approval_grant_source(kind))?;
                 if decision == Decision::AllowBroad {
                     ctx.db.grant(&ws.id, "*", identity, crate::db::GRANT_BROAD, crate::db::GRANT_PAIRING)?;
                 }
@@ -723,8 +736,23 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
             bail!("task {} was already answered somewhere else; nothing was granted", task.id);
         }
         ctx.db.audit(Some(&pid), Some(&task.agent), "approve", None, None, Some(&format!("{}{}: {}", kind, if decision == Decision::AllowBroad { "+broad" } else { "" }, task.names.join(","))))?;
-        tx.commit().context("recording approval")?;
+        Ok(task)
+    })();
+    let task = match decided {
+        Ok(t) => match ctx.db.conn.execute_batch("COMMIT") {
+            Ok(()) => t,
+            Err(e) => return Err(rollback_store(ctx, anyhow!(e).context("recording the answer"))),
+        },
+        Err(e) => return Err(rollback_store(ctx, e)),
+    };
+    if decision == Decision::Deny {
+        return Ok(AnswerResult::Denied);
     }
+    let task = &task;
+    let pid = task.project.clone();
+    let project = Path::new(&pid);
+    let kind = task.expects.as_str();
+    let grant_source = approval_grant_source(kind);
     // 2. Inject each requested identity. Failures are collected and surfaced after all
     //    entries are attempted; the approval itself is already recorded.
     let mut injected = vec![];
