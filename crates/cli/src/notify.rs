@@ -167,6 +167,35 @@ pub fn desktop(cfg: &Config, title: &str, body: &str, where_to: &str) -> bool {
         .is_ok()
 }
 
+/// A listener on 127.0.0.1 that answers `/verify` as our inbox would, with this
+/// `TOKENSTASH_HOME`'s proof key, while `honest` is set, and as another process would after
+/// that. Returns its port. For tests of what links name.
+#[cfg(test)]
+pub(crate) fn fake_inbox(honest: std::sync::Arc<std::sync::atomic::AtomicBool>) -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let proof = inbox_auth::ensure_proof_key().unwrap();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            // The probe writes its request in pieces, so read up to the blank line.
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let nonce = head.split_once("?c=").and_then(|(_, rest)| rest.split(' ').next()).unwrap_or_default();
+            let body = if honest.load(std::sync::atomic::Ordering::SeqCst) { inbox_auth::verify_response(&proof, nonce) } else { "not the inbox".into() };
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        }
+    });
+    port
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

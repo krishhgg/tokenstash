@@ -28,6 +28,8 @@
 //! whole response — status line, headers and body, error replies included — must be taken
 //! within [`RESPONSE_DEADLINE`], and every partial write is given only the time that is left,
 //! so the main thread spends at most that long on any one client however slowly it reads.
+//! A request over the tailnet from another device also needs `tailscale whois` to say who sent
+//! it, which can take seconds; the reader asks that too, before it hands the request over.
 //!
 //! What this bounds is resources and each individual read or write, not fairness. Time spent
 //! in the kernel's listen backlog, in the acceptor's hand waiting for a free reader, or as a
@@ -184,10 +186,10 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
         if cfg.remote != tokenstash_core::config::Remote::Tailscale || !host_is_one_of(&req, &[cfg.remote_host.as_deref(), cfg.remote_ip.as_deref()]) {
             return not_found(req);
         }
-        let peer = req.peer.map(|p| p.ip());
-        let own_machine = from_this_machine(&req);
-        if !own_machine {
-            match (peer.and_then(crate::remote::whois), cfg.remote_login.as_deref()) {
+        // The login came from the reader that read this request (see `peer_login`), so a
+        // slow `tailscale whois` never holds this thread. No login is no answer.
+        if !from_this_machine(&req) {
+            match (req.peer_login.as_deref(), cfg.remote_login.as_deref()) {
                 (Some(login), Some(owner)) if login == owner => person_device = true,
                 _ => return not_found(req),
             }
@@ -425,12 +427,21 @@ fn send_full_link(app: &App, task: &Task) -> Result<String> {
     if sent.get(&task.id).is_some_and(|at| at.elapsed() < RESEND_EVERY) {
         return Ok("Sent a moment ago: look for the tokenstash notification on this computer's desktop".into());
     }
-    let link = crate::util::inbox_url_human(&app.cfg, Some(&task.id), crate::notify::Inbox::Ours);
+    let link = desktop_link(&app.cfg, &task.id);
     if !crate::notify::desktop(&app.cfg, &task.title, &format!("{} · open this to decide", tokenstash_core::project::short(std::path::Path::new(&task.project))), &link) {
         anyhow::bail!("{}", if app.cfg.notifications { "this computer could not show a desktop notification (no desktop session here, as on a server or over SSH)" } else { "desktop notifications are turned off (notifications = false in config.toml)" });
     }
     sent.insert(task.id.clone(), Instant::now());
     Ok("Sent: click the tokenstash notification on this computer's desktop to decide on this card".into())
+}
+
+/// The full-session link to card `id` that the inbox puts in a desktop notification, always on
+/// loopback. The notification shows on this computer, where 127.0.0.1 opens. A Tailscale link
+/// would first have this thread prove the inbox's own tailnet listener, a request that only
+/// this thread can answer, so it would wait out the probe's timeout and fall back anyway.
+fn desktop_link(cfg: &tokenstash_core::Config, id: &str) -> String {
+    let here = tokenstash_core::Config { remote: tokenstash_core::config::Remote::Off, ..cfg.clone() };
+    crate::util::inbox_url_human(&here, Some(id), crate::notify::Inbox::Ours)
 }
 
 /// Which family a path belongs to. Anything else is nothing.
@@ -598,6 +609,9 @@ struct Request {
     peer: Option<std::net::SocketAddr>,
     /// It came in on the Tailscale listener, not loopback.
     tailnet: bool,
+    /// For a tailnet request from another device, the login Tailscale names for its address
+    /// (see [`peer_login`]). `None` otherwise.
+    peer_login: Option<String>,
     /// A cookie every response to this request carries: the session, for the person on
     /// another of their devices (see `handle`).
     set_cookie: Option<String>,
@@ -709,7 +723,10 @@ fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<
         std::thread::spawn(move || loop {
             let next = conn_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
             let Ok(stream) = next else { return };
-            if let Some(req) = read_request(stream, tailnet) {
+            if let Some(mut req) = read_request(stream, tailnet) {
+                if tailnet {
+                    req.peer_login = peer_login(&req);
+                }
                 if req_tx.send(req).is_err() {
                     return;
                 }
@@ -740,6 +757,17 @@ fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
     });
+}
+
+/// Who sent a tailnet request from another device, as Tailscale names it. Asked here, on the
+/// reader that read the request, and not by `handle`: `tailscale whois` can take seconds, and
+/// the main thread answers everyone, loopback included. `None` for this machine, which is
+/// not looked up because it gets what loopback gets, and for a device Tailscale cannot name.
+fn peer_login(req: &Request) -> Option<String> {
+    if from_this_machine(req) {
+        return None;
+    }
+    crate::remote::whois(req.peer?.ip())
 }
 
 /// Listen on this machine's Tailscale address too, when remote access is on and nothing
@@ -835,7 +863,7 @@ fn read_request(mut stream: TcpStream, tailnet: bool) -> Option<Request> {
             }
         }
     }
-    Some(Request { method: head.method, url: head.url, headers: head.headers, body, oversized, stream: Some(stream), peer, tailnet, set_cookie: None })
+    Some(Request { method: head.method, url: head.url, headers: head.headers, body, oversized, stream: Some(stream), peer, tailnet, peer_login: None, set_cookie: None })
 }
 
 /// One read of up to `max` bytes appended to `buf`, or why there was none. Returns within
@@ -1123,6 +1151,28 @@ fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scop
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The link the card's "send it to my desktop" button sends is on loopback, even with
+    /// remote access on and a listener on the Tailscale address that passes the proof. The
+    /// notification shows on this computer, and the inbox proving its own tailnet listener
+    /// from the thread that has to answer the proof would only wait out the probe.
+    #[test]
+    fn the_desktop_link_stays_on_loopback() {
+        use tokenstash_core::config::Remote;
+        let _g = inbox_auth::env_lock();
+        let home = std::env::temp_dir().join(format!("tokenstash-desktop-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("TOKENSTASH_HOME", &home);
+        let port = crate::notify::fake_inbox(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let cfg = tokenstash_core::Config { inbox_port: port, remote: Remote::Tailscale, remote_ip: Some("127.0.0.1".into()), remote_host: Some("box.tail1234.ts.net".into()), ..Default::default() };
+        let link = desktop_link(&cfg, "t_abc");
+        let tailnet = crate::util::inbox_url(&cfg, Some("t_abc"));
+        std::env::remove_var("TOKENSTASH_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(link.starts_with(&format!("http://127.0.0.1:{port}/t/t_abc")), "{link}");
+        assert!(tailnet.starts_with("http://box.tail1234.ts.net:"), "the listener passes the proof: {tailnet}");
+    }
 
     #[test]
     fn csrf_field_carries_the_token_and_escapes_it() {

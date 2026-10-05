@@ -41,29 +41,44 @@ pub struct Tailnet {
     pub login: Option<String>,
 }
 
-/// The `tailscale` CLI: `TOKENSTASH_TAILSCALE` (tests), `tailscale` on PATH, or the binary
-/// inside the macOS app.
+/// Where Tailscale installs its `tailscale` CLI, in the order tried, and nowhere else. The
+/// inbox often runs with an agent's environment, and `tailscale whois` decides who a tailnet
+/// request comes from, so a `PATH` or a variable the agent chose could run a program of its
+/// own that names the owner as the sender of any request.
+#[cfg(target_os = "macos")]
+const TAILSCALE_PATHS: &[&str] = &["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"];
+#[cfg(not(target_os = "macos"))]
+const TAILSCALE_PATHS: &[&str] = &["/usr/bin/tailscale", "/usr/sbin/tailscale", "/usr/local/bin/tailscale", "/run/current-system/sw/bin/tailscale"];
+
+/// The `PATH` the `tailscale` CLI runs with. It finds helpers such as `lsof` there.
+const TAILSCALE_ENV_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The `tailscale` CLI. Debug builds take `TOKENSTASH_TAILSCALE` first, so the tests can stand
+/// up a fake tailnet; release builds never read it.
 fn tailscale_bin() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("TOKENSTASH_TAILSCALE").filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(p));
     }
-    if let Some(paths) = std::env::var_os("PATH") {
-        if let Some(p) = std::env::split_paths(&paths).map(|d| d.join("tailscale")).find(|p| p.is_file()) {
-            return Some(p);
-        }
-    }
-    let mac = PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
-    mac.is_file().then_some(mac)
+    installed_tailscale()
 }
 
-/// How long one `tailscale` call may take. `whois` runs on the inbox's request thread, so a
-/// stalled one would stop every answer, loopback included.
+/// The first of [`TAILSCALE_PATHS`] that exists.
+fn installed_tailscale() -> Option<PathBuf> {
+    TAILSCALE_PATHS.iter().map(PathBuf::from).find(|p| p.is_file())
+}
+
+/// How long one `tailscale` call may take. The inbox runs `whois` on the reader thread that
+/// read the request, so a stalled one holds that connection and its reader, nothing more.
 const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn tailscale_json(args: &[&str]) -> Result<serde_json::Value> {
     use std::io::Read;
-    let bin = tailscale_bin().context("the `tailscale` command is not installed here")?;
+    let bin = tailscale_bin().with_context(|| format!("the `tailscale` command is not installed in any of its usual places ({}); tokenstash does not look for it on PATH", TAILSCALE_PATHS.join(", ")))?;
     let mut child = std::process::Command::new(&bin).args(args)
+        // None of the caller's environment but HOME, since the CLI reads variables of its own
+        // and the caller may be an agent.
+        .env_clear().env("PATH", TAILSCALE_ENV_PATH).envs(std::env::var_os("HOME").map(|h| ("HOME", h)))
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .spawn().with_context(|| format!("running {}", bin.display()))?;
     // Read the output on threads so a chatty child cannot fill a pipe and stall the wait.
@@ -109,26 +124,27 @@ pub fn status() -> Result<Tailnet> {
     Ok(Tailnet { ip, dns_name, login })
 }
 
-/// The Tailscale login of the device at `ip`, or `None` for a tagged device or an address
-/// Tailscale does not know. Cached for a minute per address: a page load is several requests.
-/// A looked-up login and when it was looked up.
+/// A login Tailscale named for an address, and when it did.
 type Seen = HashMap<IpAddr, (Option<String>, Instant)>;
 
+/// The Tailscale login of the device at `ip`, or `None` for a tagged device or when Tailscale
+/// cannot say. Tailscale's answer is kept for a minute per address, since a page load is
+/// several requests. A lookup that failed (Tailscale slow or restarting, or an address it does
+/// not know) is not kept, so the next request asks again.
 pub fn whois(ip: IpAddr) -> Option<String> {
     static CACHE: Mutex<Option<Seen>> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(60);
-    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    let cache = cache.get_or_insert_with(HashMap::new);
-    if let Some((login, at)) = cache.get(&ip) {
+    if let Some((login, at)) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashMap::new).get(&ip) {
         if at.elapsed() < TTL {
             return login.clone();
         }
     }
-    let login = tailscale_json(&["whois", "--json", &ip.to_string()]).ok().and_then(|v| {
-        let tagged = v["Node"]["Tags"].as_array().is_some_and(|t| !t.is_empty());
-        if tagged { None } else { v["UserProfile"]["LoginName"].as_str().map(String::from) }
-    });
-    cache.insert(ip, (login.clone(), Instant::now()));
+    // Without the lock held: readers look up several peers at once, and the owner's device
+    // must not wait behind a slow lookup for another one.
+    let v = tailscale_json(&["whois", "--json", &ip.to_string()]).ok()?;
+    let tagged = v["Node"]["Tags"].as_array().is_some_and(|t| !t.is_empty());
+    let login = if tagged { None } else { v["UserProfile"]["LoginName"].as_str().map(String::from) };
+    CACHE.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashMap::new).insert(ip, (login.clone(), Instant::now()));
     login
 }
 
@@ -141,21 +157,13 @@ pub fn base_url(cfg: &Config) -> String {
     }
 }
 
-/// The address links and notifications use: the Tailscale one only once our inbox has proved
-/// it answers there (checked at most every 30 s per process), loopback otherwise.
+/// The address links and notifications use: the Tailscale one only when our inbox proves, as
+/// this link is made, that it answers there; loopback otherwise. The proof is one local
+/// request, and it is never reused: the inbox may have stopped, or remote access gone off and
+/// on, since the last one, and another process may hold that address and port now.
 pub fn link_base(cfg: &Config) -> String {
-    static PROVED: Mutex<Option<(String, Instant)>> = Mutex::new(None);
-    let remote = base_url(cfg);
-    if cfg.remote != Remote::Tailscale {
-        return remote;
-    }
-    let mut proved = PROVED.lock().unwrap_or_else(|p| p.into_inner());
-    if proved.as_ref().is_some_and(|(base, at)| *base == remote && at.elapsed() < Duration::from_secs(30)) {
-        return remote;
-    }
-    if crate::notify::tailnet_state(cfg) == crate::notify::Inbox::Ours {
-        *proved = Some((remote.clone(), Instant::now()));
-        return remote;
+    if cfg.remote == Remote::Tailscale && crate::notify::tailnet_state(cfg) == crate::notify::Inbox::Ours {
+        return base_url(cfg);
     }
     format!("http://127.0.0.1:{}", cfg.inbox_port)
 }
@@ -278,8 +286,8 @@ pub fn remote(a: RemoteArgs) -> Result<i32> {
 mod tests {
     use super::*;
 
-    /// Greptile on #69: a `tailscale` that stalls must not hold the caller (the inbox's
-    /// request thread, for `whois`) past the time limit.
+    /// Greptile on #69: a `tailscale` that stalls must not hold the caller (an inbox reader,
+    /// for `whois`) past the time limit.
     #[cfg(unix)]
     #[test]
     fn a_stalled_tailscale_call_gives_up_on_time() {
@@ -309,6 +317,106 @@ mod tests {
         assert!(fell_back.contains("has not answered on this machine's Tailscale address") && fell_back.contains("ssh -L 7433:127.0.0.1:7433"), "{fell_back}");
         cfg.remote = Remote::Off;
         assert!(hint(&cfg, "tokenstash: the inbox is not running").is_empty());
+    }
+
+    /// A fake `tailscale` in a fresh directory, running `body` as a shell script.
+    #[cfg(unix)]
+    fn fake_tailscale(name: &str, body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tokenstash-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("tailscale");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, bin)
+    }
+
+    /// Greptile on #61: the program that says who sent a tailnet request is not the caller's
+    /// to choose. A release build runs only a `tailscale` from where Tailscale installs it,
+    /// never one found on `PATH` or named by `TOKENSTASH_TAILSCALE`, and whichever runs gets
+    /// none of the caller's environment but `HOME` and a fixed `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn the_tailscale_program_and_its_environment_are_not_the_callers() {
+        let _g = crate::inbox_auth::env_lock();
+        let (dir, fake) = fake_tailscale("chosen", r#"echo "{\"BackendState\":\"${TOKENSTASH_TEST_INHERITED:-none} $PATH\"}""#);
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut front = vec![dir.clone()];
+        front.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(front).unwrap());
+        std::env::set_var("TOKENSTASH_TAILSCALE", &fake);
+        std::env::set_var("TOKENSTASH_TEST_INHERITED", "inherited");
+        // What a release build runs, an installed one or none.
+        let installed = installed_tailscale();
+        // Debug builds take the override, which is how the tests fake a tailnet.
+        let err = status().unwrap_err();
+        std::env::set_var("PATH", &path);
+        std::env::remove_var("TOKENSTASH_TAILSCALE");
+        std::env::remove_var("TOKENSTASH_TEST_INHERITED");
+        assert_ne!(installed.as_deref(), Some(fake.as_path()));
+        assert!(installed.as_deref().is_none_or(|p| TAILSCALE_PATHS.iter().any(|t| p == std::path::Path::new(t))), "{installed:?}");
+        assert!(format!("{err:#}").contains(&format!("(state: none {TAILSCALE_ENV_PATH})")), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Greptile on #63: a failed `tailscale whois` is not remembered. One that fails while
+    /// Tailscale restarts must not turn the owner's device away for the next minute. An
+    /// answer is still kept, so a page load does not ask once per request.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_whois_is_asked_again_and_an_answer_is_kept() {
+        let _g = crate::inbox_auth::env_lock();
+        let dir = std::env::temp_dir().join(format!("tokenstash-whois-{}", std::process::id()));
+        let (up, calls) = (dir.join("up"), dir.join("calls"));
+        let answer = r#"{"Node":{"Tags":[]},"UserProfile":{"LoginName":"owner@example.com"}}"#;
+        let (dir, bin) = fake_tailscale("whois", &format!("echo x >> '{}'\n[ -f '{}' ] || exit 1\necho '{answer}'", calls.display(), up.display()));
+        std::env::set_var("TOKENSTASH_TAILSCALE", &bin);
+        // An address no other test looks up, since answers are kept for the whole process.
+        let ip: IpAddr = "100.64.0.77".parse().unwrap();
+        let down = whois(ip);
+        std::fs::write(&up, "").unwrap();
+        let recovered = whois(ip);
+        std::fs::remove_file(&up).unwrap();
+        let kept = whois(ip);
+        std::env::remove_var("TOKENSTASH_TAILSCALE");
+        assert_eq!(down, None);
+        assert_eq!(recovered.as_deref(), Some("owner@example.com"), "the failure was not remembered");
+        assert_eq!(kept.as_deref(), Some("owner@example.com"), "the answer was kept");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Greptile on #63 and #71: a link names the Tailscale address only on a proof made for
+    /// that link. Once whatever answers there fails the proof (the inbox stopped and another
+    /// process took the address and port, or remote access went off and on meanwhile), the
+    /// next link is on loopback, not one up to 30 seconds later.
+    #[test]
+    fn every_link_proves_the_tailnet_listener_again() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _g = crate::inbox_auth::env_lock();
+        let home = std::env::temp_dir().join(format!("tokenstash-reprove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("TOKENSTASH_HOME", &home);
+        let honest = std::sync::Arc::new(AtomicBool::new(true));
+        let port = crate::notify::fake_inbox(std::sync::Arc::clone(&honest));
+        let mut cfg = Config { inbox_port: port, remote: Remote::Tailscale, remote_ip: Some("127.0.0.1".into()), remote_host: Some("box.tail1234.ts.net".into()), ..Default::default() };
+        let (tailnet, loopback) = (format!("http://box.tail1234.ts.net:{port}"), format!("http://127.0.0.1:{port}"));
+        let mut seen = vec![link_base(&cfg)];
+        // Another process holds the address and port now.
+        honest.store(false, Ordering::SeqCst);
+        seen.push(link_base(&cfg));
+        // Off, then on again, and proved afresh either way.
+        cfg.remote = Remote::Off;
+        seen.push(link_base(&cfg));
+        cfg.remote = Remote::Tailscale;
+        seen.push(link_base(&cfg));
+        honest.store(true, Ordering::SeqCst);
+        seen.push(link_base(&cfg));
+        std::env::remove_var("TOKENSTASH_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(seen, vec![tailnet.clone(), loopback.clone(), loopback.clone(), loopback, tailnet]);
     }
 
     #[test]

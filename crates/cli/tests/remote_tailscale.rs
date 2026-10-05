@@ -1,6 +1,7 @@
 //! `remote = "tailscale"` end to end, with a fake `tailscale` and loopback aliases standing in
 //! for the tailnet: 127.0.0.2 is this machine's Tailscale address, 127.0.0.3 another device
-//! signed in as the owner, 127.0.0.4 a device of someone else. Linux only: other systems do
+//! signed in as the owner, 127.0.0.4 a device of someone else, 127.0.0.6 another of the
+//! owner's devices that Tailscale takes two seconds to name. Linux only: other systems do
 //! not answer on every 127.x address. Requests go out through `curl --interface`, which picks
 //! the address a request comes from.
 #![cfg(target_os = "linux")]
@@ -24,20 +25,24 @@ fn free_port() -> u16 {
 }
 
 /// What `tailscale status --json` and `tailscale whois --json IP` answer on this fake tailnet.
+/// `status` takes two seconds while a file named `slow` is in `dir`. tokenstash runs
+/// `tailscale` with none of its own environment, so a flag has to be a file.
 fn fake_tailscale(dir: &Path) -> PathBuf {
     let p = dir.join("tailscale");
+    let slow = dir.join("slow");
     std::fs::write(&p, format!(r#"#!/bin/sh
 case "$1" in
-status) [ -n "$TS_SLOW" ] && sleep "$TS_SLOW"; echo '{{"BackendState":"Running","Self":{{"TailscaleIPs":["127.0.0.2","fd7a::2"],"DNSName":"","UserID":1,"Tags":[]}},"User":{{"1":{{"LoginName":"{OWNER}"}}}}}}' ;;
+status) [ -f '{slow}' ] && sleep 2; echo '{{"BackendState":"Running","Self":{{"TailscaleIPs":["127.0.0.2","fd7a::2"],"DNSName":"","UserID":1,"Tags":[]}},"User":{{"1":{{"LoginName":"{OWNER}"}}}}}}' ;;
 whois)
   case "$3" in
   127.0.0.3) echo '{{"Node":{{"Tags":[]}},"UserProfile":{{"LoginName":"{OWNER}"}}}}' ;;
   127.0.0.4) echo '{{"Node":{{"Tags":[]}},"UserProfile":{{"LoginName":"someone@else.example"}}}}' ;;
+  127.0.0.6) sleep 2; echo '{{"Node":{{"Tags":[]}},"UserProfile":{{"LoginName":"{OWNER}"}}}}' ;;
   *) echo "no such peer" >&2; exit 1 ;;
   esac ;;
 *) exit 2 ;;
 esac
-"#)).unwrap();
+"#, slow = slow.display())).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     p
@@ -99,13 +104,14 @@ fn session_cookie(head: &str) -> Option<String> {
     head.lines().find_map(|l| l.strip_prefix("Set-Cookie: tokenstash_inbox=").or_else(|| l.strip_prefix("set-cookie: tokenstash_inbox="))).map(|v| v.split(';').next().unwrap().to_string())
 }
 
-#[test]
-fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
+/// A fresh home, project and fake tailnet named `name`, with an inbox running on loopback and
+/// remote access off. `None` without curl.
+fn start(name: &str) -> Option<(World, Inbox)> {
     if Command::new("curl").arg("--version").stdout(Stdio::null()).status().map(|s| !s.success()).unwrap_or(true) {
         eprintln!("skipped: no curl");
-        return;
+        return None;
     }
-    let root = tmp("world");
+    let root = tmp(name);
     let port = free_port();
     let home = root.join("home");
     let proj = root.join("proj");
@@ -119,6 +125,58 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
         assert!(start.elapsed() < Duration::from_secs(20), "the inbox did not come up");
         std::thread::sleep(Duration::from_millis(50));
     }
+    Some((w, inbox))
+}
+
+/// Turn remote access on and wait until the inbox listens on the Tailscale address. Any answer
+/// counts, since this machine without a credential gets a 404.
+fn turn_on(w: &World) -> std::process::Output {
+    let on = w.run(&["remote", "tailscale"]);
+    let start = Instant::now();
+    while on.status.success() && curl(w, "127.0.0.2", "GET", "/", None, None, None).0 == 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the inbox did not start listening on the Tailscale address");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    on
+}
+
+/// A curl that GETs `url`, from `from` when given, and prints only the status code.
+fn get_code(url: &str, from: Option<&str>) -> Command {
+    let mut c = Command::new("curl");
+    c.args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--noproxy", "*", "--max-time", "10"]);
+    if let Some(f) = from {
+        c.args(["--interface", f]);
+    }
+    c.arg(url).stdout(Stdio::piped());
+    c
+}
+
+/// Greptile on #60: the inbox asks Tailscale who sent a tailnet request on the reader that
+/// read it, not on the thread that answers everyone. While Tailscale takes two seconds to
+/// name a new device, loopback answers at once, and that device still gets in only once
+/// Tailscale names it as the owner.
+#[test]
+fn a_slow_tailscale_lookup_does_not_hold_up_loopback() {
+    let Some((w, inbox)) = start("slow-peer") else { return };
+    let on = turn_on(&w);
+    assert!(on.status.success(), "{}", String::from_utf8_lossy(&on.stderr));
+    let slow = get_code(&format!("http://127.0.0.2:{}/", w.port), Some("127.0.0.6")).spawn().unwrap();
+    // Long enough for a reader to take the request and start the lookup.
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let local = get_code(&format!("http://127.0.0.1:{}/verify?c=nonce", w.port), None).output().unwrap();
+    let took = started.elapsed();
+    let slow = slow.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&local.stdout), "200");
+    assert!(took < Duration::from_secs(1), "loopback waited {took:?} behind the lookup");
+    assert_eq!(String::from_utf8_lossy(&slow.stdout), "200", "the owner's device gets in once Tailscale names it");
+    drop(inbox);
+}
+
+#[test]
+fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
+    let Some((w, inbox)) = start("world") else { return };
+    let port = w.port;
 
     // Off: nothing answers on the Tailscale address yet, and links point at loopback.
     let need = w.run(&["need", "OPENAI_API_KEY"]);
@@ -155,18 +213,12 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     impostor.join().unwrap();
 
     // On, from an agent's shell: the person it is for cannot reach the inbox until it is.
-    let on = w.run(&["remote", "tailscale"]);
+    // The running inbox starts listening on the Tailscale address within a second or so.
+    let on = turn_on(&w);
     assert!(on.status.success(), "{}", String::from_utf8_lossy(&on.stderr));
     assert!(String::from_utf8_lossy(&on.stdout).contains(&format!("http://127.0.0.2:{port}/")));
     let cfg = std::fs::read_to_string(w.home.join("config.toml")).unwrap();
     assert!(cfg.contains("remote = \"tailscale\"") && cfg.contains(&format!("remote_login = \"{OWNER}\"")), "{cfg}");
-    // The running inbox starts listening on the Tailscale address within a second or so
-    // (anything but a refused connection: this machine without a credential gets a 404).
-    let start = Instant::now();
-    while curl(&w, "127.0.0.2", "GET", "/", None, None, None).0 == 0 {
-        assert!(start.elapsed() < Duration::from_secs(10), "the inbox did not start listening on the Tailscale address");
-        std::thread::sleep(Duration::from_millis(100));
-    }
     let need = w.run(&["need", "OPENAI_API_KEY"]);
     let text = String::from_utf8_lossy(&need.stdout).into_owned();
     let link = text.split_whitespace().find(|t| t.starts_with(&format!("http://127.0.0.2:{port}/p/"))).unwrap_or_else(|| panic!("no tailnet link: {text}")).to_string();
@@ -235,10 +287,13 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
 
     // The person turns remote access off while an agent's `remote tailscale` still waits for
     // Tailscale: the later choice stands, and the slower command changes nothing.
-    let slow = w.cmd().args(["remote", "tailscale"]).env("TS_SLOW", "2").current_dir(&w.proj).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let flag = w.tailscale.with_file_name("slow");
+    std::fs::write(&flag, "").unwrap();
+    let slow = w.cmd().args(["remote", "tailscale"]).current_dir(&w.proj).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     std::thread::sleep(Duration::from_millis(500));
     assert!(w.run(&["remote", "off"]).status.success());
     let slow = slow.wait_with_output().unwrap();
+    std::fs::remove_file(&flag).unwrap();
     assert!(!slow.status.success() && String::from_utf8_lossy(&slow.stderr).contains("changed while this waited"), "{}", String::from_utf8_lossy(&slow.stderr));
     assert!(!std::fs::read_to_string(w.home.join("config.toml")).unwrap().contains("remote = \"tailscale\""));
 
