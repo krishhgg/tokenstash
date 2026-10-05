@@ -157,10 +157,11 @@ pub fn base_url(cfg: &Config) -> String {
     }
 }
 
-/// The address links and notifications use: the Tailscale one only when our inbox proves, as
-/// this link is made, that it answers there; loopback otherwise. The proof is one local
-/// request, and it is never reused: the inbox may have stopped, or remote access gone off and
-/// on, since the last one, and another process may hold that address and port now.
+/// The address links and notifications use: the Tailscale one only when our inbox proves, on
+/// this call, that it answers there; loopback otherwise. The proof is one local request, made
+/// once for each batch of links a command prints together ([`crate::util::Links`]) and never
+/// kept past it. The inbox may have stopped, or remote access gone off and on, since an
+/// earlier proof, and another process may hold that address and port now.
 pub fn link_base(cfg: &Config) -> String {
     if cfg.remote == Remote::Tailscale && crate::notify::tailnet_state(cfg) == crate::notify::Inbox::Ours {
         return base_url(cfg);

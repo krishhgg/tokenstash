@@ -20,11 +20,11 @@ pub fn request(app: &App, project: &Path, agent: &str, action: &Action, why: Opt
 
 /// A card an agent filed for the person, printed with its link and what to do next.
 pub fn print_pending(app: &App, project: &Path, agent: &str, t: &Task) -> Result<i32> {
-    let state = notify::ensure_inbox(&app.cfg);
+    let links = util::Links::new(&app.cfg, notify::ensure_inbox(&app.cfg));
     if app.db.mark_notified(&t.id).unwrap_or(true) {
-        notify::desktop(&app.cfg, &t.title, &format!("{} · asked by {agent}", tokenstash_core::project::short(project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
+        notify::desktop(&app.cfg, &t.title, &format!("{} · asked by {agent}", tokenstash_core::project::short(project)), &util::inbox_notice(&app.cfg, Some(&t.id), &links));
     }
-    let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), state);
+    let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), &links);
     println!("⏳ {} (card {})", t.title, t.id);
     println!("  next: {}", crate::guide::confirm_next(t, &card, &app.cfg));
     Ok(tokenstash_core::exit::PENDING)

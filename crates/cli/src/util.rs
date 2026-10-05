@@ -79,11 +79,38 @@ pub fn agent_from(arg: &Option<String>) -> String {
     tokenstash_core::need::clean_agent(&arg.clone().unwrap_or_else(tokenstash_core::project::detect_agent))
 }
 
+/// What one batch of links is built on: what answers on loopback (`state`), and the address
+/// the links name. A command makes one just before it prints links, and a new one after any
+/// wait, so every link rests on a fresh look without each link taking its own. The address
+/// is the Tailscale one only when [`crate::remote::link_base`] proves, the first time a link
+/// in the batch needs it, that our inbox answers there. One proof per batch, not per link, so
+/// eight cards from one `need` wait on one round trip, not eight.
+pub struct Links {
+    pub state: Inbox,
+    cfg: Config,
+    base: std::cell::OnceCell<String>,
+}
+
+impl Links {
+    pub fn new(cfg: &Config, state: Inbox) -> Self {
+        Links { state, cfg: cfg.clone(), base: std::cell::OnceCell::new() }
+    }
+
+    fn base(&self) -> &str {
+        // Only a proved loopback inbox gets a credentialed link, so only then is the Tailscale
+        // address worth proving.
+        self.base.get_or_init(|| match self.state {
+            Inbox::Ours => crate::remote::link_base(&self.cfg),
+            _ => format!("http://127.0.0.1:{}", self.cfg.inbox_port),
+        })
+    }
+}
+
 /// The bare inbox URL, no credential: the index, or a card on the full route `/t/<id>`.
 /// Only ever shown when nothing better is available; every link a person is expected to
 /// click carries a credential (see `inbox_url_agent`, `inbox_url_human`).
-pub fn inbox_url(cfg: &Config, task_id: Option<&str>) -> String {
-    let base = crate::remote::link_base(cfg);
+pub fn inbox_url(links: &Links, task_id: Option<&str>) -> String {
+    let base = links.base();
     match task_id {
         Some(id) => format!("{base}/t/{id}"),
         None => format!("{base}/"),
@@ -91,8 +118,8 @@ pub fn inbox_url(cfg: &Config, task_id: Option<&str>) -> String {
 }
 
 /// One card on the scoped route `/p/<id>`, which is served only to that card's capability.
-fn inbox_url_scoped(cfg: &Config, task_id: &str) -> String {
-    format!("{}/p/{task_id}", crate::remote::link_base(cfg))
+fn inbox_url_scoped(links: &Links, task_id: &str) -> String {
+    format!("{}/p/{task_id}", links.base())
 }
 
 /// Which stream a URL is about to be written to. A TTY check is only meaningful for the
@@ -119,7 +146,7 @@ fn is_terminal(stream: Stream) -> bool {
 /// and `tokenstash open`. The session is whatever the running inbox minted when it started;
 /// this process only reads it, and a link built from it dies with that inbox.
 ///
-/// `state` is a required argument on purpose. The session is appended only when ownership
+/// `links` carries the state on purpose. The session is appended only when ownership
 /// of the port has been *proved* ([`Inbox::Ours`]). Handing `?t=` to a listener that failed
 /// the `/verify` challenge would give a squatter exactly the credential it needs to
 /// impersonate the inbox and collect whatever the human pastes next — the URL is the one
@@ -127,9 +154,9 @@ fn is_terminal(stream: Stream) -> bool {
 /// can forget it.
 /// Falls back to the bare URL otherwise; callers talking to a human should use
 /// [`inbox_notice`], which explains itself instead of handing over a dead or hostile link.
-pub fn inbox_url_human(cfg: &Config, task_id: Option<&str>, state: Inbox) -> String {
-    let url = inbox_url(cfg, task_id);
-    match (state, crate::inbox_auth::read_session()) {
+pub fn inbox_url_human(links: &Links, task_id: Option<&str>) -> String {
+    let url = inbox_url(links, task_id);
+    match (links.state, crate::inbox_auth::read_session()) {
         (Inbox::Ours, Some(t)) => format!("{url}?t={t}"),
         _ => url,
     }
@@ -146,14 +173,14 @@ pub fn inbox_url_human(cfg: &Config, task_id: Option<&str>, state: Inbox) -> Str
 /// in front of a person is an invitation to paste a key into whatever answers there, and an
 /// agent relays the line verbatim. `Down` gets no link either — a squatter can bind the port
 /// between our probe and the click.
-pub fn inbox_url_tty(cfg: &Config, db: Option<&Db>, task_id: Option<&str>, state: Inbox, stream: Stream) -> String {
-    if !matches!(state, Inbox::Ours) {
-        return inbox_notice(cfg, task_id, state);
+pub fn inbox_url_tty(cfg: &Config, db: Option<&Db>, task_id: Option<&str>, links: &Links, stream: Stream) -> String {
+    if !matches!(links.state, Inbox::Ours) {
+        return inbox_notice(cfg, task_id, links);
     }
     if is_terminal(stream) {
-        inbox_url_human(cfg, task_id, state)
+        inbox_url_human(links, task_id)
     } else {
-        inbox_url_agent(cfg, db, task_id, state)
+        inbox_url_agent(cfg, db, task_id, links)
     }
 }
 
@@ -169,17 +196,17 @@ pub fn inbox_url_tty(cfg: &Config, db: Option<&Db>, task_id: Option<&str>, state
 ///
 /// The capability is signed over the card's row, which is why this takes the database; a
 /// card that cannot be read gets the bare URL rather than a credential for a guess.
-pub fn inbox_url_agent(cfg: &Config, db: Option<&Db>, task_id: Option<&str>, state: Inbox) -> String {
-    if !matches!(state, Inbox::Ours) {
-        return inbox_notice(cfg, task_id, state);
+pub fn inbox_url_agent(cfg: &Config, db: Option<&Db>, task_id: Option<&str>, links: &Links) -> String {
+    if !matches!(links.state, Inbox::Ours) {
+        return inbox_notice(cfg, task_id, links);
     }
     let task = match (db, task_id) {
         (Some(db), Some(id)) => db.get_task(id).ok().flatten(),
         _ => None,
     };
     match (task, crate::inbox_auth::ensure_cap_key()) {
-        (Some(t), Ok(key)) => format!("{}?t={}", inbox_url_scoped(cfg, &t.id), crate::inbox_auth::task_credential(&key, &t)),
-        _ => inbox_url(cfg, task_id),
+        (Some(t), Ok(key)) => format!("{}?t={}", inbox_url_scoped(links, &t.id), crate::inbox_auth::task_credential(&key, &t)),
+        _ => inbox_url(links, task_id),
     }
 }
 
@@ -200,9 +227,9 @@ pub fn inbox_unavailable(cfg: &Config, state: Inbox) -> Option<String> {
 /// ownership is proved, and why we are not sending them anywhere when it is not. Never a link
 /// to a listener that failed the proof — even a bare one would walk the human into an
 /// impostor's paste form.
-pub fn inbox_notice(cfg: &Config, task_id: Option<&str>, state: Inbox) -> String {
-    match inbox_unavailable(cfg, state) {
-        None => inbox_url_human(cfg, task_id, state),
+pub fn inbox_notice(cfg: &Config, task_id: Option<&str>, links: &Links) -> String {
+    match inbox_unavailable(cfg, links.state) {
+        None => inbox_url_human(links, task_id),
         Some(why) => format!("tokenstash: {why}"),
     }
 }
@@ -265,23 +292,24 @@ mod tests {
     #[test]
     fn the_session_is_only_attached_to_a_verified_inbox() {
         with_home("verified", |cfg, _db| {
+            let ours_links = Links::new(&cfg, Inbox::Ours);
             // Before any inbox has run there is no session, and no link pretends otherwise.
-            assert_eq!(inbox_url_human(&cfg, Some("t_abc"), Inbox::Ours), inbox_url(&cfg, Some("t_abc")));
+            assert_eq!(inbox_url_human(&ours_links, Some("t_abc")), inbox_url(&ours_links, Some("t_abc")));
             let token = crate::inbox_auth::rotate_session().unwrap();
             // Proved ours: the human's link carries the session the inbox minted.
-            let ours = inbox_url_human(&cfg, Some("t_abc"), Inbox::Ours);
+            let ours = inbox_url_human(&ours_links, Some("t_abc"));
             assert!(ours.contains(&format!("?t={token}")), "{ours}");
             assert!(ours.contains("/t/t_abc"));
 
             // Anything we could not prove is ours gets no session — a squatter on the port
             // must not be handed the credential that lets it impersonate the inbox.
             for state in [Inbox::Foreign, Inbox::Down] {
-                let url = inbox_url_human(&cfg, None, state);
+                let url = inbox_url_human(&Links::new(&cfg, state), None);
                 assert!(!url.contains("t="), "{state:?} produced a tokened URL: {url}");
                 assert!(!url.contains(&token), "{state:?} leaked the token: {url}");
             }
             // ...and the bare form never carries it, whatever the state.
-            assert!(!inbox_url(&cfg, None).contains("t="));
+            assert!(!inbox_url(&ours_links, None).contains("t="));
             // The persistent keys are never what a link carries.
             let proof = crate::inbox_auth::ensure_proof_key().unwrap();
             let cap = crate::inbox_auth::ensure_cap_key().unwrap();
@@ -295,17 +323,18 @@ mod tests {
             let token = crate::inbox_auth::rotate_session().unwrap();
             assert_eq!(inbox_unavailable(&cfg, Inbox::Ours), None);
 
-            let foreign = inbox_notice(&cfg, Some("t_abc"), Inbox::Foreign);
+            let foreign = inbox_notice(&cfg, Some("t_abc"), &Links::new(&cfg, Inbox::Foreign));
             assert!(foreign.contains("held by another process"), "{foreign}");
             assert!(!foreign.contains("http"), "a link to an unverified listener: {foreign}");
             assert!(!foreign.contains(&token));
 
-            let down = inbox_notice(&cfg, None, Inbox::Down);
+            let down = inbox_notice(&cfg, None, &Links::new(&cfg, Inbox::Down));
             assert!(down.contains("tokenstash open"), "{down}");
             assert!(!down.contains(&token));
 
             // Verified: the notice IS the tokened link.
-            assert_eq!(inbox_notice(&cfg, None, Inbox::Ours), inbox_url_human(&cfg, None, Inbox::Ours));
+            let ours = Links::new(&cfg, Inbox::Ours);
+            assert_eq!(inbox_notice(&cfg, None, &ours), inbox_url_human(&ours, None));
         });
     }
 
@@ -316,25 +345,27 @@ mod tests {
             let cap = crate::inbox_auth::ensure_cap_key().unwrap();
             let proof = crate::inbox_auth::ensure_proof_key().unwrap();
             let t = card(&db, "t_abc123");
-            let url = inbox_url_agent(&cfg, Some(&db), Some("t_abc123"), Inbox::Ours);
+            let ours = Links::new(&cfg, Inbox::Ours);
+            let url = inbox_url_agent(&cfg, Some(&db), Some("t_abc123"), &ours);
             assert!(url.ends_with(&format!("/p/t_abc123?t={}", crate::inbox_auth::task_credential(&cap, &t))), "the scoped route, not the full one: {url}");
             for secret in [&session, &cap, &proof] {
                 assert!(!url.contains(secret.as_str()), "an agent link carries no key or session: {url}");
             }
             // No card, no credential: a bare URL, never a session minted for the occasion.
-            let bare = inbox_url_agent(&cfg, Some(&db), None, Inbox::Ours);
-            assert_eq!(bare, inbox_url(&cfg, None));
+            let bare = inbox_url_agent(&cfg, Some(&db), None, &ours);
+            assert_eq!(bare, inbox_url(&ours, None));
             // A card that is not on file gets no credential either — nothing is signed over a
             // guess.
-            assert_eq!(inbox_url_agent(&cfg, Some(&db), Some("t_nothere"), Inbox::Ours), inbox_url(&cfg, Some("t_nothere")));
-            assert_eq!(inbox_url_agent(&cfg, None, Some("t_abc123"), Inbox::Ours), inbox_url(&cfg, Some("t_abc123")));
+            assert_eq!(inbox_url_agent(&cfg, Some(&db), Some("t_nothere"), &ours), inbox_url(&ours, Some("t_nothere")));
+            assert_eq!(inbox_url_agent(&cfg, None, Some("t_abc123"), &ours), inbox_url(&ours, Some("t_abc123")));
             // The retired opt-out changes nothing: same scoped link, no session, taskless
             // still bare.
             let mut full = cfg.clone();
             full.inbox_links = "full".into();
-            assert_eq!(inbox_url_agent(&full, Some(&db), Some("t_abc123"), Inbox::Ours), url, "inbox_links = full is ignored");
-            assert_eq!(inbox_url_agent(&full, Some(&db), None, Inbox::Ours), inbox_url(&cfg, None));
-            assert!(!inbox_url_agent(&full, Some(&db), Some("t_abc123"), Inbox::Ours).contains(&session));
+            let full_links = Links::new(&full, Inbox::Ours);
+            assert_eq!(inbox_url_agent(&full, Some(&db), Some("t_abc123"), &full_links), url, "inbox_links = full is ignored");
+            assert_eq!(inbox_url_agent(&full, Some(&db), None, &full_links), inbox_url(&ours, None));
+            assert!(!inbox_url_agent(&full, Some(&db), Some("t_abc123"), &full_links).contains(&session));
         });
     }
 
@@ -343,14 +374,15 @@ mod tests {
         with_home("unproved", |cfg, db| {
             card(&db, "t_abc");
             for state in [Inbox::Foreign, Inbox::Down] {
+                let links = Links::new(&cfg, state);
                 for stream in [Stream::Stdout, Stream::Stderr] {
-                    let out = inbox_url_tty(&cfg, Some(&db), Some("t_abc"), state, stream);
+                    let out = inbox_url_tty(&cfg, Some(&db), Some("t_abc"), &links, stream);
                     assert!(!out.contains("http"), "{state:?}/{stream:?} linked to an unproved inbox: {out}");
                 }
-                let out = inbox_url_agent(&cfg, Some(&db), Some("t_abc"), state);
+                let out = inbox_url_agent(&cfg, Some(&db), Some("t_abc"), &links);
                 assert!(!out.contains("http"), "agent surface linked to an unproved inbox: {out}");
             }
-            assert!(inbox_url_agent(&cfg, Some(&db), None, Inbox::Ours).starts_with("http://127.0.0.1:"));
+            assert!(inbox_url_agent(&cfg, Some(&db), None, &Links::new(&cfg, Inbox::Ours)).starts_with("http://127.0.0.1:"));
         });
     }
 
@@ -363,8 +395,9 @@ mod tests {
             // point is that each variant consults its own stream rather than a fixed one.
             for stream in [Stream::Stdout, Stream::Stderr] {
                 if !is_terminal(stream) {
-                    let url = inbox_url_tty(&cfg, Some(&db), Some("t_abc123"), Inbox::Ours, stream);
-                    assert_eq!(url, inbox_url_agent(&cfg, Some(&db), Some("t_abc123"), Inbox::Ours), "{stream:?} must hand a captured stream the agent link");
+                    let ours = Links::new(&cfg, Inbox::Ours);
+                    let url = inbox_url_tty(&cfg, Some(&db), Some("t_abc123"), &ours, stream);
+                    assert_eq!(url, inbox_url_agent(&cfg, Some(&db), Some("t_abc123"), &ours), "{stream:?} must hand a captured stream the agent link");
                     assert!(!url.contains(&token), "the session must never reach a captured stream");
                     let cap = crate::inbox_auth::ensure_cap_key().unwrap();
                     assert!(url.contains(&crate::inbox_auth::task_credential(&cap, &t)), "the agent link carries the card's capability");

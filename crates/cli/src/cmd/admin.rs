@@ -49,7 +49,7 @@ pub fn tasks(a: TasksArgs) -> Result<i32> {
     }
     // Printed to stdout, so the TTY check must be stdout's.
     let state = crate::notify::inbox_state(&app.cfg);
-    println!("\ninbox: {}", util::inbox_url_tty(&app.cfg, Some(&app.db), None, state, util::Stream::Stdout));
+    println!("\ninbox: {}", util::inbox_url_tty(&app.cfg, Some(&app.db), None, &util::Links::new(&app.cfg, state), util::Stream::Stdout));
     if let Some(why) = util::inbox_unavailable(&app.cfg, state) {
         println!("       {why}");
     }
@@ -366,9 +366,8 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
         }
         let t = tokenstash_core::actions::request_rotation(&app.ctx(), &project, &agent, &a.name, &identity, a.why.as_deref())?;
         let outcome = tokenstash_core::need::Outcome::Pending { name: a.name.clone(), identity: identity.clone(), task_id: t.id.clone(), title: t.title.clone(), url: t.url.clone() };
-        crate::cmd::need::notify_pending(&app, &project, &agent, std::slice::from_ref(&outcome));
-        let state = crate::notify::inbox_state(&app.cfg);
-        let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), state);
+        let links = crate::cmd::need::notify_pending(&app, &project, &agent, std::slice::from_ref(&outcome));
+        let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), &links);
         println!("⏳ {} replacement requested (card {})", a.name, t.id);
         println!("  next: {}", crate::guide::rotation_next(&a.name, &t, &card, &app.cfg));
         return Ok(tokenstash_core::exit::PENDING);
@@ -377,9 +376,9 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
     let agent = "human".to_string();
     let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
     let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, &identity)?;
-    let state = crate::notify::ensure_inbox(&app.cfg);
-    crate::notify::desktop(&app.cfg, &format!("Replace {}", a.name), "you asked to rotate it", &util::inbox_notice(&app.cfg, Some(&t.id), state));
-    println!("⏳ {}@{identity} marked for rotation — task {} → {}", a.name, t.id, util::inbox_url_tty(&app.cfg, Some(&app.db), Some(&t.id), state, util::Stream::Stdout));
+    let links = util::Links::new(&app.cfg, crate::notify::ensure_inbox(&app.cfg));
+    crate::notify::desktop(&app.cfg, &format!("Replace {}", a.name), "you asked to rotate it", &util::inbox_notice(&app.cfg, Some(&t.id), &links));
+    println!("⏳ {}@{identity} marked for rotation — task {} → {}", a.name, t.id, util::inbox_url_tty(&app.cfg, Some(&app.db), Some(&t.id), &links, util::Stream::Stdout));
     println!("  paste the NEW key first; revoke the old one in the dashboard after it says stored");
     Ok(tokenstash_core::exit::PENDING)
 }

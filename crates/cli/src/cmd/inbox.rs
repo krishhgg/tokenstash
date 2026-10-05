@@ -441,7 +441,7 @@ fn send_full_link(app: &App, task: &Task) -> Result<String> {
 /// this thread can answer, so it would wait out the probe's timeout and fall back anyway.
 fn desktop_link(cfg: &tokenstash_core::Config, id: &str) -> String {
     let here = tokenstash_core::Config { remote: tokenstash_core::config::Remote::Off, ..cfg.clone() };
-    crate::util::inbox_url_human(&here, Some(id), crate::notify::Inbox::Ours)
+    crate::util::inbox_url_human(&crate::util::Links::new(&here, crate::notify::Inbox::Ours), Some(id))
 }
 
 /// Which family a path belongs to. Anything else is nothing.
@@ -1167,7 +1167,7 @@ mod tests {
         let port = crate::notify::fake_inbox(Arc::new(std::sync::atomic::AtomicBool::new(true)));
         let cfg = tokenstash_core::Config { inbox_port: port, remote: Remote::Tailscale, remote_ip: Some("127.0.0.1".into()), remote_host: Some("box.tail1234.ts.net".into()), ..Default::default() };
         let link = desktop_link(&cfg, "t_abc");
-        let tailnet = crate::util::inbox_url(&cfg, Some("t_abc"));
+        let tailnet = crate::util::inbox_url(&crate::util::Links::new(&cfg, crate::notify::Inbox::Ours), Some("t_abc"));
         std::env::remove_var("TOKENSTASH_HOME");
         let _ = std::fs::remove_dir_all(&home);
         assert!(link.starts_with(&format!("http://127.0.0.1:{port}/t/t_abc")), "{link}");

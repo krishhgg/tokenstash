@@ -117,7 +117,7 @@ fn run(cli: Cli) -> Result<i32> {
                 eprintln!("tokenstash: {why}");
                 return Ok(tokenstash_core::exit::ERROR);
             }
-            let url = util::inbox_url_human(&cfg, None, state);
+            let url = util::inbox_url_human(&util::Links::new(&cfg, state), None);
             let _ = open::that(&url);
             println!("{url}");
             Ok(0)

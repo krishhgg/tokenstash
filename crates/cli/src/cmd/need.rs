@@ -141,17 +141,21 @@ pub fn need(a: NeedArgs) -> Result<i32> {
         }
     }
 
+    let mut notified = None;
     if outcomes.iter().any(|o| o.is_pending()) {
-        notify_pending(&app, &project, &agent, &outcomes);
+        let links = notify_pending(&app, &project, &agent, &outcomes);
         if a.blocking {
             // wait on the tasks already filed; never file a second set
             need::wait(&app.ctx(), &project, &mut outcomes, opts.timeout)?;
+        } else {
+            // Nothing waited since: the links printed below share the notification's proof.
+            notified = Some(links);
         }
     }
 
     // Only probed when something is pending: a hit never needs the inbox.
     let pending = outcomes.iter().any(|o| o.is_pending());
-    let state = if pending { notify::inbox_state(&app.cfg) } else { notify::Inbox::Down };
+    let links = notified.unwrap_or_else(|| util::Links::new(&app.cfg, if pending { notify::inbox_state(&app.cfg) } else { notify::Inbox::Down }));
     let env_file = project.join(&app.cfg.env_file);
     // Each result carries its own card link and its own `next`, the same text the MCP tool
     // returns; the top-level `inbox` is the bare index URL, and carries nothing.
@@ -160,7 +164,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
         let mut v = serde_json::to_value(o)?;
         let (task, card) = match o {
             Outcome::Pending { task_id, .. } => {
-                let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state);
+                let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), &links);
                 v["inbox"] = serde_json::json!(card);
                 (app.db.get_task(task_id)?, card)
             }
@@ -174,7 +178,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "project": project,
             "env_file": app.cfg.env_file,
-            "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
+            "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, &links),
             "results": results.iter().map(|(v, _)| v).collect::<Vec<_>>(),
             "next": crate::guide::summary(&outcomes, crate::guide::Recheck::Cli),
         }))?);
@@ -196,13 +200,16 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     Ok(code_for(&outcomes))
 }
 
-pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcomes: &[Outcome]) {
-    let state = notify::ensure_inbox(&app.cfg);
+/// Start the inbox if need be and notify the person of the cards not yet notified. Returns
+/// the links it built on. A caller that prints links before any wait uses them, so the
+/// notification and those links share one proof.
+pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcomes: &[Outcome]) -> util::Links {
+    let links = util::Links::new(&app.cfg, notify::ensure_inbox(&app.cfg));
     // One notification per card. A polling agent re-runs `need` every few seconds and gets
     // the same card back; the human must not get the same toast back.
     let fresh: Vec<&Outcome> = outcomes.iter().filter(|o| matches!(o, Outcome::Pending { task_id, .. } if app.db.mark_notified(task_id).unwrap_or(true))).collect();
     if fresh.is_empty() {
-        return;
+        return links;
     }
     let pending: Vec<&str> = fresh.iter().map(|o| o.name()).collect();
     let first_id = fresh.iter().find_map(|o| match o { Outcome::Pending { task_id, .. } => Some(task_id.clone()), _ => None });
@@ -211,10 +218,11 @@ pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcome
         &format!("{} needs {}", tokenstash_core::project::short(project), pending.join(", ")),
         &format!("requested by {agent}"),
         // The notification is read by the human and nothing else, so it is tokened — but only
-        // if `state` says we proved the port is ours. Otherwise it explains itself instead of
-        // walking the human, and the token, into whatever is squatting there.
-        &util::inbox_notice(&app.cfg, first_id.as_deref(), state),
+        // if `links.state` says we proved the port is ours. Otherwise it explains itself instead
+        // of walking the human, and the token, into whatever is squatting there.
+        &util::inbox_notice(&app.cfg, first_id.as_deref(), &links),
     );
+    links
 }
 
 pub fn code_for(outcomes: &[Outcome]) -> i32 {
@@ -263,10 +271,10 @@ pub fn ask(a: AskArgs) -> Result<i32> {
         &agent,
         HumanRequest { title: a.title.clone(), why: a.why.clone(), url: a.url.clone(), steps: a.steps.clone(), expects: a.expects.clone() },
     )?;
-    let state = notify::ensure_inbox(&app.cfg);
+    let mut links = util::Links::new(&app.cfg, notify::ensure_inbox(&app.cfg));
     // The same title returns the same task; it must not return the same toast.
     if app.db.mark_notified(&t.id).unwrap_or(true) {
-        notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
+        notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), &links));
     }
     let mut task = t;
     if a.blocking {
@@ -276,12 +284,13 @@ pub fn ask(a: AskArgs) -> Result<i32> {
             app.db.expire_overdue()?;
             task = app.db.get_task(&task.id)?.unwrap_or(task);
         }
+        // After a wait, a fresh look at where the inbox answers.
+        links = util::Links::new(&app.cfg, notify::inbox_state(&app.cfg));
     }
-    let state = notify::inbox_state(&app.cfg);
     if a.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task, "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), state) }))?);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task, "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), &links) }))?);
     } else {
-        println!("{} {} — task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), state));
+        println!("{} {} — task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), &links));
         if let Some(n) = &task.note {
             println!("  note: {n}");
         }

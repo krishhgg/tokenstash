@@ -173,6 +173,53 @@ fn a_slow_tailscale_lookup_does_not_hold_up_loopback() {
     drop(inbox);
 }
 
+/// Greptile on #75: the links one `need` prints rest on one proof of the Tailscale address,
+/// not one proof per card. Three cards and the desktop notice cost one `/verify` there. A
+/// relay holds this machine's Tailscale address, counts each connection, and passes it to the
+/// inbox on loopback, so the inbox's own answer is what proves it.
+#[test]
+fn one_need_proves_the_tailnet_address_once() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let Some((w, inbox)) = start("one-proof") else { return };
+    let relay = TcpListener::bind(("127.0.0.7", w.port)).unwrap();
+    let proofs = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&proofs);
+    let port = w.port;
+    std::thread::spawn(move || {
+        for s in relay.incoming() {
+            let Ok(mut s) = s else { continue };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let Ok(mut up) = std::net::TcpStream::connect(("127.0.0.1", port)) else { continue };
+            let mut reply = Vec::new();
+            if up.write_all(&head).is_ok() && up.read_to_end(&mut reply).is_ok() {
+                let _ = s.write_all(&reply);
+            }
+        }
+    });
+    // Remote access on at the relay's address. The inbox cannot listen there, since the relay
+    // holds it.
+    let mut cfg = std::fs::read_to_string(w.home.join("config.toml")).unwrap();
+    cfg.push_str(&format!("remote = \"tailscale\"\nremote_ip = \"127.0.0.7\"\nremote_login = \"{OWNER}\"\n"));
+    std::fs::write(w.home.join("config.toml"), cfg).unwrap();
+    let need = w.run(&["need", "OPENAI_API_KEY", "RESEND_API_KEY", "STRIPE_SECRET_KEY"]);
+    let text = String::from_utf8_lossy(&need.stdout).into_owned();
+    for name in ["OPENAI_API_KEY", "RESEND_API_KEY", "STRIPE_SECRET_KEY"] {
+        assert!(text.contains(&format!("{name} pending")), "{text}");
+    }
+    assert!(text.matches(&format!("http://127.0.0.7:{port}/p/")).count() >= 3, "every card links to the Tailscale address: {text}");
+    assert_eq!(proofs.load(Ordering::SeqCst), 1, "{text}");
+    drop(inbox);
+}
+
 #[test]
 fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     let Some((w, inbox)) = start("world") else { return };

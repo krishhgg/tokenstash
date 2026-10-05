@@ -422,17 +422,21 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                 };
                 results.extend(need::need_with_budget(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts, &mut budget)?);
             }
+            let mut notified = None;
             if results.iter().any(|o| o.is_pending()) {
-                notify_pending(&app, &project, agent, &results);
+                let links = notify_pending(&app, &project, agent, &results);
                 if blocking {
                     // wait on the tasks already filed (each carries its own identity)
                     // Leave room for the delivery that follows an answer (a verify-on-use
                     // probe may run, up to ProbeBudget::MAX): the cap is on the whole call.
                     need::wait(&app.ctx(), &project, &mut results, remaining(call_started, timeout).saturating_sub(need::ProbeBudget::MAX))?;
+                } else {
+                    // Nothing waited since: the links below share the notification's proof.
+                    notified = Some(links);
                 }
             }
             let pending = results.iter().any(|o| o.is_pending());
-            let state = if pending { crate::notify::inbox_state(&app.cfg) } else { crate::notify::Inbox::Down };
+            let links = notified.unwrap_or_else(|| util::Links::new(&app.cfg, if pending { crate::notify::inbox_state(&app.cfg) } else { crate::notify::Inbox::Down }));
             let waited = call_started.elapsed().as_secs();
             let env_file = project.join(&app.cfg.env_file);
             // The rule that matters is the one attached to the result the agent is looking
@@ -445,7 +449,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     // `url` on the outcome is where the key is created (the card shows it);
                     // the link the user needs is the card itself.
                     need::Outcome::Pending { task_id, .. } => {
-                        let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state);
+                        let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), &links);
                         v["inbox"] = json!(card);
                         (app.db.get_task(task_id)?, card)
                     }
@@ -459,7 +463,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             let mut top = json!({
                 "results": results,
                 "env_file": env_file,
-                "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
+                "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, &links),
                 "next": summary
             });
             if blocking { top["waited_s"] = json!(waited); top["timed_out"] = json!(pending); }
@@ -477,12 +481,12 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     other => anyhow::bail!("expects must be \"confirm\" or \"text\", not {other:?}"),
                 },
             })?;
-            let state = crate::notify::ensure_inbox(&app.cfg);
+            let mut links = util::Links::new(&app.cfg, crate::notify::ensure_inbox(&app.cfg));
             // The desktop notification is the human's copy, so it may be tokened (subject to
             // the ownership proof). The tool result below stays bare. Once per card: the same
             // title returns the same task, and must not return the same toast.
             if app.db.mark_notified(&t.id).unwrap_or(true) {
-                crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
+                crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), &links));
             }
             let mut task = t;
             if blocking {
@@ -494,8 +498,10 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     app.db.expire_overdue()?;
                     task = app.db.get_task(&task.id)?.unwrap_or(task);
                 }
+                // After a wait, a fresh look at where the inbox answers.
+                links = util::Links::new(&app.cfg, crate::notify::inbox_state(&app.cfg));
             }
-            let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), crate::notify::inbox_state(&app.cfg));
+            let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), &links);
             let next = match task.status {
                 tokenstash_core::db::TaskStatus::Pending => format!("The user has been asked ({}). {} Keep working on what does not depend on it and call task_check(\"{}\") later; do not call human_request again for the same step — the same title returns this same task.",
                     task.id, if card.starts_with("http") { format!("Show the user this link: {card}.") } else { format!("The inbox is unavailable ({card}); tell the user to run `tokenstash open`.") }, task.id),
@@ -520,13 +526,16 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     // the agent at that card, or "answered" reads as "injected".
                     let mut replacements = vec![];
                     let mut in_flight = vec![];
+                    // One look at the inbox for all the Replace cards' links, if any.
+                    let mut links = None;
                     if t.kind == tokenstash_core::db::TaskKind::Approval && t.status == tokenstash_core::db::TaskStatus::Answered {
                         for entry in &t.names {
                             if entry == "*" { continue; }
                             let (n, identity) = tokenstash_core::tasks::split_identity(entry);
                             if let Some(rt) = app.db.open_secret_task(&pid, n, identity)? {
                                 if rt.expects == tokenstash_core::tasks::EXPECTS_REPLACE {
-                                    replacements.push(json!({ "name": n, "task_id": rt.id, "url": util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&rt.id), crate::notify::inbox_state(&app.cfg)) }));
+                                    let links = links.get_or_insert_with(|| util::Links::new(&app.cfg, crate::notify::inbox_state(&app.cfg)));
+                                    replacements.push(json!({ "name": n, "task_id": rt.id, "url": util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&rt.id), links) }));
                                     continue;
                                 }
                             }
@@ -566,7 +575,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             // Always this project only: `all` was a cross-project path oracle for the model.
             let pid = project.to_string_lossy().to_string();
             let list = app.db.list_tasks(Some(&pid), true)?;
-            Ok((json!({ "tasks": list, "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, crate::notify::inbox_state(&app.cfg)) }), false))
+            Ok((json!({ "tasks": list, "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, &util::Links::new(&app.cfg, crate::notify::inbox_state(&app.cfg))) }), false))
         }
         "secrets_report_invalid" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();

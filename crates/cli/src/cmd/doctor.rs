@@ -84,7 +84,7 @@ pub fn doctor() -> Result<i32> {
         inbox != notify::Inbox::Foreign,
         // `check` prints to stdout, so the TTY check is stdout's. No card is named, so no
         // database is needed to sign a link.
-        format!("{}  {}", crate::util::inbox_url_tty(&cfg, None, None, inbox, crate::util::Stream::Stdout), notify::describe(inbox)),
+        format!("{}  {}", crate::util::inbox_url_tty(&cfg, None, None, &crate::util::Links::new(&cfg, inbox), crate::util::Stream::Stdout), notify::describe(inbox)),
     );
 
     match cfg.remote {

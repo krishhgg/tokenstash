@@ -65,12 +65,11 @@ pub fn run(a: RunArgs) -> Result<i32> {
         };
         let mut outcomes = need::need(&app.ctx(), &project, &agent, &missing, &opts)?;
         if outcomes.iter().any(|o| o.is_pending()) {
-            notify_pending(&app, &project, &agent, &outcomes);
+            let links = notify_pending(&app, &project, &agent, &outcomes);
             // This line goes to STDERR, so the TTY check has to be stderr's — `run` is
             // routinely used with stdout redirected and stderr on the terminal, and the
             // reverse.
-            let state = crate::notify::inbox_state(&app.cfg);
-            eprintln!("tokenstash: waiting for you → {}", util::inbox_url_tty(&app.cfg, Some(&app.db), None, state, util::Stream::Stderr));
+            eprintln!("tokenstash: waiting for you → {}", util::inbox_url_tty(&app.cfg, Some(&app.db), None, &links, util::Stream::Stderr));
             // wait on the approval task just filed; calling need again would file another
             need::wait(&app.ctx(), &project, &mut outcomes, opts.timeout)?;
         }
