@@ -191,7 +191,7 @@ pub enum TrustCmd {
 /// Trust roots are retired (0.2): a folder never said which keys the human meant. Each
 /// directory pairs once instead. `rm` still works so old configs can be cleaned up.
 pub fn trust(a: TrustArgs) -> Result<i32> {
-    let mut cfg = Config::load()?;
+    let cfg = Config::load()?;
     const NOTICE: &str = "trust roots are retired: the first time a directory asks for stored keys you approve exactly which ones (one card), and they are silent there afterwards. See `tokenstash workspaces`.";
     match a.cmd.unwrap_or(TrustCmd::List) {
         TrustCmd::Add { .. } => {
@@ -199,12 +199,14 @@ pub fn trust(a: TrustArgs) -> Result<i32> {
         }
         TrustCmd::Rm { path } => {
             let p = path.canonicalize().unwrap_or(path);
-            let before = cfg.trust_roots.len();
-            cfg.trust_roots.retain(|r| r != &p);
-            if cfg.trust_roots.len() == before {
-                bail!("{} is not in the (retired) trust roots", p.display());
-            }
-            cfg.save()?;
+            Config::update(|cfg| {
+                let before = cfg.trust_roots.len();
+                cfg.trust_roots.retain(|r| r != &p);
+                if cfg.trust_roots.len() == before {
+                    bail!("{} is not in the (retired) trust roots", p.display());
+                }
+                Ok(())
+            })?;
             println!("✓ removed {} from the retired list", tokenstash_core::project::short(&p));
         }
         TrustCmd::List => {

@@ -63,8 +63,15 @@ pub fn doctor() -> Result<i32> {
         tokenstash_core::config::Remote::Tailscale => {
             let base = crate::remote::base_url(&cfg);
             let login = cfg.remote_login.clone().unwrap_or_default();
+            let at = format!("{}:{}", cfg.remote_ip.clone().unwrap_or_default(), cfg.inbox_port);
             ok &= match crate::remote::status() {
-                Ok(net) if Some(net.ip.to_string()) == cfg.remote_ip => check("remote access", true, format!("tailscale: {base}/ opens as you on devices signed in as {login}")),
+                // The address is right; the link opens only if the inbox itself answers there.
+                Ok(net) if Some(net.ip.to_string()) == cfg.remote_ip => match (notify::tailnet_state(&cfg), inbox) {
+                    (notify::Inbox::Ours, _) => check("remote access", true, format!("tailscale: {base}/ opens as you on devices signed in as {login}")),
+                    (notify::Inbox::Foreign, _) => check("remote access", false, format!("tailscale: another process answers on {at} and failed the ownership check, so links point at 127.0.0.1; stop it, then run `tokenstash remote tailscale` again")),
+                    (notify::Inbox::Down, notify::Inbox::Down) => check("remote access", true, format!("tailscale: links use {base}/ once the inbox answers there (it is not running; it starts on demand)")),
+                    (notify::Inbox::Down, _) => check("remote access", false, format!("tailscale: the inbox runs but does not answer on {at}, so links point at 127.0.0.1; run `tokenstash remote tailscale` again")),
+                },
                 Ok(net) => check("remote access", false, format!("tailscale: this machine's address is now {}, not {}; run `tokenstash remote tailscale` again", net.ip, cfg.remote_ip.clone().unwrap_or_default())),
                 Err(e) => check("remote access", false, format!("tailscale: {e:#}")),
             };

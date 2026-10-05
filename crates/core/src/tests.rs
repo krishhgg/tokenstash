@@ -3624,3 +3624,27 @@ fn the_extra_ask_is_spent_on_its_card_and_recovered_when_none_was_filed() {
     assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", &old).unwrap().is_none(), "a spent ask stays spent however old");
 }
 
+
+/// Greptile on #69: a command that loaded the config earlier saves only what it changed,
+/// so `init` finishing after a `remote off` does not turn remote access back on.
+#[test]
+fn a_config_update_keeps_what_another_command_changed() {
+    use crate::config::{AgentMode, Remote};
+    let _env = env_lock();
+    let home = tmp("config-update");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    Config::update(|c| { c.remote = Remote::Tailscale; c.remote_ip = Some("100.64.0.1".into()); Ok(()) }).unwrap();
+    // `init` loads here, and is still working when the person turns remote access off.
+    let early = Config::load().unwrap();
+    assert_eq!(early.remote, Remote::Tailscale);
+    Config::update(|c| { c.remote = Remote::Off; c.remote_ip = None; Ok(()) }).unwrap();
+    Config::update(|c| { c.agent_mode = AgentMode::Explicit; Ok(()) }).unwrap();
+    let now = Config::load().unwrap();
+    assert_eq!(now.remote, Remote::Off);
+    assert_eq!(now.remote_ip, None);
+    assert_eq!(now.agent_mode, AgentMode::Explicit);
+    // A change that fails writes nothing.
+    assert!(Config::update(|c| { c.remote = Remote::Tailscale; anyhow::bail!("no") as anyhow::Result<()> }).is_err());
+    assert_eq!(Config::load().unwrap().remote, Remote::Off);
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}

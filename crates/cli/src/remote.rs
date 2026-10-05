@@ -214,11 +214,13 @@ pub fn remote(a: RemoteArgs) -> Result<i32> {
             Ok(0)
         }
         Some("off") => {
-            cfg.remote = Remote::Off;
-            cfg.remote_host = None;
-            cfg.remote_ip = None;
-            cfg.remote_login = None;
-            cfg.save()?;
+            Config::update(|cfg| {
+                cfg.remote = Remote::Off;
+                cfg.remote_host = None;
+                cfg.remote_ip = None;
+                cfg.remote_login = None;
+                Ok(())
+            })?;
             println!("✓ remote access off: the inbox answers on 127.0.0.1 only, and links point there");
             Ok(0)
         }
@@ -234,11 +236,13 @@ pub fn remote(a: RemoteArgs) -> Result<i32> {
                 (Some(l), None) => l,
                 (None, None) => bail!("this machine is a tagged Tailscale node, so it has no owner to recognise; name yours: `tokenstash remote tailscale --login you@example.com`"),
             };
-            cfg.remote = Remote::Tailscale;
-            cfg.remote_ip = Some(net.ip.to_string());
-            cfg.remote_host = Some(net.dns_name.clone().unwrap_or_else(|| net.ip.to_string()));
-            cfg.remote_login = Some(login.clone());
-            cfg.save()?;
+            cfg = Config::update(|cfg| {
+                cfg.remote = Remote::Tailscale;
+                cfg.remote_ip = Some(net.ip.to_string());
+                cfg.remote_host = Some(net.dns_name.clone().unwrap_or_else(|| net.ip.to_string()));
+                cfg.remote_login = Some(login.clone());
+                Ok(cfg.clone())
+            })?;
             // A running inbox picks the setting up within a second; start one if none runs. Then
             // prove it answers on the Tailscale address before saying so: something else
             // holding that address and port would get the links.

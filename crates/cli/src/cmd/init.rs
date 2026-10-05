@@ -772,9 +772,14 @@ pub fn init(a: InitArgs) -> Result<i32> {
     // for stored keys the human approves exactly which ones; that is the whole model.
     // The mode and the MCP choice are remembered here too, so a later plain `init` keeps them.
     let switched = !fresh && mode != cfg.agent_mode;
-    cfg.agent_mode = mode;
-    cfg.mcp = if a.mcp { true } else if a.no_mcp || mode == AgentMode::Explicit { false } else { cfg.mcp };
-    cfg.save()?;
+    let mcp = if a.mcp { true } else if a.no_mcp || mode == AgentMode::Explicit { false } else { cfg.mcp };
+    let pinned = cfg.stash_backend.clone();
+    cfg = Config::update(|c| {
+        if c.stash_backend.is_none() { c.stash_backend = pinned; }
+        c.agent_mode = mode;
+        c.mcp = mcp;
+        Ok(c.clone())
+    })?;
     tokenstash_core::Db::open_default()?;
     if !a.trust.is_empty() {
         println!("! --trust is retired: directories are not trusted by folder any more. The first stored key a directory asks for shows you one card; approve it and those keys are silent there.");
@@ -869,21 +874,22 @@ fn request_choice(a: &InitArgs) -> Result<i32> {
 /// the card in their inbox, so this does what `init --mode` or `init --mcp` does at their
 /// terminal, for the binary that serves the inbox.
 pub fn apply_choice(mode: Option<AgentMode>, mcp: Option<bool>) -> Result<()> {
-    let mut cfg = Config::load()?;
     let mut manifest = Manifest::load()?;
-    if let Some(m) = mode {
-        cfg.agent_mode = m;
-        if m == AgentMode::Explicit {
-            cfg.mcp = false;
+    let cfg = Config::update(|cfg| {
+        if let Some(m) = mode {
+            cfg.agent_mode = m;
+            if m == AgentMode::Explicit {
+                cfg.mcp = false;
+            }
         }
-    }
-    if let Some(on) = mcp {
-        if on && cfg.agent_mode == AgentMode::Explicit {
-            anyhow::bail!("explicit mode has no MCP server: switch to auto mode first");
+        if let Some(on) = mcp {
+            if on && cfg.agent_mode == AgentMode::Explicit {
+                anyhow::bail!("explicit mode has no MCP server: switch to auto mode first");
+            }
+            cfg.mcp = on;
         }
-        cfg.mcp = on;
-    }
-    cfg.save()?;
+        Ok(cfg.clone())
+    })?;
     let w = Wiring {
         home: dirs::home_dir().unwrap_or_default(),
         exe: std::env::current_exe()?.display().to_string(),

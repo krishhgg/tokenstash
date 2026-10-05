@@ -234,12 +234,20 @@ impl Config {
         toml::from_str(&s).with_context(|| format!("parsing {}", p.display()))
     }
 
-    pub fn save(&self) -> Result<()> {
+    /// Change the saved config: under a lock, the file is read again, `f` changes the fields
+    /// its command owns, and the result is written. Saving a copy loaded earlier would put
+    /// back whatever another command changed in between (`init` undoing a `remote off`).
+    pub fn update<T>(f: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
+        require_home()?;
         let dir = config_dir();
         fs::create_dir_all(&dir)?;
         restrict_dir(&dir);
-        fs::write(config_path(), toml::to_string_pretty(self)?)?;
-        Ok(())
+        crate::fsutil::with_lock(&config_path(), || {
+            let mut cfg = Self::load()?;
+            let out = f(&mut cfg)?;
+            fs::write(config_path(), toml::to_string_pretty(&cfg)?)?;
+            Ok(out)
+        })
     }
 
     pub fn exists() -> bool { config_path().exists() }

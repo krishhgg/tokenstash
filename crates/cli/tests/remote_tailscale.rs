@@ -148,6 +148,9 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     assert!(!held.status.success() && String::from_utf8_lossy(&held.stderr).contains("another process holds"), "{}", String::from_utf8_lossy(&held.stderr));
     let need = w.run(&["need", "OPENAI_API_KEY"]);
     assert!(String::from_utf8_lossy(&need.stdout).contains(&format!("http://127.0.0.1:{port}/p/")), "links stay on loopback: {}", String::from_utf8_lossy(&need.stdout));
+    // doctor does not call the remote link healthy because the address is right.
+    let doctor = String::from_utf8_lossy(&w.run(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains(&format!("another process answers on 127.0.0.2:{port}")), "{doctor}");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     impostor.join().unwrap();
 
@@ -167,6 +170,8 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     let need = w.run(&["need", "OPENAI_API_KEY"]);
     let text = String::from_utf8_lossy(&need.stdout).into_owned();
     let link = text.split_whitespace().find(|t| t.starts_with(&format!("http://127.0.0.2:{port}/p/"))).unwrap_or_else(|| panic!("no tailnet link: {text}")).to_string();
+    let doctor = String::from_utf8_lossy(&w.run(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains(&format!("tailscale: http://127.0.0.2:{port}/ opens as you")), "{doctor}");
     let card_path = link.strip_prefix(&format!("http://127.0.0.2:{port}")).unwrap().to_string();
     let id = card_path.trim_start_matches("/p/").split('?').next().unwrap().to_string();
 
