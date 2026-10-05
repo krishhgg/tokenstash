@@ -3517,10 +3517,11 @@ fn an_expired_action_card_is_not_reused() {
     assert_eq!(db.get_task(&first.id).unwrap().unwrap().status, db::TaskStatus::Expired);
 }
 
-/// Greptile on #68: a confirm that stops half way must not leave its card looking done. The
-/// claim keeps the card pending, holds off a second confirm, and runs out.
+/// Greptile on #68: a confirm that stops half way must not leave its card looking done, a
+/// worker that was taken over must not close or release the card under the one that took it,
+/// and a card cannot be declined while its action is being carried out.
 #[test]
-fn an_action_claim_holds_off_a_second_confirm_and_runs_out() {
+fn an_action_claim_belongs_to_its_worker_and_runs_out() {
     use crate::actions::Action;
     let _env = env_lock();
     let home = tmp("claim-home");
@@ -3532,14 +3533,48 @@ fn an_action_claim_holds_off_a_second_confirm_and_runs_out() {
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let t = crate::actions::request(&ctx, &proj, "agent", &Action::Undo, None).unwrap();
-    let a_minute_ago = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    assert!(db.claim_action(&t.id, &a_minute_ago).unwrap());
+    let first = db.claim_action(&t.id).unwrap().expect("the first confirm claims it");
     assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Pending, "still pending while it runs");
-    assert!(!db.claim_action(&t.id, &a_minute_ago).unwrap(), "a second confirm waits");
-    // The process that held it stopped: once the claim is older than the cut-off, it is taken over.
-    let later = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    assert!(db.claim_action(&t.id, &later).unwrap());
-    db.release_action_claim(&t.id).unwrap();
-    assert_eq!(db.get_task(&t.id).unwrap().unwrap().note, None);
-    assert!(db.claim_action(&t.id, &a_minute_ago).unwrap(), "a released claim can be taken again");
+    assert!(db.claim_action(&t.id).unwrap().is_none(), "a second confirm waits");
+    let err = tasks::deny(&ctx, &t, None).unwrap_err();
+    assert!(format!("{err:#}").contains("being carried out"), "{err:#}");
+    // The first worker stopped: its claim runs out and another confirm takes the card over.
+    db.conn.execute("UPDATE tasks SET note=?2 WHERE id=?1", rusqlite::params![t.id, format!("{}2000-01-01T00:00:00Z 0000000000000000", db::CONFIRMING)]).unwrap();
+    let second = db.claim_action(&t.id).unwrap().expect("a claim that ran out is taken over");
+    // The first worker comes back: it can neither give the claim back nor close the card.
+    db.release_action_claim(&t.id, &first).unwrap();
+    assert!(!db.finish_action(&t.id, &first, "done by the first").unwrap());
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().note.as_deref(), Some(second.as_str()));
+    assert!(db.finish_action(&t.id, &second, "done").unwrap());
+    let done = db.get_task(&t.id).unwrap().unwrap();
+    assert_eq!((done.status, done.note.as_deref()), (db::TaskStatus::Answered, Some("done")));
+    // A claim given back after a failure frees the card for another try, or a decline.
+    let u = crate::actions::request(&ctx, &proj, "agent", &Action::Mcp(false), None).unwrap();
+    let c = db.claim_action(&u.id).unwrap().unwrap();
+    db.release_action_claim(&u.id, &c).unwrap();
+    assert!(tasks::deny(&ctx, &u, None).is_ok());
+}
+
+/// Greptile on #68: an exact grant from before a no does not deliver the key to an agent that
+/// asks again; the person gets a card.
+#[test]
+fn asking_again_files_a_card_even_with_an_exact_grant() {
+    let _env = env_lock();
+    let home = tmp("ask-again-exact-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("ask-again-exact-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    pair(&db, &proj, "GROQ_API_KEY");
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "GROQ_API_KEY", "default", &tasks::SecretRequest::default()).unwrap();
+    tasks::deny(&ctx, &t, None).unwrap();
+    // Stored since, from another directory.
+    stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_storedelsewhere_0123456789".to_string())).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: Some("Groq".into()), sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+    let again = need::need(&ctx, &proj, "agent", &["GROQ_API_KEY".to_string()], &need::NeedOpts { force: true, ask_again: true, ..Default::default() }).unwrap();
+    assert!(matches!(again[0], need::Outcome::Pending { .. }), "{again:?}");
+    assert!(!crate::envfile::has(&proj, ".env.local", "GROQ_API_KEY"));
 }

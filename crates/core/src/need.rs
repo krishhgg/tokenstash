@@ -195,7 +195,15 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
             // (or an on-disk match) is not: it was a decision about the directory, made
             // earlier, and it must not quietly overrule "no" to this key here. Without this
             // a denied card followed by a paste elsewhere turns into a silent delivery.
+            let denied_now = |ctx: &Ctx| -> Result<bool> {
+                let since = ctx.cfg.ttl_since();
+                Ok(ctx.db.recent_denial(&pid, name, &identity, &since)?.is_some() || denied_card_for(ctx, &pid, &format!("{name}@{identity}"), &since)?.is_some())
+            };
             let gate = match &gate {
+                // Asked again after a no: the person answers a card again, whatever grant
+                // opened the gate before the no, an exact one included (a grant outlives
+                // `forget`, and the key may since have been stored from another directory).
+                Gate::Open { .. } if opts.ask_again && denied_now(ctx)? => Gate::NeedsApproval { reason: if sensitive { GateReason::Sensitive } else { GateReason::Pairing } },
                 Gate::Open { source } if source == crate::db::GRANT_BROAD || source == crate::db::GRANT_ON_DISK => {
                     let since = ctx.cfg.ttl_since();
                     // Both kinds of "no" count: a refused paste card and a refused pairing or
@@ -212,9 +220,6 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                             outcomes.push(Outcome::Denied { name: name.clone(), task_id: tid });
                             continue;
                         }
-                        // Asked again after a no: the person answers a card again, not the
-                        // standing grant that was there before the no.
-                        Some(_) if opts.ask_again => Gate::NeedsApproval { reason: GateReason::Pairing },
                         _ => gate,
                     }
                 }

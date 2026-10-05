@@ -66,11 +66,18 @@ pub fn need(a: NeedArgs) -> Result<i32> {
         }
     }
     let ask_again = !denied.is_empty();
+    // The one extra ask is reserved before the card is filed, in one step, so two requests
+    // at once cannot both take it; one that ends without a card for the key hands it back.
+    let mut reserved: Vec<(String, i64)> = vec![];
     if ask_again {
         let since = app.cfg.ttl_since();
         for name in &denied {
-            if app.db.audited_since(&pid, name, "need.force", &since)? {
-                anyhow::bail!("{name} was already asked for again once after the user declined it here; that answer stands for {} hours from the first no. Tell the user; do not ask again", app.cfg.task_ttl_hours);
+            match app.db.reserve_once(&pid, &agent, name, "need.force", &since)? {
+                Some(row) => reserved.push((name.clone(), row)),
+                None => {
+                    for (_, row) in &reserved { app.db.delete_audit_row(*row)?; }
+                    anyhow::bail!("{name} was already asked for again once after the user declined it here; that answer stands for {} hours from the first no. Tell the user; do not ask again", app.cfg.task_ttl_hours);
+                }
             }
         }
         why = Some(match why {
@@ -87,11 +94,20 @@ pub fn need(a: NeedArgs) -> Result<i32> {
         require_approval: false,
         ask_again,
     };
-    let mut outcomes = need::need(&app.ctx(), &project, &agent, &a.names, &opts)?;
+    let outcomes = need::need(&app.ctx(), &project, &agent, &a.names, &opts);
+    let mut outcomes = match outcomes {
+        Ok(o) => o,
+        Err(e) => {
+            for (_, row) in &reserved { app.db.delete_audit_row(*row)?; }
+            return Err(e);
+        }
+    };
     // The one extra ask is spent only by a request that filed a card for the key: a request
     // that failed, or found the key already allowed, leaves it for later.
-    for o in outcomes.iter().filter(|o| o.is_pending() && denied.iter().any(|d| d == o.name())) {
-        app.db.audit(Some(&pid), Some(&agent), "need.force", Some(o.name()), None, None)?;
+    for (name, row) in &reserved {
+        if !outcomes.iter().any(|o| o.is_pending() && o.name() == name) {
+            app.db.delete_audit_row(*row)?;
+        }
     }
 
     if outcomes.iter().any(|o| o.is_pending()) {

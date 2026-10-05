@@ -808,8 +808,12 @@ pub fn deny(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<AnswerResult> 
             bail!("that note looks like a credential; it would be shown to the agent. Deny without it.");
         }
     }
-    if !ctx.db.close_task_if_open(&task.id, TaskStatus::Denied, note)? {
-        bail!("task {} is already {}", task.id, ctx.db.get_task(&task.id)?.map(|t| t.status.as_str().to_string()).unwrap_or_else(|| "gone".into()));
+    if !ctx.db.deny_unless_claimed(&task.id, note)? {
+        match ctx.db.get_task(&task.id)? {
+            Some(t) if t.status == TaskStatus::Pending => bail!("this card is being carried out right now, so it cannot be declined; reload in a minute"),
+            Some(t) => bail!("task {} is already {}", task.id, t.status.as_str()),
+            None => bail!("task {} is already gone", task.id),
+        }
     }
     ctx.db.audit(Some(&task.project), Some(&task.agent), "deny", task.name.as_deref(), None, None)?;
     Ok(AnswerResult::Denied)

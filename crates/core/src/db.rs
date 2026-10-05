@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -7,6 +7,13 @@ use std::path::Path;
 /// (ts, project, agent, action, name, identity, detail, grant_source)
 /// The note an action card carries while it is being carried out, before the time.
 pub const CONFIRMING: &str = "confirming since ";
+/// How long a claim on an action card holds before it counts as left behind by a process that
+/// stopped mid-action. Every action finishes in seconds.
+pub const CLAIM_HOLDS_SECS: i64 = 120;
+
+fn claim_cutoff() -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(CLAIM_HOLDS_SECS)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
 
 pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
 
@@ -761,20 +768,63 @@ impl Db {
     }
 
     /// Mark a pending action card as being carried out, so a second confirm does not run it
-    /// again. True if this caller holds the claim now. A claim older than `stale_before` was
-    /// left by a process that stopped mid-action, and is taken over: the card stays pending
-    /// until the action has run, so an interrupted one can be confirmed again.
-    pub fn claim_action(&self, id: &str, stale_before: &str) -> Result<bool> {
+    /// again. Returns the claim (its note, unique to this caller) when this caller holds it now.
+    /// A claim older than [`CLAIM_HOLDS_SECS`] was left by a process that stopped mid-action
+    /// and is taken over: the card stays pending until the action has run, so an interrupted
+    /// one can be confirmed again.
+    pub fn claim_action(&self, id: &str) -> Result<Option<String>> {
+        let claim = format!("{CONFIRMING}{} {:016x}", crate::now(), rand::random::<u64>());
         let n = self.conn.execute(
-            "UPDATE tasks SET note=?2 WHERE id=?1 AND status='pending' AND (note IS NULL OR note NOT LIKE 'confirming since %' OR substr(note, 18) < ?3)",
-            params![id, format!("{CONFIRMING}{}", crate::now()), stale_before],
+            "UPDATE tasks SET note=?2 WHERE id=?1 AND status='pending' AND (note IS NULL OR note NOT LIKE 'confirming since %' OR substr(note, 18, 20) < ?3)",
+            params![id, claim, claim_cutoff()],
         )?;
-        Ok(n == 1)
+        Ok((n == 1).then_some(claim))
     }
 
-    /// Give a claim back after the action failed, so the person can try again or decline.
-    pub fn release_action_claim(&self, id: &str) -> Result<()> {
-        self.conn.execute("UPDATE tasks SET note=NULL WHERE id=?1 AND status='pending' AND note LIKE 'confirming since %'", params![id])?;
+    /// Close a card whose action ran, if `claim` still holds it: a worker that was taken over
+    /// after its claim ran out must not close the card under the one that took it.
+    pub fn finish_action(&self, id: &str, claim: &str, done: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE tasks SET status='answered', answered_at=?3, note=?4 WHERE id=?1 AND status='pending' AND note=?2",
+            params![id, claim, crate::now(), done],
+        )? == 1)
+    }
+
+    /// Give `claim` back after the action failed, so the person can try again or decline.
+    pub fn release_action_claim(&self, id: &str, claim: &str) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET note=NULL WHERE id=?1 AND status='pending' AND note=?2", params![id, claim])?;
+        Ok(())
+    }
+
+    /// Decline a card unless an action on it is being carried out right now (a fresh claim):
+    /// a decline must not land while the change it declines is half made.
+    pub fn deny_unless_claimed(&self, id: &str, note: Option<&str>) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE tasks SET status='denied', answered_at=?2, note=COALESCE(?3, note) WHERE id=?1 AND status='pending' AND (note IS NULL OR note NOT LIKE 'confirming since %' OR substr(note, 18, 20) < ?4)",
+            params![id, crate::now(), note, claim_cutoff()],
+        )? == 1)
+    }
+
+    /// Reserve a one-time audit row: insert `action` for (project, name) unless one exists
+    /// since `since`, as one step. The row id when this caller got it.
+    pub fn reserve_once(&self, project: &str, agent: &str, name: &str, action: &str, since: &str) -> Result<Option<i64>> {
+        self.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
+        let r = (|| -> Result<Option<i64>> {
+            if self.audited_since(project, name, action, since)? {
+                return Ok(None);
+            }
+            self.audit(Some(project), Some(agent), action, Some(name), None, None)?;
+            Ok(Some(self.conn.last_insert_rowid()))
+        })();
+        match r {
+            Ok(v) => { self.conn.execute_batch("COMMIT")?; Ok(v) }
+            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK"); Err(e) }
+        }
+    }
+
+    /// Hand back a reservation that went unused.
+    pub fn delete_audit_row(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM audit WHERE id=?1", params![id])?;
         Ok(())
     }
 
