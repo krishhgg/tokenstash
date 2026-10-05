@@ -415,6 +415,27 @@ impl Db {
         Ok(self.conn.query_row("SELECT identity FROM bindings WHERE project=?1 AND name=?2", params![project, name], |r| r.get(0)).optional()?)
     }
 
+    /// Run `f` under the index write lock (`BEGIN IMMEDIATE`), then commit, or roll back if
+    /// anything in it fails. A stash write goes inside when it must not interleave with a
+    /// store or a probe verdict, which hold this lock around their own stash reads and
+    /// writes. Not reentrant: calling it inside a transaction is an error.
+    pub fn locked<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            anyhow::bail!("the index write lock is already held by this connection");
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
+        let out = f().and_then(|v| {
+            self.conn.execute_batch("COMMIT").context("committing to the index")?;
+            Ok(v)
+        });
+        // SQLite can leave the transaction open after a failed COMMIT, as after a failed
+        // statement: roll back whenever it is still open.
+        if out.is_err() && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        out
+    }
+
     pub fn open_default() -> Result<Self> {
         Self::open(&crate::config::db_path())
     }

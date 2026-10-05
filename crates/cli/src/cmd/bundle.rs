@@ -251,28 +251,33 @@ fn stale_source_of(e: &Entry) -> &'static str {
 }
 
 pub fn apply_entry(app: &App, e: &Entry, source: &str, no_verify: bool) -> Result<()> {
-    app.stash.set(&stash_key(&e.name, &e.identity), &SecretString::from(e.value.clone()))?;
     let provider = tokenstash_core::registry::lookup(&e.name);
     let value = SecretString::from(e.value.clone());
     // Sensitivity is re-derived here exactly as a paste derives it; the source cannot
     // downgrade a registry-sensitive name or a live-mode value.
     let by_registry = tokenstash_core::registry::is_sensitive(provider, &value)?;
-    app.db.upsert_secret(&tokenstash_core::db::SecretMeta {
-        name: e.name.clone(), identity: e.identity.clone(),
-        provider: e.provider.clone().or_else(|| provider.map(|p| p.provider.clone())),
-        sensitive: e.sensitive || by_registry,
-        source_url: e.source_url.clone().or_else(|| provider.map(|p| p.url.clone())),
-        created: e.created.clone(), last_used: e.last_used.clone(), stale: e.stale,
-        last_verified: None,
-        stale_reason: if e.stale { e.stale_reason.clone().or_else(|| Some("stale at the source".into())) } else { None },
-        stale_source: if e.stale { Some(stale_source_of(e).into()) } else { None },
-        next_probe: None,
-        // An import that skipped the sweep is the human saying "do not check these": the
-        // sweep, when it runs, clears this for every key the provider accepts.
-        verify_off: no_verify || e.verify_off,
-    })?;
-    app.db.audit(None, None, "import", Some(&e.name), Some(&e.identity), Some(source))?;
-    Ok(())
+    // The stash write, its index row and the audit line share the index write lock, as a
+    // store's do. A probe verdict reads the stash and updates the row under that lock
+    // (`tasks::if_still_stored`), so it cannot read the old value, miss this write, and then
+    // record the old key's answer against the imported one.
+    app.db.locked(|| {
+        app.stash.set(&stash_key(&e.name, &e.identity), &value)?;
+        app.db.upsert_secret(&tokenstash_core::db::SecretMeta {
+            name: e.name.clone(), identity: e.identity.clone(),
+            provider: e.provider.clone().or_else(|| provider.map(|p| p.provider.clone())),
+            sensitive: e.sensitive || by_registry,
+            source_url: e.source_url.clone().or_else(|| provider.map(|p| p.url.clone())),
+            created: e.created.clone(), last_used: e.last_used.clone(), stale: e.stale,
+            last_verified: None,
+            stale_reason: if e.stale { e.stale_reason.clone().or_else(|| Some("stale at the source".into())) } else { None },
+            stale_source: if e.stale { Some(stale_source_of(e).into()) } else { None },
+            next_probe: None,
+            // An import that skipped the sweep is the human saying "do not check these": the
+            // sweep, when it runs, clears this for every key the provider accepts.
+            verify_off: no_verify || e.verify_off,
+        })?;
+        app.db.audit(None, None, "import", Some(&e.name), Some(&e.identity), Some(source))
+    })
 }
 
 /// Built from `ExportArgs` (`export --from-env DIR`); not a clap surface of its own.
@@ -434,4 +439,57 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
 fn identity_index(candidates: &[tokenstash_core::envcrawl::Candidate], idx: usize) -> usize {
     let name = &candidates[idx].name;
     (0..=idx).filter(|&i| &candidates[i].name == name).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokenstash_core::stash::{FileStash, Stash};
+    use tokenstash_core::{Config, Db};
+
+    fn entry(value: &str) -> Entry {
+        Entry {
+            name: "OPENAI_API_KEY".into(), identity: "default".into(), value: value.into(), provider: None, sensitive: false,
+            source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None, stale_source: None, verify_off: false,
+        }
+    }
+
+    /// An import writes the stash under the index write lock, as a store does. A probe
+    /// verdict holds that lock from its stash read to its update, so the import waits for it
+    /// rather than replacing the key in between and receiving the old key's verdict.
+    #[test]
+    fn an_import_writes_the_stash_under_the_index_lock() {
+        let _g = crate::inbox_auth::env_lock();
+        let home = std::env::temp_dir().join(format!("tokenstash-import-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("TOKENSTASH_HOME", &home);
+        let key = stash_key("OPENAI_API_KEY", "default");
+        let app = App { cfg: Config::default(), db: Db::open(&home.join("t.db")).unwrap(), stash: Box::new(FileStash::new().unwrap()) };
+        app.stash.set(&key, &SecretString::from("sk-old-aaaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+        // A verdict in another process reads the stash under the lock, waits for its
+        // provider, and reads again where it would record its answer.
+        let db_path = home.join("t.db");
+        let probed = key.clone();
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let verdict = std::thread::spawn(move || {
+            let other = Db::open(&db_path).unwrap();
+            let stash = FileStash::new().unwrap();
+            other.locked(|| {
+                let before = stash.get(&probed)?.map(|v| v.expose_secret().to_string());
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                let after = stash.get(&probed)?.map(|v| v.expose_secret().to_string());
+                Ok((before, after))
+            }).unwrap()
+        });
+        wait_held.recv().unwrap();
+        apply_entry(&app, &entry("sk-new-bbbbbbbbbbbbbbbbbbbbb"), "test", true).unwrap();
+        let (before, after) = verdict.join().unwrap();
+        assert_eq!(before, after, "the import changed the stash while a verdict held the lock");
+        assert_eq!(app.stash.get(&key).unwrap().unwrap().expose_secret(), "sk-new-bbbbbbbbbbbbbbbbbbbbb", "it lands once the lock is free");
+        std::env::remove_var("TOKENSTASH_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

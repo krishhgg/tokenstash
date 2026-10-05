@@ -596,27 +596,17 @@ fn store_and_inject_gated(
 /// this key. Returns `None`, with nothing applied, when it holds something else. A probe
 /// takes seconds and runs outside any lock, so a human can store a new value while it is in
 /// flight. A 401 for the old value must not mark the new one stale, and an Ok must not
-/// clear a flag the new one earned. [`store_and_inject_gated`] writes the stash under this
-/// same lock, so no store can land between the comparison here and `apply`.
+/// clear a flag the new one earned. [`store_and_inject_gated`] and `tokenstash import` write
+/// the stash under this same lock, so no store can land between the comparison here and
+/// `apply`.
 pub fn if_still_stored<T>(ctx: &Ctx, name: &str, identity: &str, probed: Option<&SecretString>, apply: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
-    if !ctx.db.conn.is_autocommit() {
-        bail!("if_still_stored called inside a transaction");
-    }
-    ctx.db.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
-    let applied = (|| -> Result<Option<T>> {
+    ctx.db.locked(|| {
         let now = ctx.stash.get(&stash_key(name, identity))?;
         if now.as_ref().map(|v| v.expose_secret()) != probed.map(|v| v.expose_secret()) {
             return Ok(None);
         }
         apply().map(Some)
-    })();
-    match applied {
-        Ok(v) => match ctx.db.conn.execute_batch("COMMIT") {
-            Ok(()) => Ok(v),
-            Err(e) => Err(rollback_store(ctx, anyhow!(e).context("recording the probe verdict"))),
-        },
-        Err(e) => Err(rollback_store(ctx, e)),
-    }
+    })
 }
 
 /// Restore autocommit after any failure in the raw `BEGIN IMMEDIATE` transaction. SQLite
