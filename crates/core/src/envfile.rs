@@ -32,6 +32,13 @@ pub fn normalize(env_file: &str) -> Result<String> {
     if parts.is_empty() {
         anyhow::bail!("env_file must name a file inside the project, but is '{env_file}'");
     }
+    // A .gitignore holds git's ignore rules, never secrets. At the project root the rule
+    // that ignores the env file would go into the env file itself, and the secret write
+    // would then replace that rule. The lock `ensure_gitignore` takes on a .gitignore would
+    // also be the env file's own lock, taken a second time, which waits forever.
+    if parts.last().is_some_and(|p| p == ".gitignore") {
+        anyhow::bail!("env_file must not be a .gitignore, but is '{env_file}'");
+    }
     Ok(parts.join("/"))
 }
 
@@ -445,6 +452,12 @@ unsafe fn libc_geteuid() -> u32 {
 /// project can re-include the file. If git says it is still not ignored, a rule is added to
 /// the project's own `.gitignore` (closest wins) and re-verified; if that still fails, the
 /// caller must not write the secret. Symlinked ignore files are refused.
+///
+/// Each `.gitignore` is locked from its read until git has verified the result. Two writers
+/// with different env file names would otherwise both read the same file, and the second
+/// rename would drop the first writer's rule after that writer had verified it and written
+/// its secret. The lock only orders tokenstash processes; another tool that rewrites
+/// `.gitignore` does not take it.
 pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     // Two different questions. Which repo will commit this file (`git_root`, plain
     // detection) and which `.gitignore` we may write into (`owned_git_root`, which refuses
@@ -458,29 +471,41 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
         Some(owned) => owned,
         None => project.to_path_buf(),
     };
-    let mut changed = add_rule_if_uncovered(&ignore_dir.join(".gitignore"), env_file)?;
+    let gi = ignore_dir.join(".gitignore");
     let target = project.join(env_file);
-    match git_check_ignore(&root, &target) {
-        Some(true) => Ok(changed),
-        None => unverified(&target),
-        Some(false) => {
-            // a closer .gitignore re-includes it; the project's own file is closest
-            let local = project.join(".gitignore");
-            if local != ignore_dir.join(".gitignore") {
-                changed |= add_rule_if_uncovered(&local, env_file)?;
-                if !gitignore_covers(&read_regular_file(&local).unwrap_or_default(), env_file) {
-                    // covered-by-our-evaluation but still re-included means a later negation
-                    // in this same file; append an explicit trailing rule regardless.
-                    append_rule(&local, env_file)?;
-                    changed = true;
-                }
-            }
-            match git_check_ignore(&root, &target) {
-                Some(true) => Ok(changed),
-                Some(false) => anyhow::bail!("git still does not ignore {} after updating .gitignore (a nested rule re-includes it); refusing to write a secret there", target.display()),
-                None => unverified(&target),
-            }
+    crate::fsutil::with_lock_elsewhere(&gi, || {
+        let mut changed = add_rule_if_uncovered(&gi, env_file)?;
+        match git_check_ignore(&root, &target) {
+            Some(true) => return Ok(changed),
+            None => return unverified(&target),
+            Some(false) => {}
         }
+        // a closer .gitignore re-includes it; the project's own file is closest
+        let local = project.join(".gitignore");
+        if local == gi {
+            return verify_again(&root, &target).map(|()| changed);
+        }
+        // The repo's file is locked before the project's. That is ancestor before descendant
+        // for every caller, so two writers never wait on each other's second lock.
+        crate::fsutil::with_lock_elsewhere(&local, || {
+            changed |= add_rule_if_uncovered(&local, env_file)?;
+            if !gitignore_covers(&read_regular_file(&local).unwrap_or_default(), env_file) {
+                // covered-by-our-evaluation but still re-included means a later negation
+                // in this same file; append an explicit trailing rule regardless.
+                append_rule(&local, env_file)?;
+                changed = true;
+            }
+            verify_again(&root, &target).map(|()| changed)
+        })
+    })
+}
+
+/// Ask git again once the project's own `.gitignore` holds the rule. "Not ignored" is final.
+fn verify_again(root: &Path, target: &Path) -> Result<()> {
+    match git_check_ignore(root, target) {
+        Some(true) => Ok(()),
+        Some(false) => anyhow::bail!("git still does not ignore {} after updating .gitignore (a nested rule re-includes it); refusing to write a secret there", target.display()),
+        None => unverified(target).map(|_| ()),
     }
 }
 

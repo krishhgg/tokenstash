@@ -196,6 +196,43 @@ fn gitignore_is_enforced_in_repos() {
     }
 }
 
+/// Two writers with different env file names update the same `.gitignore`. Each reads it,
+/// adds its rule and renames its copy into place. Without a lock, the second rename drops
+/// the first writer's rule after that writer has verified it and written its secret. The
+/// test plays writer A by hand. It takes the `.gitignore` lock, reads the file, starts
+/// writer B, and only then renames its own copy. B must wait for the lock and keep A's rule.
+#[test]
+fn gitignore_update_waits_for_a_concurrent_writer() {
+    // The lock lives under TOKENSTASH_HOME, so no other test may move it during the race.
+    let _env = env_lock();
+    let dir = tmp("gitignore-race");
+    init_git(&dir);
+    let gi = dir.join(".gitignore");
+    std::fs::write(&gi, "node_modules\n").unwrap();
+    let writer_b = fsutil::with_lock_elsewhere(&gi, || {
+        let seen = std::fs::read_to_string(&gi)?;
+        let (done, finished) = std::sync::mpsc::channel();
+        let project = dir.clone();
+        let writer_b = std::thread::spawn(move || {
+            let out = envfile::ensure_gitignore(&project, ".env.b");
+            let _ = done.send(());
+            out
+        });
+        // Without the lock, B finishes well inside this wait and the rename below drops its
+        // rule. With the lock, B is still waiting when the wait ends.
+        let _ = finished.recv_timeout(std::time::Duration::from_secs(1));
+        let staged = dir.join(".gitignore.writer-a");
+        std::fs::write(&staged, format!("{seen}.env.a\n"))?;
+        std::fs::rename(&staged, &gi)?;
+        Ok(writer_b)
+    })
+    .unwrap();
+    assert!(writer_b.join().unwrap().unwrap(), "B added its rule");
+    let after = std::fs::read_to_string(&gi).unwrap();
+    assert_eq!(envfile::git_check_ignore(&dir, &dir.join(".env.a")), Some(true), "A's rule is gone:\n{after}");
+    assert_eq!(envfile::git_check_ignore(&dir, &dir.join(".env.b")), Some(true), "B's rule is gone:\n{after}");
+}
+
 #[test]
 fn trust_gate_logic() {
     // A grant is (workspace, key, identity). Nothing is inferred from folders.
@@ -999,6 +1036,28 @@ fn tracked_env_file_is_still_refused_when_project_path_is_a_symlink() {
     assert!(err.to_string().contains("git rm --cached"), "tracked file must be refused through a symlinked project path: {err}");
     assert_eq!(std::fs::read_to_string(real.join(".env.local")).unwrap(), "OLD=1\n");
     let _ = std::fs::remove_file(&link);
+}
+
+/// The rule that ignores a root `.gitignore` would go into that same file, and the secret
+/// write replaced it, so the secret landed in a file git does not ignore. With the
+/// `.gitignore` lock the write would instead wait forever on its own env file lock.
+#[test]
+fn a_gitignore_as_env_file_is_refused() {
+    let dir = tmp("envfile-gitignore");
+    init_git(&dir);
+    for env_file in [".gitignore", "./.gitignore", "config/.gitignore"] {
+        let (done, finished) = std::sync::mpsc::channel();
+        let project = dir.clone();
+        std::thread::spawn(move || {
+            let out = envfile::write(&project, env_file, "K", &SecretString::from("vvvvvvvv".to_string()));
+            let _ = done.send(out.map_err(|e| e.to_string()));
+        });
+        let out = finished.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| panic!("writing to {env_file} hung"));
+        let err = out.unwrap_err();
+        assert!(err.contains("must not be a .gitignore"), "must name the problem: {err}");
+    }
+    assert!(!dir.join(".gitignore").exists());
+    assert!(!dir.join("config").exists());
 }
 
 #[test]
