@@ -54,6 +54,11 @@ pub(crate) fn service() -> String {
 
 pub trait Stash {
     fn backend(&self) -> &'static str;
+    /// How long values last here, when that is shorter than one might expect (`doctor` and
+    /// `init` show it).
+    fn note(&self) -> Option<String> {
+        None
+    }
     fn get(&self, key: &str) -> Result<Option<SecretString>>;
     fn set(&self, key: &str, value: &SecretString) -> Result<()>;
     fn delete(&self, key: &str) -> Result<bool>;
@@ -321,9 +326,27 @@ mod kernel {
 }
 
 #[cfg(target_os = "linux")]
+impl KernelKeyring {
+    /// Writes and deletes for this home take one lock. Two processes storing the same new
+    /// name at once would otherwise each create a key and link it into the two rings in
+    /// separate steps, and interleaved links can leave the user keyring holding one value and
+    /// the persistent keyring the other.
+    fn locked<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::fsutil::with_lock_elsewhere(std::path::Path::new("kernel-keyring"), f)
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Stash for KernelKeyring {
     fn backend(&self) -> &'static str {
         "keyutils"
+    }
+    fn note(&self) -> Option<String> {
+        Some(if kernel::persistent().is_some() {
+            "Linux kernel keyring: kept until the next reboot; a Secret Service such as gnome-keyring keeps keys across reboots".into()
+        } else {
+            "Linux kernel keyring without a persistent keyring: keys last only while you have a process running, and not past a reboot; a Secret Service such as gnome-keyring keeps them".into()
+        })
     }
     fn get(&self, key: &str) -> Result<Option<SecretString>> {
         let desc = kernel::description(key);
@@ -343,29 +366,33 @@ impl Stash for KernelKeyring {
             return Err(anyhow!("the kernel keyring cannot hold an empty value"));
         }
         let desc = kernel::description(key);
-        let (user, persistent) = (kernel::user()?, kernel::persistent());
-        let copies = kernel::copies(&user, persistent.as_ref(), &desc)?;
-        let Some(&keep) = copies.first() else {
-            kernel::create(&user, persistent.as_ref(), &desc, v)?;
-            return Ok(());
-        };
-        // Update in place: every session that links this object sees the new value.
-        kernel::update(keep, v)?;
-        // A shadow (an older session copy) gets the value as well, best effort: this
-        // process never reads it, but an older tokenstash in that session does.
-        for &k in copies.iter().skip(1) {
-            let _ = kernel::update(k, v);
-        }
-        kernel::pin(&user, persistent.as_ref(), keep)
+        Self::locked(|| {
+            let (user, persistent) = (kernel::user()?, kernel::persistent());
+            let copies = kernel::copies(&user, persistent.as_ref(), &desc)?;
+            let Some(&keep) = copies.first() else {
+                kernel::create(&user, persistent.as_ref(), &desc, v)?;
+                return Ok(());
+            };
+            // Update in place: every session that links this object sees the new value.
+            kernel::update(keep, v)?;
+            // A shadow (an older session copy) gets the value as well, best effort: this
+            // process never reads it, but an older tokenstash in that session does.
+            for &k in copies.iter().skip(1) {
+                let _ = kernel::update(k, v);
+            }
+            kernel::pin(&user, persistent.as_ref(), keep)
+        })
     }
     fn delete(&self, key: &str) -> Result<bool> {
         let desc = kernel::description(key);
-        let (user, persistent) = (kernel::user()?, kernel::persistent());
-        let copies = kernel::copies(&user, persistent.as_ref(), &desc)?;
-        for &k in &copies {
-            kernel::invalidate(k)?;
-        }
-        Ok(!copies.is_empty())
+        Self::locked(|| {
+            let (user, persistent) = (kernel::user()?, kernel::persistent());
+            let copies = kernel::copies(&user, persistent.as_ref(), &desc)?;
+            for &k in &copies {
+                kernel::invalidate(k)?;
+            }
+            Ok(!copies.is_empty())
+        })
     }
 }
 
@@ -439,10 +466,21 @@ mod kernel_tests {
         if std::env::var_os(CHILD).is_some() {
             return true;
         }
-        use std::os::unix::process::CommandExt;
         let home = std::env::temp_dir().join(format!("tokenstash-kernel-test-{}-{}", std::process::id(), rand::random::<u32>()));
+        spawn_session(name, &[("TOKENSTASH_HOME", home.as_os_str())]);
+        let _ = std::fs::remove_dir_all(&home);
+        false
+    }
+
+    /// Run the test `name` in a new process with a session keyring of its own and `env`
+    /// added; assert it ran its body to the end. False if keyctl is refused here.
+    fn spawn_session(name: &str, env: &[(&str, &std::ffi::OsStr)]) -> bool {
+        use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.args([name, "--exact", "--nocapture", "--test-threads=1"]).env(CHILD, "1").env("TOKENSTASH_HOME", &home);
+        cmd.args([name, "--exact", "--nocapture", "--test-threads=1"]).env(CHILD, "1");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         // SAFETY: only an async-signal-safe syscall runs between fork and exec.
         unsafe {
             cmd.pre_exec(|| {
@@ -460,11 +498,10 @@ mod kernel_tests {
                 return false;
             }
         };
-        let _ = std::fs::remove_dir_all(&home);
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success() && text.contains("1 passed"), "child run failed:\n{text}");
         assert!(text.contains(RAN), "the child did not run the test body:\n{text}");
-        false
+        true
     }
 
     /// Printed by a child that ran the body to the end, so a silent early return cannot
@@ -525,6 +562,36 @@ mod kernel_tests {
         assert!(KernelKeyring.delete(key).unwrap());
         assert_eq!(value(&KernelKeyring, key), None);
         assert!(!KernelKeyring.delete(key).unwrap());
+        println!("{RAN}");
+    }
+
+    /// The reported failure, with both logins alive at once: this session (the agent's)
+    /// holds an old copy straight in its session keyring, and a second session (an SSH
+    /// shell, the inbox) stores a new value while this one is still running. This session
+    /// must read the new value.
+    #[test]
+    fn a_value_stored_from_another_live_session_is_the_one_read_here() {
+        const NAME: &str = "stash::kernel_tests::a_value_stored_from_another_live_session_is_the_one_read_here";
+        if !in_own_session(NAME) {
+            return;
+        }
+        let key = "OPENAI_API_KEY@default";
+        if std::env::var_os("TOKENSTASH_KERNEL_TEST_ROLE").is_some() {
+            // The second session: a paste, nothing else.
+            KernelKeyring.set(key, &SecretString::from("sk-pasted-in-the-other-session")).unwrap();
+            println!("{RAN}");
+            return;
+        }
+        probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
+        let _cleanup = Cleanup(key);
+        KernelKeyring.set(key, &SecretString::from("sk-first-value")).unwrap();
+        // What an older tokenstash in this session left behind: its own copy, straight in
+        // the session keyring.
+        let session = KeyRing::from_special_id(KeyRingIdentifier::Session, false).unwrap();
+        let shadow = session.add_key(&kernel::description(key), b"sk-old-session-copy").unwrap();
+        assert_eq!(session.search(&kernel::description(key)).unwrap(), shadow, "the setup must reproduce the shadowing");
+        assert!(spawn_session(NAME, &[("TOKENSTASH_KERNEL_TEST_ROLE", std::ffi::OsStr::new("writer"))]), "the second session must run");
+        assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-pasted-in-the-other-session"));
         println!("{RAN}");
     }
 
