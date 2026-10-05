@@ -337,13 +337,8 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                 // send it to them the one way the agent cannot read, the desktop. Anyone with
                 // the link can press this; all it does is notify the person again.
                 (_, "notify") => send_full_link(app, &task),
-                (kind, "deny") => {
-                    // An approval card is the human's decision either way: closing it from
-                    // the agent's link would let the agent bury its own pairing card for a
-                    // day, or another agent's in the same directory.
-                    if kind == TaskKind::Approval && scope != Scope::Full {
-                        anyhow::bail!("closing an approval card needs your own inbox link: use the one in the desktop notification (the button below sends it again) and decide on this card there");
-                    }
+                // An approval card's Deny is decided below, with Allow.
+                (kind, "deny") if kind != TaskKind::Approval => {
                     tasks::deny(&ctx, &task, form.get("note").map(|s| s.as_str()))?;
                     Ok(format!("Denied {}", task.title))
                 }
@@ -371,19 +366,28 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                 (TaskKind::Approval, _) => {
                     // Approving is the one thing a card session must not do: it is the
                     // human's yes to "this project may use my key", and the agent's link
-                    // must not be able to give it. Refuse with no state change.
+                    // must not be able to give it. Refuse with no state change. Closing the card
+                    // is the human's decision too: from the agent's link it would let the agent
+                    // bury its own pairing card for a day, or another agent's in the same
+                    // directory.
                     if scope != Scope::Full {
+                        if action == "deny" {
+                            anyhow::bail!("closing an approval card needs your own inbox link: use the one in the desktop notification (the button below sends it again) and decide on this card there");
+                        }
                         anyhow::bail!("approving needs your own inbox link: use the one in the desktop notification (the button below sends it again) and approve this card there");
                     }
                     let decision = match action.as_str() { "allow" => tasks::Decision::Allow, "allow_broad" => tasks::Decision::AllowBroad, _ => tasks::Decision::Deny };
                     // What the page listed when it was rendered: a card that grew since
-                    // (an agent asked for more) is refused and re-read.
+                    // (an agent asked for more) is refused and re-read. That holds for Deny
+                    // too, which closes the card and every key on it: a key added after the
+                    // page loaded is not declined unseen. The comparison and the close happen
+                    // under the index write lock in `answer_approval`.
                     // The browser form always carries `seen`; a POST without it (a
                     // person scripting `curl`) is judged on the card as it is now.
                     let seen: Option<Vec<String>> = form.get("seen").map(|s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect());
                     match tasks::answer_approval(&ctx, &task, decision, seen.as_deref())? {
                         AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")) })),
-                        _ => Ok("Denied".into()),
+                        _ => Ok(format!("Denied {}", task.title)),
                     }
                 }
                 (TaskKind::Human, _) => match tokenstash_core::actions::Action::of(&task) {

@@ -458,3 +458,39 @@ fn an_action_card_runs_only_on_the_persons_confirm() {
     assert!(std::fs::read_to_string(home.join("user-home/.codex/config.toml")).unwrap().contains("[mcp_servers.tokenstash]"));
     inbox.stop();
 }
+
+/// Greptile on #65: Deny on an approval card goes through the same locked comparison with
+/// what the page showed as Allow does. A card that grew after the page loaded is refused and
+/// stays open, so a key the agent added since is not declined unseen.
+#[test]
+fn denying_an_approval_card_that_grew_since_the_page_loaded_is_refused() {
+    let port = free_port();
+    let home = home("deny-grown-home", port);
+    let proj_a = tmp("deny-grown-a");
+    let proj_b = tmp("deny-grown-b");
+    let inbox = Inbox::start(&home, port);
+    for (name, value) in [("OPENAI_API_KEY", "sk-proj-denygrown0123456789abcdef"), ("GROQ_API_KEY", "gsk_denygrown0123456789abcdefghij")] {
+        let need = run(&home, &proj_a, &["need", name, "--agent", "ci"]);
+        let (path, cred) = card_link(&need, port);
+        assert_eq!(http(port, "POST", &path, &[("tokenstash_card", cred.as_str())], Some(&format!("value={value}&skip_check=1&t={cred}"))).0, 303, "{name}");
+    }
+    // B asks for one of them: a pairing card, which the person opens.
+    assert_eq!(run(&home, &proj_b, &["need", "OPENAI_API_KEY", "--agent", "ci"]).status.code(), Some(10));
+    let approval = task_id_kind(&home, &proj_b, "approval");
+    let session = std::fs::read_to_string(home.join("inbox.session")).unwrap();
+    let full = [("tokenstash_inbox", session.as_str())];
+    let (st, _, _, page) = http(port, "GET", &format!("/t/{approval}"), &full, None);
+    let seen = "OPENAI_API_KEY@default";
+    assert!(st == 200 && page.contains(&format!("name=seen value='{seen}'")), "{page}");
+    // The agent asks for the other key before the person answers: the same card grows.
+    assert_eq!(run(&home, &proj_b, &["need", "GROQ_API_KEY", "--agent", "ci"]).status.code(), Some(10));
+    assert_eq!(task_id_kind(&home, &proj_b, "approval"), approval, "the card grew");
+    let (st, _, _, page) = http(port, "POST", &format!("/t/{approval}"), &full, Some(&format!("action=deny&seen={seen}&t={session}")));
+    assert!(st == 200 && page.contains("changed since you read it"), "{page}");
+    assert_eq!(status_of(&home, &proj_b, &approval), "pending", "a Deny on what the page showed does not close the grown card");
+    // Decided on the card as it is now, the Deny lands.
+    let (st, _, _, page) = http(port, "POST", &format!("/t/{approval}"), &full, Some(&format!("action=deny&seen={seen},GROQ_API_KEY@default&t={session}")));
+    assert_eq!(st, 303, "{page}");
+    assert_eq!(status_of(&home, &proj_b, &approval), "denied");
+    inbox.stop();
+}
