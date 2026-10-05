@@ -296,7 +296,7 @@ pub fn audit(a: AuditArgs) -> Result<i32> {
     } else {
         let project = tokenstash_core::project::current();
         match app.db.find_workspace(&project)? {
-            Some(ws) => app.db.recent_audit_for(&project.to_string_lossy(), &ws.created, a.limit)?,
+            Some(ws) => app.db.recent_audit_for(&project.to_string_lossy(), &ws, a.limit)?,
             None => vec![],
         }
     };

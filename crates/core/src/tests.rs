@@ -4392,6 +4392,44 @@ fn forget_and_a_concurrent_store_do_not_interleave() {
     std::env::set_var("TOKENSTASH_HOME", base_home());
 }
 
+/// Greptile on #65, #61 and #71: an agent in a directory paired again within the same second
+/// as an event of the directory it replaced does not see that event. Times are whole seconds;
+/// the agent's view starts after the last audit row written before its workspace was recorded.
+#[test]
+fn a_directory_paired_again_in_the_same_second_does_not_see_the_old_ones_events() {
+    let _env = env_lock();
+    let home = tmp("audit-bound-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    let proj = tmp("audit-bound-proj").canonicalize().unwrap();
+    let pid = proj.to_string_lossy().to_string();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let old = db.workspace_for(&proj).unwrap();
+    db.audit(Some(&pid), Some("agent"), "store", Some("OPENAI_API_KEY"), Some("default"), None).unwrap();
+    assert_eq!(db.recent_audit_for(&pid, &old, 10).unwrap().len(), 1);
+    std::fs::remove_dir_all(&proj).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::create_dir_all(&proj).unwrap();
+    let fresh = db.repair_workspace(&proj).unwrap();
+    // Every row in the second the new directory was paired.
+    db.conn.execute("UPDATE audit SET ts=?1", rusqlite::params![fresh.created]).unwrap();
+    let rows = db.recent_audit_for(&pid, &fresh, 10).unwrap();
+    assert!(rows.is_empty(), "the old directory's events: {rows:?}");
+    db.audit(Some(&pid), Some("agent"), "inject", Some("GROQ_API_KEY"), Some("default"), None).unwrap();
+    db.conn.execute("UPDATE audit SET ts=?1", rusqlite::params![fresh.created]).unwrap();
+    let rows = db.recent_audit_for(&pid, &fresh, 10).unwrap();
+    assert_eq!(rows.iter().map(|r| r.4.as_deref()).collect::<Vec<_>>(), vec![Some("GROQ_API_KEY")], "its own event, from the same second");
+    // A record from before the bound existed gets one when the index opens: everything up to
+    // and including its creation second stays out.
+    db.conn.execute("UPDATE workspaces SET audit_from=NULL", []).unwrap();
+    let rows = db.recent_audit_for(&pid, &fresh, 10).unwrap();
+    assert!(rows.is_empty(), "until then, rows after its creation second only: {rows:?}");
+    let db = Db::open(&home.join("t.db")).unwrap();
+    assert!(db.recent_audit_for(&pid, &fresh, 10).unwrap().is_empty());
+    db.audit(Some(&pid), Some("agent"), "inject", Some("RESEND_API_KEY"), Some("default"), None).unwrap();
+    assert_eq!(db.recent_audit_for(&pid, &fresh, 10).unwrap().len(), 1);
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
 /// Greptile on #68: an exact grant from before a no does not deliver the key to an agent that
 /// asks again; the person gets a card.
 #[test]

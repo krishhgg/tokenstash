@@ -360,6 +360,9 @@ impl Db {
             // What a confirmed action card acts on, recorded by its first confirm
             // (`pin_action_target`).
             ("tasks", "acts_on", "ALTER TABLE tasks ADD COLUMN acts_on TEXT"),
+            // The last audit row from before the workspace was recorded: an agent's view of
+            // the log starts after it (`recent_audit_for`).
+            ("workspaces", "audit_from", "ALTER TABLE workspaces ADD COLUMN audit_from INTEGER"),
         ] {
             let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"))?.exists([col])?;
             if !has {
@@ -370,6 +373,13 @@ impl Db {
                 }
             }
         }
+        // Workspaces recorded before `audit_from` existed, or by an older version since: start
+        // after every row up to and including the second the workspace was recorded in. Times
+        // are whole seconds, so a row from that second may be the old directory's.
+        conn.execute(
+            "UPDATE workspaces SET audit_from=(SELECT COALESCE(MAX(id), 0) FROM audit WHERE ts <= workspaces.created) WHERE audit_from IS NULL",
+            [],
+        )?;
         // Rows marked stale before `stale_source` existed: the human's rotation is the only
         // one whose display text is a fixed constant, so it is the only one recoverable.
         conn.execute(
@@ -1086,11 +1096,20 @@ impl Db {
         }
         let id = new_workspace_id();
         let created = crate::now();
-        self.conn.execute(
-            "INSERT INTO workspaces (id, root, ino, btime, dev, created) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![id, key, fp.ino as i64, fp.btime, fp.dev as i64, created],
-        )?;
+        self.insert_workspace(&id, &key, &fp, &created)?;
         Ok(Some(Workspace { id, root: key, ino: fp.ino, fingerprint_weak: fp.btime.is_none(), btime: fp.btime, dev: fp.dev, created, fingerprint_ok: true }))
+    }
+
+    /// Record a workspace. Its agent's view of the audit log starts after the last row written
+    /// before it ([`Self::recent_audit_for`]): row ids only grow, where times are whole
+    /// seconds, so a directory paired again within the second of an old row still never
+    /// sees that row.
+    fn insert_workspace(&self, id: &str, root: &str, fp: &Fingerprint, created: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workspaces (id, root, ino, btime, dev, created, audit_from) VALUES (?1,?2,?3,?4,?5,?6,(SELECT COALESCE(MAX(id), 0) FROM audit))",
+            params![id, root, fp.ino as i64, fp.btime, fp.dev as i64, created],
+        )?;
+        Ok(())
     }
 
     /// The workspace for a root, created if this is its first contact. Only the delivery
@@ -1155,7 +1174,7 @@ impl Db {
         }
         let id = new_workspace_id();
         let created = crate::now();
-        self.conn.execute("INSERT INTO workspaces (id, root, ino, btime, dev, created) VALUES (?1,?2,?3,?4,?5,?6)", params![id, key, fp.ino as i64, fp.btime, fp.dev as i64, created])?;
+        self.insert_workspace(&id, &key, &fp, &created)?;
         Ok(Workspace { id, root: key, ino: fp.ino, fingerprint_weak: fp.btime.is_none(), btime: fp.btime, dev: fp.dev, created, fingerprint_ok: true })
     }
 
@@ -1310,14 +1329,19 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// The most recent audit rows for one project since `since`, newest first: what an agent
-    /// may see of the log. `since` is when the directory now at that path was paired, so a
-    /// checkout re-created at the same path does not read the old one's history.
-    pub fn recent_audit_for(&self, project: &str, since: &str, limit: usize) -> Result<Vec<AuditRow>> {
+    /// The most recent audit rows for one project written after workspace `ws` was recorded,
+    /// newest first: what an agent may see of the log. A checkout re-created at the same path
+    /// does not read the old one's history, even when it was paired again within the same
+    /// second as the old one's last event: the bound is the workspace's audit row id, not a
+    /// time. A record an older version wrote has no such id until the next open fills it in,
+    /// and until then its view starts after its creation second.
+    pub fn recent_audit_for(&self, project: &str, ws: &Workspace, limit: usize) -> Result<Vec<AuditRow>> {
         let mut st = self.conn.prepare(
-            "SELECT ts, project, agent, action, name, identity, detail, grant_source FROM audit WHERE project=?1 AND ts >= ?2 ORDER BY id DESC LIMIT ?3",
+            "SELECT a.ts, a.project, a.agent, a.action, a.name, a.identity, a.detail, a.grant_source FROM audit a JOIN workspaces w ON w.id=?2
+             WHERE a.project=?1 AND CASE WHEN w.audit_from IS NULL THEN a.ts > w.created ELSE a.id > w.audit_from END
+             ORDER BY a.id DESC LIMIT ?3",
         )?;
-        let rows = st.query_map(params![project, since, limit as i64], |r| {
+        let rows = st.query_map(params![project, ws.id, limit as i64], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
