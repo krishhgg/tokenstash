@@ -152,9 +152,13 @@ impl Manifest {
     fn is_empty(&self) -> bool {
         self.files.is_empty() && self.dirs.is_empty() && !self.claude_mcp_registered && self.entries.is_empty()
     }
-    /// Remember the tokenstash entry `p` holds now as the one init wrote.
-    fn record_wrote(&mut self, p: &Path) -> Result<()> {
-        if let Some(e) = mcp_entry(p)? {
+    /// [`Manifest::mutate`] for a shared config, remembering the tokenstash entry the change
+    /// wrote. Not read back from the file: another writer may have changed it already, and
+    /// undo would then take out their entry as init's.
+    fn mutate_entry(&mut self, p: &Path, f: impl FnOnce() -> Result<serde_json::Value>) -> Result<()> {
+        let mut made = None;
+        self.mutate(p, || { made = Some(f()?); Ok(()) })?;
+        if let Some(e) = made {
             self.wrote.retain(|(q, _)| q != p);
             self.wrote.push((p.to_path_buf(), e));
             self.save()?;
@@ -439,6 +443,19 @@ fn write_file_as(p: &Path, contents: impl AsRef<[u8]>, perms: Option<fs::Permiss
     use std::io::Write;
     let target = landing(p)?;
     let p = target.as_path();
+    // A file with more than one name (a hard link, as some dotfile managers make) is
+    // rewritten in place, so every name keeps showing the same file: a rename would give
+    // only this name the new text. That one write is not atomic.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fs::metadata(p).is_ok_and(|md| md.is_file() && md.nlink() > 1) {
+            let mut f = fs::OpenOptions::new().write(true).truncate(true).open(p).map_err(|e| anyhow::anyhow!("writing {}: {e}", p.display()))?;
+            f.write_all(contents.as_ref())?;
+            f.sync_all()?;
+            return Ok(());
+        }
+    }
     let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     // A name nobody can guess, created only if nothing is there: a link planted at a
@@ -809,7 +826,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
             if !ok { manifest.claude_mcp_registered = false; manifest.save()?; }
             ok
         } else {
-            match manifest.mutate(&cj, || merge_mcp_json_typed(&cj, &w.exe, true, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&cj)) {
+            match manifest.mutate_entry(&cj, || merge_mcp_json_typed(&cj, &w.exe, true, w.ts_home.as_deref())) {
                 Ok(()) => { touched.push(cj); true }
                 Err(e) => { println!("! Claude Code: left {} untouched — {e}", cj.display()); false }
             }
@@ -823,7 +840,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let codex = w.codex();
     if codex.is_dir() {
         let ctoml = codex.join("config.toml");
-        match manifest.mutate(&ctoml, || merge_codex_toml(&ctoml, &w.exe, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&ctoml)) {
+        match manifest.mutate_entry(&ctoml, || merge_codex_toml(&ctoml, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(ctoml.clone()); println!("✓ Codex: MCP server registered ({})", ctoml.display()) }
             Err(e) => println!("! Codex: left {} untouched — {e}", ctoml.display()),
         }
@@ -831,7 +848,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let cursor = w.cursor();
     if cursor.is_dir() {
         let cj = cursor.join("mcp.json");
-        match manifest.mutate(&cj, || merge_mcp_json(&cj, &w.exe, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&cj)) {
+        match manifest.mutate_entry(&cj, || merge_mcp_json(&cj, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(cj.clone()); println!("✓ Cursor: MCP server registered ({})", cj.display()) }
             Err(e) => println!("! Cursor: left {} untouched — {e}", cj.display()),
         }
@@ -839,7 +856,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let gemini = w.gemini();
     if gemini.is_dir() {
         let gj = gemini.join("settings.json");
-        match manifest.mutate(&gj, || merge_mcp_json(&gj, &w.exe, w.ts_home.as_deref())).and_then(|()| manifest.record_wrote(&gj)) {
+        match manifest.mutate_entry(&gj, || merge_mcp_json(&gj, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(gj.clone()); println!("✓ Gemini CLI: MCP server registered ({})", gj.display()) }
             Err(e) => println!("! Gemini CLI: left {} untouched — {e}", gj.display()),
         }
@@ -1228,7 +1245,7 @@ pub fn installed(home: &Path) -> Vec<Installed> {
 /// whitespace, inline tables, nested subtables) — an earlier line-scanning version got a
 /// steady stream of those wrong. An existing entry is replaced wholesale so the env
 /// (TOKENSTASH_HOME) is current. If the file cannot be parsed it is left untouched.
-fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
+fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<serde_json::Value> {
     let mut doc = read_toml(p)?;
     let servers = doc.entry("mcp_servers").or_insert(toml_edit::table());
     let Some(servers) = servers.as_table_like_mut() else {
@@ -1248,12 +1265,13 @@ fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
     let out = doc.to_string();
     // Belt and braces: the result must parse back with exactly our command.
     let back: toml::Value = toml::from_str(&out).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
-    if back.get("mcp_servers").and_then(|m| m.get("tokenstash")).and_then(|t| t.get("command")).and_then(|c| c.as_str()) != Some(exe) {
+    let Some(ours) = back.get("mcp_servers").and_then(|m| m.get("tokenstash")).filter(|t| t.get("command").and_then(|c| c.as_str()) == Some(exe)) else {
         anyhow::bail!("refusing to write {}: could not set the tokenstash entry cleanly; edit it by hand", p.display());
-    }
+    };
+    let ours = serde_json::to_value(ours)?;
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
     write_file(p, &out)?;
-    Ok(())
+    Ok(ours)
 }
 
 fn read_toml(p: &Path) -> Result<toml_edit::DocumentMut> {
@@ -1283,12 +1301,13 @@ fn toml_has_server(p: &Path) -> bool { toml_server_state(p).unwrap_or(false) }
 
 /// Add `mcpServers.tokenstash` to a JSON config owned by another tool. If the file exists
 /// but cannot be parsed as a JSON object, refuse rather than replace it.
-fn merge_mcp_json(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
+fn merge_mcp_json(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<serde_json::Value> {
     merge_mcp_json_typed(p, exe, false, ts_home)
 }
 
 /// Same, with `"type": "stdio"` — the shape Claude Code writes into `~/.claude.json`.
-fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool, ts_home: Option<&str>) -> Result<()> {
+/// Returns the entry written.
+fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool, ts_home: Option<&str>) -> Result<serde_json::Value> {
     let mut v = read_json(p)?;
     let root = v.as_object_mut().ok_or_else(|| anyhow::anyhow!("{} root is not a JSON object", p.display()))?;
     let servers = root.entry("mcpServers").or_insert(serde_json::json!({}));
@@ -1297,10 +1316,10 @@ fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool, ts_home: Option<&str>)
     if let Some(h) = ts_home {
         entry["env"] = serde_json::json!({ "TOKENSTASH_HOME": h });
     }
-    m.insert("tokenstash".into(), entry);
+    m.insert("tokenstash".into(), entry.clone());
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
     write_file(p, &serde_json::to_string_pretty(&v)?)?;
-    Ok(())
+    Ok(entry)
 }
 
 fn read_json(p: &Path) -> Result<serde_json::Value> {
@@ -2225,5 +2244,39 @@ mod tests {
         std::os::unix::fs::symlink(d.join("a"), d.join("b")).unwrap();
         assert!(write_file(&d.join("a"), "x").is_err());
         assert_eq!(fs::read_dir(&d).unwrap().count(), 2, "no file or temporary file left");
+    }
+
+    /// Greptile on #70: a config with a second name through a hard link is changed under
+    /// both names.
+    #[test]
+    fn a_hard_linked_config_changes_under_every_name() {
+        let d = scratch("hardlink");
+        let a = d.join("dotfiles/config.toml");
+        let b = d.join("codex/config.toml");
+        write(&a, "model = \"o3\"\n");
+        fs::create_dir_all(b.parent().unwrap()).unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        write_file(&b, "model = \"o4\"\n").unwrap();
+        assert_eq!(read(&a), "model = \"o4\"\n");
+        assert_eq!(read(&b), "model = \"o4\"\n");
+    }
+
+    /// Greptile on #70: init records the entry it wrote, not what the file holds a moment
+    /// later, so an edit made in between is the person's and undo leaves it.
+    #[test]
+    fn init_records_the_entry_it_wrote_not_a_later_edit() {
+        let (w, mut m) = machine("record-made");
+        let p = w.cursor().join("mcp.json");
+        write(&p, "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"}}}");
+        let theirs = "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"},\"tokenstash\":{\"command\":\"/usr/local/bin/tokenstash\",\"args\":[\"mcp\"]}}}";
+        m.mutate_entry(&p, || {
+            let made = merge_mcp_json(&p, &w.exe, None)?;
+            // Another writer changes the entry right after init wrote it.
+            write(&p, theirs);
+            Ok(made)
+        }).unwrap();
+        assert_eq!(m.wrote_for(&p).unwrap()["command"], w.exe.as_str());
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        assert_eq!(read(&p), theirs, "their entry stays");
     }
 }
