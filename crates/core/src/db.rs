@@ -805,15 +805,23 @@ impl Db {
         )? == 1)
     }
 
-    /// Reserve a one-time audit row: insert `action` for (project, name) unless one exists
-    /// since `since`, as one step. The row id when this caller got it.
-    pub fn reserve_once(&self, project: &str, agent: &str, name: &str, action: &str, since: &str) -> Result<Option<i64>> {
+    /// Reserve the one extra ask after a no (`need --force` from an agent) for (project, name),
+    /// in one step. A reservation is spent once it names the card it filed ([`bind_force`]).
+    /// One that names none is an ask still being filed for a minute, then one a stopped process
+    /// left behind, which is taken back here. The row id when this caller got the ask.
+    pub fn reserve_force(&self, project: &str, agent: &str, name: &str, since: &str) -> Result<Option<i64>> {
+        let in_flight = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
         let r = (|| -> Result<Option<i64>> {
-            if self.audited_since(project, name, action, since)? {
-                return Ok(None);
+            let mut st = self.conn.prepare("SELECT id, ts, detail FROM audit WHERE project=?1 AND name=?2 AND action='need.force' AND ts >= ?3")?;
+            let rows: Vec<(i64, String, Option<String>)> = st.query_map(params![project, name, since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+            for (id, ts, card) in rows {
+                if card.is_some() || ts >= in_flight {
+                    return Ok(None);
+                }
+                self.conn.execute("DELETE FROM audit WHERE id=?1", params![id])?;
             }
-            self.audit(Some(project), Some(agent), action, Some(name), None, None)?;
+            self.audit(Some(project), Some(agent), "need.force", Some(name), None, None)?;
             Ok(Some(self.conn.last_insert_rowid()))
         })();
         match r {
@@ -826,6 +834,22 @@ impl Db {
     pub fn delete_audit_row(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM audit WHERE id=?1", params![id])?;
         Ok(())
+    }
+
+    /// Spend the reservation `row` on the card it filed.
+    pub fn bind_force(&self, row: i64, task_id: &str) -> Result<()> {
+        self.conn.execute("UPDATE audit SET detail=?2 WHERE id=?1 AND action='need.force'", params![row, task_id])?;
+        Ok(())
+    }
+
+    /// A card for `name` in `project` filed at or after reservation `row`, if any: what a
+    /// request that failed part way had already filed under it.
+    pub fn card_since_reservation(&self, row: i64, project: &str, name: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT t.id FROM tasks t, audit a WHERE a.id=?1 AND t.project=?2 AND t.created >= a.ts AND (t.name=?3 OR instr(t.names, '\"' || ?3 || '@') > 0) ORDER BY t.created LIMIT 1",
+            params![row, project, name],
+            |r| r.get(0),
+        ).optional()?)
     }
 
     /// Claim the one desktop notification a card gets: true the first time, false after. A

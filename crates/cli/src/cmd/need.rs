@@ -72,7 +72,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     if ask_again {
         let since = app.cfg.ttl_since();
         for name in &denied {
-            match app.db.reserve_once(&pid, &agent, name, "need.force", &since)? {
+            match app.db.reserve_force(&pid, &agent, name, &since)? {
                 Some(row) => reserved.push((name.clone(), row)),
                 None => {
                     for (_, row) in &reserved { app.db.delete_audit_row(*row)?; }
@@ -98,15 +98,23 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     let mut outcomes = match outcomes {
         Ok(o) => o,
         Err(e) => {
-            for (_, row) in &reserved { app.db.delete_audit_row(*row)?; }
+            // A request that failed part way may already have filed a card for some keys:
+            // those asks are spent; the rest are handed back.
+            for (name, row) in &reserved {
+                match app.db.card_since_reservation(*row, &pid, name)? {
+                    Some(tid) => app.db.bind_force(*row, &tid)?,
+                    None => app.db.delete_audit_row(*row)?,
+                }
+            }
             return Err(e);
         }
     };
     // The one extra ask is spent only by a request that filed a card for the key: a request
     // that failed, or found the key already allowed, leaves it for later.
     for (name, row) in &reserved {
-        if !outcomes.iter().any(|o| o.is_pending() && o.name() == name) {
-            app.db.delete_audit_row(*row)?;
+        match outcomes.iter().find_map(|o| match o { Outcome::Pending { name: n, task_id, .. } if n == name => Some(task_id.clone()), _ => None }) {
+            Some(tid) => app.db.bind_force(*row, &tid)?,
+            None => app.db.delete_audit_row(*row)?,
         }
     }
 

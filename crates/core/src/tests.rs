@@ -3578,3 +3578,34 @@ fn asking_again_files_a_card_even_with_an_exact_grant() {
     assert!(matches!(again[0], need::Outcome::Pending { .. }), "{again:?}");
     assert!(!crate::envfile::has(&proj, ".env.local", "GROQ_API_KEY"));
 }
+
+/// Greptile on #68: the extra ask after a no is spent on the card it filed. One a stopped
+/// process reserved and never filed a card for is taken back; one in flight is not; a request
+/// that failed part way keeps the asks it already filed cards for.
+#[test]
+fn the_extra_ask_is_spent_on_its_card_and_recovered_when_none_was_filed() {
+    let _env = env_lock();
+    let home = tmp("force-reserve-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("force-reserve-proj").canonicalize().unwrap();
+    let pid = proj.to_string_lossy().to_string();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let since = cfg.ttl_since();
+    let row = db.reserve_force(&pid, "agent", "GROQ_API_KEY", &since).unwrap().expect("the first ask is free");
+    assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", &since).unwrap().is_none(), "one in flight holds it");
+    // The process stopped before filing anything: a minute on, the ask comes back.
+    db.conn.execute("UPDATE audit SET ts='2000-01-01T00:00:00Z' WHERE id=?1", rusqlite::params![row]).unwrap();
+    let old = cfg.ttl_since().replace(&cfg.ttl_since()[..4], "1999");
+    let row = db.reserve_force(&pid, "agent", "GROQ_API_KEY", &old).unwrap().expect("a reservation left behind is taken back");
+    // Spent on the card it filed: no more asks in the window.
+    let card = tasks::create_secret_task(&ctx, &proj, "agent", "GROQ_API_KEY", "default", &tasks::SecretRequest::default()).unwrap();
+    assert_eq!(db.card_since_reservation(row, &pid, "GROQ_API_KEY").unwrap(), Some(card.id.clone()));
+    db.bind_force(row, &card.id).unwrap();
+    db.conn.execute("UPDATE audit SET ts='2000-01-01T00:00:01Z' WHERE id=?1", rusqlite::params![row]).unwrap();
+    assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", &old).unwrap().is_none(), "a spent ask stays spent however old");
+}
+
