@@ -3437,3 +3437,31 @@ fn agent_mode_round_trips_and_the_default_is_not_written() {
     assert_eq!(back.agent_mode, AgentMode::Auto);
     assert!(toml::from_str::<Config>("agent_mode = \"sometimes\"\n").is_err());
 }
+
+/// An action card names exactly what it does, and anything else under the `action:` prefix
+/// (a newer verb, targets that do not parse) is no action at all: nothing runs on a guess.
+#[test]
+fn action_cards_round_trip_and_refuse_what_they_do_not_know() {
+    use crate::actions::Action;
+    let _env = env_lock();
+    let home = tmp("actions-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("actions-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    for a in [Action::Forget { name: "OPENAI_API_KEY".into(), identity: "work".into() }, Action::Bind { name: "STRIPE_SECRET_KEY".into(), identity: "work".into() }, Action::Mode("explicit".into()), Action::Mcp(false), Action::Undo] {
+        let t = crate::actions::request(&ctx, &proj, "agent", &a, Some("asked by the user".into())).unwrap();
+        assert_eq!(Action::of(&t), Some(a.clone()), "{t:?}");
+        // The same request again is the same card.
+        assert_eq!(crate::actions::request(&ctx, &proj, "agent", &a, None).unwrap().id, t.id);
+    }
+    let mut t = crate::actions::request(&ctx, &proj, "agent", &Action::Undo, None).unwrap();
+    for (expects, names) in [("action:reboot", vec![]), ("action:mode", vec!["sometimes".to_string()]), ("action:forget", vec![]), ("action:forget", vec!["A@x".into(), "B@y".into()]), ("confirm", vec![])] {
+        t.expects = expects.into();
+        t.names = names;
+        assert_eq!(Action::of(&t), None, "{expects}");
+    }
+}

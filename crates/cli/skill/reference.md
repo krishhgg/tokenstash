@@ -2,7 +2,7 @@
 
 Every command, flag and exit code, as of this version. `tokenstash <command> --help` prints the same flags.
 
-"Who" says who may run a command. **Agent**: you. **Person**: the user, at a terminal; run by an agent it stops with `... is for a person at a terminal, not an agent` and changes nothing. tokenstash decides by looking for an agent's environment variables (`CLAUDECODE`, `CODEX_SANDBOX`, `CURSOR_AGENT`, `GEMINI_CLI`, ...) and for a terminal on both standard input and output. Do not work around that check; tell the user what the command does and what to run instead.
+Three kinds of command. **Agent** commands are yours to run. **Card** commands act for the user: run by you, each files a card and changes nothing until the user confirms it from their own inbox link. **Person** commands are the user's alone: run by you, each stops with `... is for a person at a terminal, not an agent` and changes nothing. tokenstash decides by looking for an agent's environment variables (`CLAUDECODE`, `CODEX_SANDBOX`, `CURSOR_AGENT`, `GEMINI_CLI`, ...) and for a terminal on both standard input and output. Do not work around that check; tell the user what the command does and what to run instead.
 
 ## Exit codes
 
@@ -30,7 +30,7 @@ Writes each key to the project's env file, or files a card for it. The project i
 | `--blocking` | Wait for the user instead of returning at once |
 | `--timeout SECONDS` | With `--blocking`, how long to wait (default 600) |
 | `--agent NAME` | Your name on the card and in the audit log (detected otherwise) |
-| `--force` | Ask again after the user declined. Person only |
+| `--force` | Ask again after the user declined. Once per key and project until the "no" expires; the card says it is a second ask |
 | `--json` | One JSON object instead of lines |
 
 Generated secrets (`AUTH_SECRET`, `JWT_SECRET`, `SESSION_SECRET`, `NEXTAUTH_SECRET`, `ENCRYPTION_KEY`) are never asked for: tokenstash generates one per project, or keeps the value the env file already holds.
@@ -103,30 +103,45 @@ Lists the providers tokenstash knows: env var name, provider, signup URL, and `[
 
 ### `tokenstash init [--no-agents] [--print-skill]`
 
-Sets up the stash and installs this skill for the agents it finds (Claude Code, Codex and Gemini CLI, Cursor), in the mode the user chose before (automatic unless they chose explicit). An agent may run it, for example to install tokenstash when the user asks. `--no-agents` only sets up the stash. `--print-skill` prints the skill text and changes nothing. Choosing the mode, registering the MCP server and undoing are person only (below).
+Sets up the stash and installs this skill for the agents it finds (Claude Code, Codex and Gemini CLI, Cursor), in the mode the user chose before (automatic unless they chose explicit). You may run it, for example to install tokenstash when the user asks. `--no-agents` only sets up the stash. `--print-skill` prints the skill text and changes nothing. Choosing the mode, the MCP server and undoing are card commands (below).
 
-## Commands for the person
+### `tokenstash list [--json]`
 
-Run by an agent, each of these stops without changing anything.
+The keys this directory received or was granted: name, identity, provider, and flags (`sensitive`, `STALE`, `no-verify`). Never values. Run by the user, every stored key.
+
+### `tokenstash audit [--limit N] [--json]`
+
+Recent events for this directory: which key was stored, delivered, reported or approved, when, and by which agent. `--json` prints `ts`, `project`, `agent`, `action`, `name`, `identity`, `detail`, `grant_source`. Run by the user, every directory.
+
+### `tokenstash check [NAME...] [--stale-only] [--json]`
+
+Re-checks keys with their providers (the same free request tokenstash makes before a delivery) and marks a rejected one stale, so its next `need` is a Replace card. Covers the keys this directory received or was granted (or the NAMEs given, among those). Prints one line per key: `ok`, `REJECTED (HTTP 401) → stale`, `unknown (...)` or `no check`. Run by the user, every stored key.
+
+## Card commands
+
+Run these only when the user asks for what they do. Each prints the card like a pending key (a status line and a `next:` line with the link) and exits 10. Asking again returns the same open card. `--why TEXT` puts the user's reason on the card.
+
+| Command | What confirming does |
+|---|---|
+| `tokenstash rotate NAME [--identity ID] [--why TEXT]` | A Replace card: the user pastes the new key, and every folder that had the old one gets it. The old key keeps working until then. Only for a key this directory received or was granted |
+| `tokenstash forget NAME [--identity ID] [--why TEXT]` | Deletes the stored key. Folders keep the copy in their env file; the next request for it is a paste card |
+| `tokenstash bind NAME --identity ID [--why TEXT]` | This project receives the ID copy of NAME from then on. The project must have asked for a key before |
+| `tokenstash init --mode auto\|explicit` | Whether agents load this skill by themselves or only when the user invokes it |
+| `tokenstash init --mcp`, `tokenstash init --no-mcp` | Registers tokenstash as an MCP server with every agent, or takes it out. Not in explicit mode |
+| `tokenstash init --undo` | Puts every agent config file back as `init` found it and removes the skill. Stored keys stay |
+
+## Person commands
+
+The user never needs these: everything they decide happens on a card in the browser. They remain for a person who prefers a terminal. Run by you, each stops without changing anything.
 
 | Command | What it does |
 |---|---|
 | `tokenstash open` | Opens the inbox in the browser with the full session, which can approve cards |
-| `tokenstash answer [ID] [--allow\|--allow-broad\|--deny] [--note TEXT]` | Answers a card from the terminal. Run by an agent it can only fill or decline this project's own cards and never approve, and the rules in `SKILL.md` say not to do even that |
-| `tokenstash need NAME --force` | Asks again after the user declined |
+| `tokenstash answer [ID] [--allow\|--allow-broad\|--deny] [--note TEXT]` | Answers a card from the terminal. Run by you it can only fill or decline this project's own cards and never approve or confirm, and the rules in `SKILL.md` say not to do even that |
 | `tokenstash tasks --all` | Every project's cards |
-| `tokenstash list [--json]` | Every stored key's name, identity and state; never values |
-| `tokenstash audit [--limit N] [--json]` | Recent events: which key went to which folder, and when |
-| `tokenstash check [NAME...] [--stale-only] [--json]` | Re-checks stored keys with their providers |
-| `tokenstash rotate NAME [--identity ID]` | Marks a key for replacement and files the Replace card now |
-| `tokenstash forget NAME [--identity ID]` | Deletes a stored key |
-| `tokenstash bind NAME --identity ID` | Makes this project use another identity for NAME |
 | `tokenstash workspaces [list\|revoke DIR\|forget DIR]` | Which folders may receive which keys; take a folder's approvals away |
 | `tokenstash export [-o FILE]`, `tokenstash import FILE` | Move the stash to another machine in a passphrase-encrypted bundle |
 | `tokenstash export --from-env DIR` | Import keys found in a tree of existing env files |
-| `tokenstash init --mode auto\|explicit` | Whether the skill loads by itself or only when the user invokes it |
-| `tokenstash init --mcp`, `--no-mcp` | Also register (or stop registering) tokenstash as an MCP server |
-| `tokenstash init --undo` | Put every agent config file back as `init` found it |
 
 `tokenstash mcp` (the MCP server, only after `init --mcp`) and `tokenstash inbox` (the local web inbox, started on its own when a card is filed) are started by other programs.
 

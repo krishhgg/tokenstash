@@ -8,16 +8,17 @@ tokenstash is not installed, or not on this shell's `PATH`. The user installs it
 
 ## `... is for a person at a terminal, not an agent`
 
-The command acts for the user (it approves, lists every key, deletes, or changes how agents are set up), so it refuses to run for you. Do not work around the check. Tell the user what the command does and that they can run it in a terminal, or use the agent-side command:
+A few commands are the user's alone: they approve, show every directory, or move the whole stash. Do not work around the check. What to do instead:
 
-| You wanted to | Run instead, or tell the user |
+| You wanted to | Do instead |
 |---|---|
-| See which keys this project has | `tokenstash tasks --history` shows this project's cards; `tokenstash need NAME` tells you whether NAME arrives |
-| Approve a card | Only the user approves, from the desktop notification or `tokenstash open` |
-| Ask again after a "no" | Tell the user; they can run `tokenstash need NAME --force` |
-| Replace a key that still works | Tell the user to run `tokenstash rotate NAME` |
-| Check every stored key | Tell the user to run `tokenstash check` |
-| Use another account's key here | `tokenstash need NAME --identity work` for one request; the user can make it permanent with `tokenstash bind NAME --identity work` |
+| Approve or confirm a card | Only the user does, from their own inbox link. Give them the card link; the card can send that link to their desktop |
+| Open the inbox (`open`) | Give the user the card link from `need`, or tell them to click the tokenstash desktop notification |
+| See every project's cards (`tasks --all`) | `tokenstash tasks` shows this project's |
+| Take a folder's approvals away (`workspaces`) | Tell the user; they can run `tokenstash workspaces revoke DIR` |
+| Move keys to another machine (`export`, `import`) | Tell the user; they run `tokenstash export` on the old machine and `tokenstash import FILE` on the new one |
+
+`rotate`, `forget`, `bind`, `need --force` and `init --mode/--mcp/--no-mcp/--undo` do not refuse: they file a card for the user to confirm (see `reference.md`). `list`, `audit` and `check` show you this directory's part.
 
 ## The user cannot open the link
 
@@ -25,12 +26,12 @@ The inbox listens on `127.0.0.1` of the machine tokenstash runs on, so a link on
 
 - The user is on another computer (SSH, Tailscale, a remote dev box): they can forward the port with `ssh -L 7433:127.0.0.1:7433 <this-machine>` and open the link on their computer. Port `7433` is the default `inbox_port`.
 - `next` says "The inbox is unavailable": the inbox could not start, or another process holds the port. `tokenstash doctor` shows which. Another tokenstash under a different `TOKENSTASH_HOME` is the usual culprit; the user can stop it or set another `inbox_port`.
-- The page says the link is old or invalid: the inbox restarted, which retires earlier full-session links. Card links from `need` keep working; for an approval the user needs a new desktop notification or `tokenstash open`.
+- The page says the link is old or invalid: the inbox restarted, which retires earlier full-session links. Card links from `need` keep working, and a card's "Send the link to my desktop" button sends a fresh full link.
 
 ## A key stays pending
 
 - `tokenstash tasks --history --json` shows the card's `status`. `answered` means the user answered: run `tokenstash need NAME` again and it is written. `pending` means it still waits; remind the user once, with the link.
-- An approval card answered in a browser tab opened from your link does nothing: that link cannot approve. The user approves from the desktop notification or `tokenstash open`.
+- An approval or confirm card cannot be answered from your link. The user answers from the link in the desktop notification; the card's "Send the link to my desktop" button sends it again.
 - Desktop notifications do not show on a machine without a desktop session (a server, an SSH login, a container), and they are off when `notifications = false`. Give the user the link yourself.
 
 ## The program says the key is missing, but `need` said it was written
@@ -62,7 +63,7 @@ Read the message. The common ones:
 
 ## The user declined, or the card expired
 
-Exit 20: do not ask again in this session; make the feature optional or say what is blocked. If the user changes their mind they can run `tokenstash need NAME --force`. The "no" expires after `task_ttl_hours` (24 by default).
+Exit 20: do not ask again; make the feature optional or say what is blocked. If the user changes their mind and tells you so, run `tokenstash need NAME --force`: that files one more card, marked as a second ask. A second "no" stands until the first expires, after `task_ttl_hours` (24 by default).
 
 Exit 30: the card timed out. Run `tokenstash need NAME` again when the work needs it; that files a new card.
 

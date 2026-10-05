@@ -76,21 +76,26 @@ fn the_skill_prints_for_each_mode_without_touching_anything() {
 
 /// Astra: an agent with a shell must not be able to choose the mode (it could put automatic
 /// mode back), register the MCP server (every agent would then run a binary it chose), or
-/// undo (which restores wiring the person took out). From a pipe all of these refuse, before
-/// anything is written. A plain `init` still installs the skill, in the mode the person chose.
+/// undo (which restores wiring the person took out). From a pipe each of these files a card
+/// for the person to confirm in their inbox, and nothing changes before they do. A plain
+/// `init` still installs the skill, in the mode the person chose.
 #[test]
 fn choosing_the_mode_the_server_and_undo_are_for_a_person() {
     let home = home("gates");
     let proj = tmp("gates-proj");
     std::fs::write(home.join("config.toml"), format!("{}agent_mode = \"explicit\"\n", std::fs::read_to_string(home.join("config.toml")).unwrap())).unwrap();
-    for args in [vec!["init", "--mode", "auto"], vec!["init", "--mode", "explicit"], vec!["init", "--mcp"], vec!["init", "--no-mcp"], vec!["init", "--undo"], vec!["init", "--mode", "auto", "--no-agents"]] {
+    let before = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    for (args, expects) in [(vec!["init", "--mode", "auto"], "action:mode"), (vec!["init", "--mcp"], "action:mcp"), (vec!["init", "--no-mcp"], "action:mcp"), (vec!["init", "--undo"], "action:undo")] {
         let o = run(&home, &proj, &args);
-        assert!(!o.status.success(), "{args:?} must refuse: {}", out(&o));
-        assert!(err(&o).contains("for a person at a terminal"), "{args:?}: {}", err(&o));
-        assert!(out(&o).trim().is_empty(), "{args:?} printed to a pipe: {}", out(&o));
+        assert_eq!(o.status.code(), Some(10), "{args:?} files a card: {}{}", out(&o), err(&o));
+        assert!(out(&o).contains("next:"), "{args:?}: {}", out(&o));
+        let tasks: serde_json::Value = serde_json::from_slice(&run(&home, &proj, &["tasks", "--json"]).stdout).unwrap();
+        assert!(tasks.as_array().unwrap().iter().any(|t| t["expects"] == expects), "{args:?}: {tasks}");
     }
-    assert!(std::fs::read_to_string(home.join("config.toml")).unwrap().contains("agent_mode = \"explicit\""), "the person's choice stands");
-    assert!(!home.join("tokenstash.db").exists() && !proj.join("AGENTS.md").exists());
+    assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), before, "nothing changes before the person confirms");
+    assert!(!proj.join("AGENTS.md").exists());
+    let o = run(&home, &proj, &["init", "--mode", "explicit", "--mcp"]);
+    assert!(!o.status.success() && err(&o).contains("explicit mode has no MCP server"), "{}", err(&o));
     let user_home = home.join("user-home");
     std::fs::create_dir_all(user_home.join(".claude")).unwrap();
     let o = run(&home, &proj, &["init", "--project"]);

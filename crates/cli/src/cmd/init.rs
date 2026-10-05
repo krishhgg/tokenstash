@@ -730,8 +730,15 @@ pub fn init(a: InitArgs) -> Result<i32> {
         print!("{}", skill_text(mode, Target::Claude, env_home.as_deref()));
         return Ok(0);
     }
+    if a.mcp && a.mode == Some(Mode::Explicit) {
+        anyhow::bail!("explicit mode has no MCP server: with one registered, the agent calls tokenstash on its own. Use `tokenstash init --mode auto --mcp`, or leave out --mcp");
+    }
     // Undo restores what init found; the mode and the MCP server decide how agents reach
-    // tokenstash. All three are the person's call, not an agent's.
+    // tokenstash. All three are the person's call: asked for from an agent's shell, each
+    // becomes a card the person confirms in their inbox.
+    if (a.undo || a.mode.is_some() || a.mcp || a.no_mcp) && !crate::util::looks_human() {
+        return request_choice(&a);
+    }
     if a.undo {
         crate::util::require_human("init --undo", "it puts agent wiring back the way init found it")?;
         return undo();
@@ -821,6 +828,67 @@ pub fn init(a: InitArgs) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// An agent asked to change how agents reach tokenstash: one card per change, for the person
+/// to confirm in their inbox. Nothing changes until they do.
+fn request_choice(a: &InitArgs) -> Result<i32> {
+    use tokenstash_core::actions::Action;
+    let app = crate::util::App::open()?;
+    let project = tokenstash_core::project::current();
+    let agent = crate::util::agent_from(&None);
+    let mut asked = vec![];
+    if a.undo {
+        asked.push(Action::Undo);
+    } else {
+        if let Some(m) = a.mode {
+            asked.push(Action::Mode(match m { Mode::Auto => "auto", Mode::Explicit => "explicit" }.into()));
+        }
+        if a.mcp {
+            asked.push(Action::Mcp(true));
+        } else if a.no_mcp {
+            asked.push(Action::Mcp(false));
+        }
+    }
+    let mut code = 0;
+    for action in &asked {
+        code = crate::cmd::actions::request(&app, &project, &agent, action, None)?;
+    }
+    Ok(code)
+}
+
+/// What a confirmed action card changes: the mode or the MCP server. The person decided on
+/// the card in their inbox, so this does what `init --mode` or `init --mcp` does at their
+/// terminal, for the binary that serves the inbox.
+pub fn apply_choice(mode: Option<AgentMode>, mcp: Option<bool>) -> Result<()> {
+    let mut cfg = Config::load()?;
+    let mut manifest = Manifest::load()?;
+    if let Some(m) = mode {
+        cfg.agent_mode = m;
+        if m == AgentMode::Explicit {
+            cfg.mcp = false;
+        }
+    }
+    if let Some(on) = mcp {
+        if on && cfg.agent_mode == AgentMode::Explicit {
+            anyhow::bail!("explicit mode has no MCP server: switch to auto mode first");
+        }
+        cfg.mcp = on;
+    }
+    cfg.save()?;
+    let w = Wiring {
+        home: dirs::home_dir().unwrap_or_default(),
+        exe: std::env::current_exe()?.display().to_string(),
+        ts_home: std::env::var("TOKENSTASH_HOME").ok().filter(|h| !h.is_empty()),
+        claude_cli: which("claude"),
+    };
+    wire(&mut manifest, &w, cfg.agent_mode, Some(cfg.mcp))?;
+    Ok(())
+}
+
+/// `init --undo` for a confirmed card. True when everything was put back.
+pub fn undo_quietly() -> Result<bool> {
+    Ok(undo()? == 0)
 }
 
 /// Install the skill for `mode` and take out what earlier versions installed instead.

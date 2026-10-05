@@ -361,18 +361,18 @@ ALINK=$(grep -o "http://127.0.0.1:$PORT/p/$ATID?t=[A-Za-z0-9_.]*" "$OUT/need-unt
 ACAP="${ALINK#*?t=}"; AJAR="$WEB/approval.jar"; : >"$AJAR"
 curl -fsS -c "$AJAR" -b "$AJAR" -L -o "$WEB/paste-approval.html" "$ALINK"
 grep -q "value=allow" "$WEB/paste-approval.html" && { echo "FAIL: the card session was offered an Allow button"; exit 1; }
-grep -q "full inbox session" "$WEB/paste-approval.html" || { echo "FAIL: the card approval page does not explain how to get the full session"; exit 1; }
+grep -q "your own inbox link" "$WEB/paste-approval.html" || { echo "FAIL: the card approval page does not explain how to get the full session"; exit 1; }
 grep -q "$TOKEN" "$WEB/paste-approval.html" && { echo "LEAK: the approval card page carries the session"; exit 1; }
 curl -s -c "$AJAR" -b "$AJAR" -o "$WEB/paste-approve-try.html" --data "action=allow&t=$ACAP" "http://127.0.0.1:$PORT/p/$ATID"
 human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
   || { echo "FAIL: a card-session POST approved a trust gate"; exit 1; }
 grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a card-session approval attempt injected a key"; exit 1; }
-grep -q "full inbox session" "$WEB/paste-approve-try.html" || { echo "FAIL: the card-session approval refusal does not explain"; exit 1; }
+grep -q "your own inbox link" "$WEB/paste-approve-try.html" || { echo "FAIL: the card-session approval refusal does not explain"; exit 1; }
 # ...nor close it: an approval card is the person's decision either way
 curl -s -c "$AJAR" -b "$AJAR" -o "$WEB/paste-deny-try.html" --data "action=deny&t=$ACAP" "http://127.0.0.1:$PORT/p/$ATID"
 human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
   || { echo "FAIL: a card-session POST denied an approval card"; exit 1; }
-grep -q "full inbox session" "$WEB/paste-deny-try.html" || { echo "FAIL: the card-session deny refusal does not explain how to get the full session"; exit 1; }
+grep -q "your own inbox link" "$WEB/paste-deny-try.html" || { echo "FAIL: the card-session deny refusal does not explain how to get the full session"; exit 1; }
 # A browser that holds BOTH the session and the card cookie, while the card is still pending:
 # the scoped page is not elevated, its CSRF field is the card credential (never the session),
 # a scoped approve/deny is still refused, and the full route for the same card approves.
@@ -665,7 +665,7 @@ TOKEN="$(cat "$TOKEN_FILE")"
 [ "$(cat "$CAP_FILE")" = "$CAPKEY" ] || { echo "FAIL: the capability key changed on restart; every card link printed would be dead"; fail=1; }
 code=$(curl -s -o "$WEB/stale.html" -w '%{http_code}' -c "$WEB/stale.jar" "http://127.0.0.1:$PORT/?t=$OLDTOKEN")
 [ "$code" = 404 ] || { echo "FAIL: a session from before the restart authenticated ($code)"; fail=1; }
-grep -q "tokenstash open" "$WEB/stale.html" || { echo "FAIL: the stale link did not say how to recover"; fail=1; }
+grep -q "Send the link to my desktop" "$WEB/stale.html" || { echo "FAIL: the stale link did not say how to recover"; fail=1; }
 grep -q "tokenstash_" "$WEB/stale.jar" 2>/dev/null && { echo "FAIL: the stale link set a cookie"; fail=1; }
 code=$(curl -s -o "$WEB/stale-cookie.txt" -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT/")
 [ "$code" = 404 ] && [ ! -s "$WEB/stale-cookie.txt" ] || { echo "FAIL: a cookie from before the restart opened the index ($code)"; fail=1; }

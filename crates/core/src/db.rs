@@ -1049,6 +1049,28 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The most recent audit rows for one project, newest first: what an agent may see of the
+    /// log, since every row in it is about its own directory.
+    pub fn recent_audit_for(&self, project: &str, limit: usize) -> Result<Vec<AuditRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT ts, project, agent, action, name, identity, detail, grant_source FROM audit WHERE project=?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![project, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Is there an audit row `action` for (project, name) since `since`?
+    pub fn audited_since(&self, project: &str, name: &str, action: &str, since: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit WHERE project=?1 AND name=?2 AND action=?3 AND ts >= ?4",
+            params![project, name, action, since],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Was an on-disk equivalence check for this key refused anywhere since `since`? One
     /// attempt per key per window, across every directory: directories are free to make,
     /// so a per-directory limit would let a planted `NAME=guess` per directory turn the

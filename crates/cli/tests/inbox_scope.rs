@@ -37,15 +37,25 @@ fn bin() -> Command {
     c
 }
 
+/// $HOME and the config root are scratch too: a confirmed action card makes the inbox write
+/// agent configs under $HOME and an undo record under the config root.
+fn homed(c: &mut Command, home: &Path) {
+    c.env("TOKENSTASH_HOME", home).env("HOME", home.join("user-home")).env("XDG_CONFIG_HOME", home.join("user-home/.config"));
+}
+
 fn run(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
-    bin().args(args).current_dir(cwd).env("TOKENSTASH_HOME", home).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
+    let mut c = bin();
+    homed(&mut c, home);
+    c.args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
 }
 
 /// An inbox process that dies with the test.
 struct Inbox(Child);
 impl Inbox {
     fn start(home: &Path, port: u16) -> Inbox {
-        let child = bin().args(["inbox", "--port", &port.to_string(), "--keep"]).env("TOKENSTASH_HOME", home)
+        let mut c = bin();
+        homed(&mut c, home);
+        let child = c.args(["inbox", "--port", &port.to_string(), "--keep"])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let start = Instant::now();
         while http(port, "GET", "/verify?c=ready", &[], None).0 != 200 {
@@ -243,11 +253,11 @@ fn a_card_link_opens_its_card_and_nothing_else() {
     let jar_ap = [("tokenstash_card", cred_ap.as_str())];
     let (st, _, _, page) = http(port, "GET", &path_ap, &jar_ap, None);
     assert_eq!(st, 200);
-    assert!(page.contains("full inbox session") && !page.contains("value=allow"), "{page}");
+    assert!(page.contains("your own inbox link") && page.contains("value=notify") && !page.contains("value=allow"), "{page}");
     for action in ["allow", "allow_broad", "deny"] {
         let (st, _, _, page) = post(&path_ap, &jar_ap, &format!("action={action}&t={cred_ap}"));
         assert_eq!(st, 200, "{action}");
-        assert!(page.contains("full inbox session"), "{action}: {page}");
+        assert!(page.contains("your own inbox link"), "{action}: {page}");
         assert_eq!(status_of(&home, &proj_b, &approval), "pending", "{action} changed the card");
     }
     assert!(!proj_b.join(".env.local").exists() || !env_has(&proj_b, "OPENAI_API_KEY=sk-fromthecardlink1234567"));
@@ -305,15 +315,15 @@ fn a_card_link_opens_its_card_and_nothing_else() {
         assert_eq!(st, 200);
         assert!(!page.contains("value=allow"), "elevated by the session: {page}");
         assert!(!page.contains(&session), "the session rendered on a scoped page: {page}");
-        // A pending approval card offers a scoped session no form at all, so no CSRF field;
-        // whatever CSRF field a scoped page ever carries is the card credential.
+        // A pending approval card offers a scoped session one form, the button that sends the
+        // person their own link; whatever CSRF field a scoped page carries is the card credential.
         assert!(!page.contains("name=t value=\"") || page.contains(&format!("name=t value=\"{cred_ap}\"")), "{page}");
-        assert!(page.contains("select this card there"), "sends the person to the full inbox: {page}");
+        assert!(page.contains("your own inbox link") && page.contains("value=notify"), "sends the person their own link: {page}");
     }
     for action in ["allow", "allow_broad", "deny"] {
         let (st, _, _, page) = post(&path_ap, &jar_both, &format!("action={action}&t={cred_ap}"));
         assert_eq!(st, 200, "{action}");
-        assert!(page.contains("full inbox"), "{action}: {page}");
+        assert!(page.contains("your own inbox link"), "{action}: {page}");
         let (st, _, _, _) = post(&path_ap, &jar_both, &format!("action={action}&t={session}"));
         assert_eq!(st, 404, "{action} with the session as CSRF on the scoped route");
         assert_eq!(status_of(&home, &proj_b, &approval), "pending", "{action} changed the card");
@@ -347,7 +357,7 @@ fn a_card_link_opens_its_card_and_nothing_else() {
     assert_eq!(std::fs::read_to_string(home.join("inbox.proof.key")).unwrap(), proof);
     let (st, _, _, body) = http(port, "GET", &format!("/?t={session}"), &[], None);
     assert_eq!(st, 404);
-    assert!(body.contains("no longer valid") && body.contains("tokenstash open"), "the old link says how to recover: {body}");
+    assert!(body.contains("no longer valid") && body.contains("Send the link to my desktop") && !body.contains("tokenstash open"), "the old link says how to recover, without a terminal: {body}");
     let (st, _, _, body) = http(port, "GET", "/", &jar_full, None);
     assert_eq!((st, body.as_str()), (404, ""), "the old cookie is dead");
     let (st, _, _, _) = post(&format!("/t/{b}"), &jar_full, &format!("action=deny&t={session}"));
@@ -383,4 +393,45 @@ fn hmac_hex(key: &str, msg: &str) -> String {
     let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key.as_bytes()).unwrap();
     mac.update(msg.as_bytes());
     mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An action card an agent filed (here: forget a key) runs only on the person's confirm, from
+/// their own session. The agent's link can show it, decline it and ask for the person's link
+/// to be sent to the desktop; it cannot confirm it.
+#[test]
+fn an_action_card_runs_only_on_the_persons_confirm() {
+    let port = free_port();
+    let home = home("action-home", port);
+    let proj = tmp("action-proj");
+    let inbox = Inbox::start(&home, port);
+    let need = run(&home, &proj, &["need", "OPENAI_API_KEY", "--agent", "ci"]);
+    let (path, cred) = card_link(&need, port);
+    let jar = [("tokenstash_card", cred.as_str())];
+    assert_eq!(http(port, "POST", &path, &jar, Some(&format!("value=sk-proj-actioncard0123456789abcd&skip_check=1&t={cred}"))).0, 303);
+    assert_eq!(run(&home, &proj, &["need", "OPENAI_API_KEY"]).status.code(), Some(0));
+
+    let out = run(&home, &proj, &["forget", "OPENAI_API_KEY", "--why", "the user asked"]);
+    assert_eq!(out.status.code(), Some(10), "{}", String::from_utf8_lossy(&out.stderr));
+    let tasks: serde_json::Value = serde_json::from_slice(&run(&home, &proj, &["tasks", "--json"]).stdout).unwrap();
+    let id = tasks.as_array().unwrap().iter().find(|t| t["expects"] == "action:forget").unwrap()["id"].as_str().unwrap().to_string();
+    let (apath, acred) = card_link(&out, port);
+    assert_eq!(apath, format!("/p/{id}"));
+    let ajar = [("tokenstash_card", acred.as_str())];
+    let (st, _, _, page) = http(port, "GET", &apath, &ajar, None);
+    assert!(st == 200 && page.contains("is deleted from your stash") && page.contains("value=notify") && !page.contains("value=done"), "{page}");
+    let (st, _, _, page) = http(port, "POST", &apath, &ajar, Some(&format!("action=done&t={acred}")));
+    assert!(st == 200 && page.contains("your own inbox link"), "{page}");
+    let (st, _, _, page) = http(port, "POST", &apath, &ajar, Some(&format!("action=notify&t={acred}")));
+    assert!(st == 200 && page.contains("turned off"), "notifications are off in this home: {page}");
+    assert_eq!(status_of(&home, &proj, &id), "pending");
+    assert_eq!(run(&home, &proj, &["need", "OPENAI_API_KEY"]).status.code(), Some(0), "nothing was forgotten from the agent's link");
+
+    let session = std::fs::read_to_string(home.join("inbox.session")).unwrap();
+    let full = [("tokenstash_inbox", session.as_str())];
+    let (st, _, loc, _) = http(port, "POST", &format!("/t/{id}"), &full, Some(&format!("action=done&t={session}")));
+    assert_eq!(st, 303);
+    assert!(loc.unwrap_or_default().contains("Forgot"));
+    assert_eq!(status_of(&home, &proj, &id), "answered");
+    assert_eq!(run(&home, &proj, &["need", "OPENAI_API_KEY"]).status.code(), Some(10), "forgotten: the next request asks for it again");
+    inbox.stop();
 }

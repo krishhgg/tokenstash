@@ -592,16 +592,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             // Both signals are tied to the CURRENT directory: its grants, and deliveries
             // since it was paired. A re-created directory at the same path has no record
             // (fingerprint mismatch) and inherits nothing — not even the old one's names.
-            let mut here: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
-            if let Some(ws) = app.db.find_workspace(&project)? {
-                for (name, identity, _scope, _src) in app.db.grants_for(&ws.id)? {
-                    if name != "*" { here.insert((name, identity)); }
-                }
-                let pid = project.to_string_lossy().to_string();
-                for (name, identity) in app.db.delivered_names(&pid, &ws.created)? {
-                    here.insert((name, identity));
-                }
-            }
+            let here = util::keys_here(&app.db, &project)?;
             let list = app.db.list_secrets()?;
             let names: Vec<Value> = list.iter().filter(|s| here.contains(&(s.name.clone(), s.identity.clone()))).map(|s| json!({ "name": s.name, "identity": s.identity, "provider": s.provider, "sensitive": s.sensitive, "stale": s.stale })).collect();
             Ok((json!({ "secrets": names, "note": "only keys this directory already received or was granted; ask for anything else with secrets_request (the registry knows the common names)" }), false))

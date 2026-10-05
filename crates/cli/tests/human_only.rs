@@ -44,14 +44,7 @@ fn run(home: &PathBuf, cwd: &PathBuf, args: &[&str]) -> std::process::Output {
 fn widening_commands_refuse_a_pipe() {
     let home = home("home");
     let proj = tmp("proj");
-    for args in [
-        vec!["open"],
-        vec!["list"],
-        vec!["audit"],
-        vec!["forget", "OPENAI_API_KEY"],
-        vec!["tasks", "--all"],
-        vec!["need", "OPENAI_API_KEY", "--force"],
-    ] {
+    for args in [vec!["open"], vec!["tasks", "--all"]] {
         let out = run(&home, &proj, &args);
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{args:?} must refuse: {err}");
@@ -61,6 +54,86 @@ fn widening_commands_refuse_a_pipe() {
     // ...while the agent-facing ones still run.
     let out = run(&home, &proj, &["tasks", "--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Paste a value into this directory's own card from a pipe, as an agent may.
+fn paste(home: &PathBuf, cwd: &PathBuf, id: &str, value: &str) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["answer", id, "--stdin", "--skip-check"]).current_dir(cwd)
+        .env("HOME", home.join("user-home")).env("XDG_CONFIG_HOME", home.join("user-home/.config"))
+        .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(format!("{value}\n").as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+fn tasks_json(home: &PathBuf, cwd: &PathBuf) -> Vec<serde_json::Value> {
+    let out = run(home, cwd, &["tasks", "--json", "--history"]);
+    serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap().as_array().unwrap().clone()
+}
+
+/// What acts for the person (deleting a key, changing how agents reach tokenstash, asking
+/// again after a no) files a card when an agent runs it, and nothing changes until the person
+/// confirms it in their inbox.
+#[test]
+fn an_agent_asks_on_a_card_and_nothing_changes_until_the_person_answers() {
+    let home = home("asks");
+    let proj = tmp("asks-proj");
+    let out = run(&home, &proj, &["need", "OPENAI_API_KEY"]);
+    assert_eq!(out.status.code(), Some(10));
+    let card = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "OPENAI_API_KEY").unwrap();
+    paste(&home, &proj, card["id"].as_str().unwrap(), "sk-proj-agentpasted0123456789abcdef");
+
+    let out = run(&home, &proj, &["forget", "OPENAI_API_KEY", "--why", "the user asked"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(10), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("Forget OPENAI_API_KEY") && stdout.contains("next:"), "{stdout}");
+    let forget: Vec<_> = tasks_json(&home, &proj).into_iter().filter(|t| t["expects"] == "action:forget").collect();
+    assert_eq!(forget.len(), 1, "{forget:?}");
+    assert_eq!(forget[0]["why"], "the user asked");
+    assert_eq!(run(&home, &proj, &["forget", "OPENAI_API_KEY"]).status.code(), Some(10));
+    assert_eq!(tasks_json(&home, &proj).iter().filter(|t| t["expects"] == "action:forget").count(), 1, "asking again is the same card");
+    assert_eq!(run(&home, &proj, &["need", "OPENAI_API_KEY"]).status.code(), Some(0), "nothing was forgotten");
+    // Agent-confirming its own card is refused: that is the person's.
+    let out = run(&home, &proj, &["answer", forget[0]["id"].as_str().unwrap()]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("for a person at a terminal"));
+
+    let cfg_before = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(run(&home, &proj, &["init", "--mode", "explicit"]).status.code(), Some(10));
+    assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), cfg_before, "the mode changes only on the person's confirm");
+    assert!(tasks_json(&home, &proj).iter().any(|t| t["expects"] == "action:mode" && t["names"][0] == "explicit"));
+
+    // Asking again after a no: once.
+    assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY"]).status.code(), Some(10));
+    let resend = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "RESEND_API_KEY").unwrap();
+    assert!(run(&home, &proj, &["answer", resend["id"].as_str().unwrap(), "--deny"]).status.success());
+    assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY"]).status.code(), Some(20));
+    assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY", "--force"]).status.code(), Some(10));
+    let again = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "RESEND_API_KEY" && t["status"] == "pending").unwrap();
+    assert!(again["why"].as_str().unwrap().starts_with("Asked again after you declined"), "{again}");
+    assert!(run(&home, &proj, &["answer", again["id"].as_str().unwrap(), "--deny"]).status.success());
+    let out = run(&home, &proj, &["need", "RESEND_API_KEY", "--force"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("already asked for again once"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `list` and `audit` show an agent its own directory and nothing else: the rest of the stash
+/// and the log are the person's inventory.
+#[test]
+fn an_agent_sees_only_its_own_directory_in_list_and_audit() {
+    let home = home("scoped");
+    let a = tmp("scoped-a");
+    let b = tmp("scoped-b");
+    assert_eq!(run(&home, &a, &["need", "OPENAI_API_KEY"]).status.code(), Some(10));
+    let card = tasks_json(&home, &a).into_iter().find(|t| t["name"] == "OPENAI_API_KEY").unwrap();
+    paste(&home, &a, card["id"].as_str().unwrap(), "sk-proj-scopedlist0123456789abcdef");
+    let in_a = String::from_utf8_lossy(&run(&home, &a, &["list"]).stdout).into_owned();
+    assert!(in_a.contains("OPENAI_API_KEY"), "{in_a}");
+    let in_b = String::from_utf8_lossy(&run(&home, &b, &["list"]).stdout).into_owned();
+    assert!(!in_b.contains("OPENAI_API_KEY") && in_b.contains("has not received any key"), "{in_b}");
+    let audit_b = String::from_utf8_lossy(&run(&home, &b, &["audit", "--json"]).stdout).into_owned();
+    assert!(!audit_b.contains("OPENAI_API_KEY") && !audit_b.contains(a.file_name().unwrap().to_str().unwrap()), "{audit_b}");
+    let audit_a = String::from_utf8_lossy(&run(&home, &a, &["audit", "--json"]).stdout).into_owned();
+    assert!(audit_a.contains("OPENAI_API_KEY"), "{audit_a}");
 }
 
 #[test]

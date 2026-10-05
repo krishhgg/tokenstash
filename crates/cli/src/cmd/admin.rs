@@ -60,10 +60,15 @@ pub struct ListArgs {
 }
 
 pub fn list(a: ListArgs) -> Result<i32> {
-    // The MCP side has no inventory oracle; the shell side must not be one either.
-    util::require_human("list", "it is an inventory of every key you hold")?;
     let app = App::open()?;
-    let secrets = app.db.list_secrets()?;
+    // Every key the person holds is their inventory, not the agent's. An agent gets what this
+    // directory may know exists: the keys it was granted or received, as `secrets_list` does.
+    let here = if util::looks_human() { None } else { Some(util::keys_here(&app.db, &tokenstash_core::project::current())?) };
+    let secrets: Vec<_> = app.db.list_secrets()?.into_iter().filter(|s| here.as_ref().is_none_or(|h| h.contains(&(s.name.clone(), s.identity.clone())))).collect();
+    if here.is_some() && !a.json && secrets.is_empty() {
+        println!("this directory has not received any key yet (only the keys a directory received or was granted are listed for an agent)");
+        return Ok(0);
+    }
     if a.json {
         println!("{}", serde_json::to_string_pretty(&secrets)?);
         return Ok(0);
@@ -96,17 +101,23 @@ pub struct ForgetArgs {
     pub name: String,
     #[arg(long, default_value = "default")]
     pub identity: String,
+    /// Why (shown on the card when an agent asks).
+    #[arg(long)]
+    pub why: Option<String>,
 }
 
 pub fn forget(a: ForgetArgs) -> Result<i32> {
-    // Grants outlive the value: whoever fills the next card for this name reaches every
-    // directory that holds one. An agent must not be able to empty the slot.
-    util::require_human("forget", "the next value stored under this name reaches every directory granted it")?;
+    check_name_identity(&a.name, &a.identity)?;
     let app = App::open()?;
-    let had = app.stash.delete(&stash_key(&a.name, &a.identity))?;
-    let meta = app.db.delete_secret(&a.name, &a.identity)?;
-    app.db.audit(None, None, "forget", Some(&a.name), Some(&a.identity), None)?;
-    if had || meta {
+    // Grants outlive the value: whoever fills the next card for this name reaches every
+    // directory that holds one. Emptying the slot is the person's decision, so from an agent
+    // it is a card the person confirms. The card is filed whether or not the key exists: the
+    // agent learns nothing about the stash from it.
+    if !util::looks_human() {
+        let action = tokenstash_core::actions::Action::Forget { name: a.name.clone(), identity: a.identity.clone() };
+        return crate::cmd::actions::request(&app, &tokenstash_core::project::current(), &util::agent_from(&None), &action, a.why.clone());
+    }
+    if crate::cmd::actions::forget_key(&app, &a.name, &a.identity)? {
         println!("✓ forgot {}@{}", a.name, a.identity);
     } else {
         println!("nothing stored for {}@{}", a.name, a.identity);
@@ -121,11 +132,37 @@ pub struct BindArgs {
     pub identity: String,
     #[arg(long)]
     pub project: Option<PathBuf>,
+    /// Why (shown on the card when an agent asks).
+    #[arg(long)]
+    pub why: Option<String>,
+}
+
+/// The same rules `need` applies, checked before anything is filed or changed.
+fn check_name_identity(name: &str, identity: &str) -> Result<()> {
+    if !tokenstash_core::need::valid_name(name) {
+        bail!("{name:?} is not an environment variable name (letters, digits and underscores, not starting with a digit)");
+    }
+    if !tokenstash_core::need::valid_identity(identity) {
+        bail!("{identity:?} is not an identity (letters, digits, dash and underscore, up to 64 characters)");
+    }
+    Ok(())
 }
 
 pub fn bind(a: BindArgs) -> Result<i32> {
-    util::require_human("bind", "it decides which identity a project's keys come from")?;
+    check_name_identity(&a.name, &a.identity)?;
     let app = App::open()?;
+    // Which copy of a key a project receives is the person's decision: from an agent, a card.
+    if !util::looks_human() {
+        if a.project.is_some() {
+            bail!("--project is for a person at a terminal; an agent asks for the project it runs in");
+        }
+        let project = tokenstash_core::project::current();
+        if app.db.find_workspace(&project)?.is_none() {
+            bail!("{} has not asked for any key yet, so there is nothing to bind; run `tokenstash need {} --identity {}` instead", tokenstash_core::project::short(&project), a.name, a.identity);
+        }
+        let action = tokenstash_core::actions::Action::Bind { name: a.name.clone(), identity: a.identity.clone() };
+        return crate::cmd::actions::request(&app, &project, &util::agent_from(&None), &action, a.why.clone());
+    }
     let project = util::project_from(&a.project);
     let Some(ws) = app.db.find_workspace(&project)? else {
         bail!("{} is not a paired directory yet; run `tokenstash need {}` there first (the card pairs it), then bind", tokenstash_core::project::short(&project), a.name);
@@ -245,9 +282,13 @@ pub struct AuditArgs {
 }
 
 pub fn audit(a: AuditArgs) -> Result<i32> {
-    util::require_human("audit", "it lists every directory and key")?;
     let app = App::open()?;
-    let rows = app.db.recent_audit(a.limit)?;
+    // The whole log names every directory and key; an agent sees its own directory's rows.
+    let rows = if util::looks_human() {
+        app.db.recent_audit(a.limit)?
+    } else {
+        app.db.recent_audit_for(&tokenstash_core::project::current().to_string_lossy(), a.limit)?
+    };
     if a.json {
         let v: Vec<serde_json::Value> = rows.iter().map(|(ts, project, agent, action, name, identity, detail, grant)| serde_json::json!({
             "ts": ts, "project": project, "agent": agent, "action": action, "name": name, "identity": identity, "detail": detail, "grant_source": grant,
@@ -288,13 +329,39 @@ pub struct RotateArgs {
     pub identity: Option<String>,
     #[arg(long)]
     pub project: Option<PathBuf>,
+    /// Why (shown on the card when an agent asks).
+    #[arg(long)]
+    pub why: Option<String>,
 }
 
 /// Mark a key for replacement and file the paste card now. The old value stays in the
 /// stash until the new one lands; every project still holding it is rewritten then.
+///
+/// From an agent (the user told it to replace a key) it files the Replace card without
+/// marking the key stale: the old key keeps working until the person pastes the new one, and
+/// declining the card changes nothing. Only a key this directory received or was granted can
+/// be asked for, so the command says nothing about the rest of the stash.
 pub fn rotate(a: RotateArgs) -> Result<i32> {
-    util::require_human("rotate", "it asserts your intent on the card (\"you asked to rotate it\")")?;
     let app = App::open()?;
+    if !util::looks_human() {
+        if a.project.is_some() {
+            bail!("--project is for a person at a terminal; an agent asks for the project it runs in");
+        }
+        let project = tokenstash_core::project::current();
+        let agent = util::agent_from(&None);
+        let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
+        if !util::keys_here(&app.db, &project)?.contains(&(a.name.clone(), identity.clone())) {
+            bail!("this directory has not received {}@{identity}, so there is nothing here to replace; `tokenstash need {}` requests it", a.name, a.name);
+        }
+        let t = tokenstash_core::actions::request_rotation(&app.ctx(), &project, &agent, &a.name, &identity, a.why.as_deref())?;
+        let outcome = tokenstash_core::need::Outcome::Pending { name: a.name.clone(), identity: identity.clone(), task_id: t.id.clone(), title: t.title.clone(), url: t.url.clone() };
+        crate::cmd::need::notify_pending(&app, &project, &agent, std::slice::from_ref(&outcome));
+        let state = crate::notify::inbox_state(&app.cfg);
+        let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), state);
+        println!("⏳ {} replacement requested (card {})", a.name, t.id);
+        println!("  next: {}", crate::guide::next(&outcome, &project.join(&app.cfg.env_file), Some(&t), &card, crate::guide::Recheck::Cli, ""));
+        return Ok(tokenstash_core::exit::PENDING);
+    }
     let project = util::project_from(&a.project);
     let agent = "human".to_string();
     let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
@@ -353,15 +420,24 @@ pub fn check(a: CheckArgs) -> Result<i32> {
     // --json is for a script the human runs (`check --json > report.json`): stdout is not a
     // terminal then, so the guard is on stdin instead.
     use std::io::IsTerminal;
-    if a.json {
-        if !std::io::stdin().is_terminal() || tokenstash_core::project::detect_agent() != "unknown" {
-            bail!("`tokenstash check` is for a person at a terminal, not an agent. Run it yourself.");
-        }
-    } else {
-        util::require_human("check", "it sends every key to its provider and lists what you have")?;
-    }
     let app = App::open()?;
-    let rows = sweep(&app, &a.names, a.stale_only, !a.json)?;
+    // A person checks every key (--json is for their own script, so stdout may be a file and
+    // the terminal check is on stdin). An agent checks the keys this directory received or was
+    // granted: the same request verify-on-use sends before a delivery, and nothing about the
+    // rest of the stash.
+    let person = !tokenstash_core::project::agent_environment() && std::io::stdin().is_terminal() && (a.json || std::io::stdout().is_terminal());
+    let rows = if person {
+        sweep(&app, &a.names, a.stale_only, !a.json)?
+    } else {
+        let here: Vec<(String, String)> = util::keys_here(&app.db, &tokenstash_core::project::current())?.into_iter().filter(|(n, _)| a.names.is_empty() || a.names.contains(n)).collect();
+        let stale_only = a.stale_only;
+        let pairs: Vec<(String, String)> = here.into_iter().filter(|(n, i)| !stale_only || app.db.get_secret(n, i).ok().flatten().is_some_and(|m| m.stale)).collect();
+        if pairs.is_empty() && !a.json {
+            println!("nothing to check here: this directory has not received any of those keys (an agent checks only the keys its directory received or was granted)");
+            return Ok(0);
+        }
+        sweep_pairs(&app, &pairs, !a.json)?
+    };
     if a.json {
         println!("{}", serde_json::to_string_pretty(&rows.iter().map(|(n, i, st, stale)| serde_json::json!({ "name": n, "identity": i, "result": st, "stale": stale })).collect::<Vec<_>>())?);
     }

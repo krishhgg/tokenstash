@@ -41,10 +41,31 @@ pub fn require_human(what: &str, why: &str) -> Result<()> {
 
 /// The signal behind [`require_human`]. A heuristic, and documented as one: an agent that
 /// scrubs its environment and allocates a pseudo-terminal passes it. Same-user processes
-/// are outside what this can tell apart.
+/// are outside what this can tell apart. `TOKENSTASH_AGENT` is never evidence of a person,
+/// whatever it says: `TOKENSTASH_AGENT=unknown` used to hide every other marker.
 pub fn looks_human() -> bool {
     use std::io::IsTerminal;
-    tokenstash_core::project::detect_agent() == "unknown" && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    !tokenstash_core::project::agent_environment() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// The keys this directory holds a grant for or was delivered since it was paired: all an
+/// agent here may learn exists. The rest of the stash is the person's inventory. Both signals
+/// belong to the current directory, so a re-created directory at the same path (fingerprint
+/// mismatch) inherits nothing, not even the old one's names.
+pub fn keys_here(db: &tokenstash_core::Db, project: &std::path::Path) -> Result<std::collections::BTreeSet<(String, String)>> {
+    let mut here = std::collections::BTreeSet::new();
+    if let Some(ws) = db.find_workspace(project)? {
+        for (name, identity, _scope, _src) in db.grants_for(&ws.id)? {
+            if name != "*" {
+                here.insert((name, identity));
+            }
+        }
+        let pid = project.to_string_lossy().to_string();
+        for (name, identity) in db.delivered_names(&pid, &ws.created)? {
+            here.insert((name, identity));
+        }
+    }
+    Ok(here)
 }
 
 pub fn project_from(arg: &Option<PathBuf>) -> PathBuf {

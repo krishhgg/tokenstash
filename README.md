@@ -155,7 +155,7 @@ Keys already written into projects' `.env.local` files stay there until you dele
 
 `tokenstash run` loads `.env.local` into the program's environment. If the program exits with an error and its output names a registry-known variable that isn't set, tokenstash asks for it and restarts the program once it arrives. A key requested this way needs your approval each time, even in an approved folder, since the program's output chose it.
 
-Commands that widen what an agent can reach (approving, opening the full inbox, listing or exporting keys, and others) only run for a person at a terminal; the full list is in [SECURITY.md](SECURITY.md).
+You never need a terminal: everything you decide is on a card in your browser. When you ask your agent to replace or forget a key, use another identity in a project, ask again for a key you declined, or change how agents reach tokenstash, it runs the command and you confirm the card it files; nothing changes before you do. Approving, opening the full inbox and moving the stash between machines stay yours alone, and `list`, `audit` and `check` show an agent only its own folder. The details are in [SECURITY.md](SECURITY.md).
 
 With `init --mcp`, agents that speak MCP also get six tools: `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check` and `task_list`. The MCP server only acts for the folder your agent opened.
 
@@ -188,7 +188,7 @@ The project is the git checkout you're in, so in a monorepo `apps/web` and `apps
 
 - **Delivery output never holds the key.** `need` and `secrets_request` return a status without the value. `tokenstash run --` is different by nature: it passes the program's own output through, with best-effort redaction of stored values.
 - **What you type goes back to the agent.** A note or reason on a request, and the answer to an `ask`, reach the agent as text. Never put a key there.
-- **The link an agent prints opens one request.** It can answer or decline that request and nothing else. Approving a folder needs the full inbox, which reaches you only through the desktop notification or `tokenstash open`.
+- **The link an agent prints opens one request.** It can answer or decline that request and nothing else. Approving a folder, or confirming a change an agent asked for, needs your own inbox link, which reaches you only through the desktop notification (a card's "Send the link to my desktop" button sends it again) or `tokenstash open`.
 - **Some places never receive a key:** your home directory itself, `/`, shared temporary directories, and tool and credential directories (`~/.ssh`, `~/.aws`, `~/.claude`, …).
 - **A folder that already has the value needs no approval.** If its own untracked `.env.local` already holds the same value for a non-sensitive registry key, that delivery goes ahead without a card.
 - **"A person at a terminal" is a heuristic.** An agent that fakes a terminal, or a process reading your keychain as you, is outside what tokenstash can stop. It guards the line between the agent's tools and you, not between programs running as you.

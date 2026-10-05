@@ -22,23 +22,34 @@ pub fn detect_agent() -> String {
         // filtered string, so the filter is applied here, at the one place the name is read.
         return crate::need::clean_agent(&a);
     }
+    detect_agent_marker().unwrap_or("unknown").into()
+}
+
+/// An agent's own environment marker, or `TOKENSTASH_AGENT` set at all. For deciding whether
+/// a person is at the terminal: `TOKENSTASH_AGENT` names the agent on cards, so it may say
+/// anything, `unknown` included, but nobody sets it for a person.
+pub fn agent_environment() -> bool {
+    std::env::var_os("TOKENSTASH_AGENT").is_some() || detect_agent_marker().is_some()
+}
+
+fn detect_agent_marker() -> Option<&'static str> {
     let has = |k: &str| std::env::var_os(k).is_some();
     if has("CLAUDECODE") || has("CLAUDE_CODE_ENTRYPOINT") {
-        return "claude-code".into();
+        return Some("claude-code");
     }
     if has("CODEX_SANDBOX") || has("CODEX_CI") || has("OPENAI_CODEX") {
-        return "codex".into();
+        return Some("codex");
     }
     if has("CURSOR_TRACE_ID") || has("CURSOR_AGENT") {
-        return "cursor".into();
+        return Some("cursor");
     }
     if has("GEMINI_CLI") {
-        return "gemini-cli".into();
+        return Some("gemini-cli");
     }
     if has("OPENCODE") {
-        return "opencode".into();
+        return Some("opencode");
     }
-    "unknown".into()
+    None
 }
 
 pub fn short(p: &Path) -> String {

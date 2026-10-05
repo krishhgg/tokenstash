@@ -3,6 +3,7 @@
 //! Invariant: nothing in this crate ever returns a secret value on a path that
 //! reaches stdout/stderr/logs. Values move clipboard → keychain → env file.
 
+pub mod actions;
 pub mod bundle;
 pub mod config;
 pub mod db;

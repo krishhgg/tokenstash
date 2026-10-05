@@ -122,6 +122,22 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
                 _ => unreachable!(),
             }
         }
+        TaskKind::Human if tokenstash_core::actions::Action::of(&task).is_some() => {
+            // An action card (forget a key, change the agent mode, ...) is the person's to
+            // confirm. Answered here, it does what it says, as the inbox would.
+            util::require_human("answer", "confirming this card changes your stash or your agents' setup")?;
+            let action = tokenstash_core::actions::Action::of(&task).expect("checked above");
+            println!("{}\n  {}", task.title, action.effect());
+            let ans = rpassword::prompt_password("Confirm? [y/N] (input hidden) ")?;
+            if !matches!(ans.trim(), "y" | "Y" | "yes") {
+                tasks::deny(&ctx, &task, None)?;
+                println!("✗ declined");
+                return Ok(0);
+            }
+            let done = crate::cmd::actions::perform(&app, &task, &action)?;
+            tasks::answer_human(&ctx, &task, Some(&done))?;
+            println!("✓ {done}");
+        }
         TaskKind::Human => {
             println!("{}", task.title);
             if let Some(w) = &task.why { println!("  why: {w}"); }

@@ -140,16 +140,19 @@ pub fn describe(state: Inbox) -> &'static str {
 
 /// `where_to` is whatever `util::inbox_notice` produced: a session URL when we proved the
 /// inbox is ours, or a sentence explaining why there is no link. Never build it here.
-pub fn desktop(cfg: &Config, title: &str, body: &str, where_to: &str) {
+/// True when the desktop took the notification; false when notifications are off or there is
+/// no desktop to show it on (a server, an SSH login).
+pub fn desktop(cfg: &Config, title: &str, body: &str, where_to: &str) -> bool {
     if !cfg.notifications {
-        return;
+        return false;
     }
-    let _ = notify_rust::Notification::new()
+    notify_rust::Notification::new()
         .appname("tokenstash")
         .summary(title)
         .body(&if where_to.is_empty() { body.to_string() } else { format!("{body}\n{where_to}") })
         .timeout(notify_rust::Timeout::Milliseconds(15000))
-        .show();
+        .show()
+        .is_ok()
 }
 
 #[cfg(test)]

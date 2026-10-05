@@ -45,18 +45,33 @@ pub struct NeedArgs {
 }
 
 pub fn need(a: NeedArgs) -> Result<i32> {
-    // "Denied" is remembered for a day so a program failing in a loop cannot nag. Asking
-    // again over that is the person's call, never the agent's.
-    if a.force {
-        util::require_human("need --force", "it asks again after the user said no")?;
-    }
     let app = App::open()?;
     // The directory this command runs in is the project: a caller-named path would let a
     // script choose which directory's grants it uses. (Read-only `tasks`/`audit` keep --project.)
     let project = util::project_from(&None);
     let agent = util::agent_from(&a.agent);
+    // "Denied" is remembered for a day so a program failing in a loop cannot nag. An agent may
+    // ask again over it once per key and project in that window, when the user tells it to:
+    // the card says it is a second ask, and a second "no" stands for the rest of the window.
+    let mut why = a.why.clone();
+    if a.force && !util::looks_human() {
+        let pid = project.to_string_lossy().to_string();
+        let since = app.cfg.ttl_since();
+        for name in &a.names {
+            if app.db.audited_since(&pid, name, "need.force", &since)? {
+                anyhow::bail!("{name} was already asked for again once after the user declined it here; that answer stands for {} hours from the first no. Tell the user; do not ask again", app.cfg.task_ttl_hours);
+            }
+        }
+        for name in &a.names {
+            app.db.audit(Some(&pid), Some(&agent), "need.force", Some(name), None, None)?;
+        }
+        why = Some(match why {
+            Some(w) => format!("Asked again after you declined, because you asked {agent} to. {w}"),
+            None => format!("Asked again after you declined, because you asked {agent} to."),
+        });
+    }
     let opts = NeedOpts {
-        req: SecretRequest { why: a.why.clone(), url: a.url.clone(), steps: a.steps.clone(), pattern: a.pattern.clone() },
+        req: SecretRequest { why, url: a.url.clone(), steps: a.steps.clone(), pattern: a.pattern.clone() },
         identity: a.identity.clone(),
         blocking: false,
         timeout: Duration::from_secs(a.timeout),

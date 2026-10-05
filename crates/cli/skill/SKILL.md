@@ -46,7 +46,7 @@ Each key gets a status line and a `next:` line saying what to do. Follow `next`.
 A pending key has a card, and `next` says which kind:
 
 - **Missing key.** The user opens the link, gets the key from the provider (the card links to the right page) and pastes it. The link works as it is.
-- **Approval.** The key is stored, but this folder has not received it before, or it is a sensitive key (live payment keys, cloud and deploy credentials, any key tokenstash does not recognise), which every folder asks for separately. The link you get shows the card but cannot approve it; the user approves from the desktop notification, or from the inbox opened with `tokenstash open` in a terminal.
+- **Approval.** The key is stored, but this folder has not received it before, or it is a sensitive key (live payment keys, cloud and deploy credentials, any key tokenstash does not recognise), which every folder asks for separately. The link you get shows the card but cannot approve it, so an agent can never approve its own request. The user approves from the link in the desktop notification; if they opened your link instead, the card has a button that sends that notification again.
 - **Replace.** The provider rejected the stored key. The user pastes a new one, and every folder that had the old key gets the new one.
 
 Tell the user in a sentence or two what the card is for and give the link. Then keep working. Check with `tokenstash tasks` (this project's open cards), or run the same `tokenstash need` again: it never files a second card or notifies twice. Use `--blocking --timeout 600` only when nothing else can proceed.
@@ -86,11 +86,27 @@ Same exit codes and the same kind of card. `--expects text` gets an answer back,
 
 Each key is stored under an identity, `default` unless chosen. `tokenstash need STRIPE_SECRET_KEY --identity work` requests the `work` copy; if there is none, the card asks the user for it.
 
+## When the user asks you to change something
+
+Some commands act for the user. Run them only when the user asks, and pass `--why` with what they said, so the card shows it:
+
+| The user asks you to | Run |
+|---|---|
+| Replace a key that still works | `tokenstash rotate NAME` |
+| Delete a stored key | `tokenstash forget NAME` |
+| Always use another identity for a key in this project | `tokenstash bind NAME --identity work` |
+| Ask again for a key they declined | `tokenstash need NAME --force` (once per key until the "no" expires) |
+| Stop agents loading this skill on their own, or let them again | `tokenstash init --mode explicit`, `tokenstash init --mode auto` |
+| Register or remove the MCP server | `tokenstash init --mcp`, `tokenstash init --no-mcp` |
+| Take tokenstash out of their agents | `tokenstash init --undo` |
+
+Each one files a card and exits 10. Nothing changes until the user confirms it from their own inbox link; declining it changes nothing. Give the user the link from `next`, as for any card. `rotate` files a Replace card: the old key keeps working until the user pastes the new one.
+
 ## When something goes wrong
 
 Run `tokenstash doctor` first. It checks the stash, the database, the inbox, the agent setup and this folder, and its last line names the binary in use. Then look up the symptom in `troubleshooting.md`, beside this file. Two common ones:
 
-- `... is for a person at a terminal, not an agent`: that command acts for the user. Tell them what it does and what to run, or use the agent-side alternative listed in `troubleshooting.md`.
+- `... is for a person at a terminal, not an agent`: a few commands are the user's alone (`open`, approving with `answer`, `tasks --all`, `workspaces`, `export`, `import`). `troubleshooting.md` lists what to do instead.
 - The link does not open for the user: the inbox listens on this machine's localhost only. If the user is on another computer, see "The user cannot open the link" in `troubleshooting.md`.
 
 `reference.md`, beside this file, lists every command, flag, exit code, JSON field, setting and file location.
