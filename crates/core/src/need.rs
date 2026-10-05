@@ -275,8 +275,8 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 continue;
             }
             if let Some(v) = generate(spec) {
-                let p = tasks::store_and_inject(ctx, name, &identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown, crate::db::GRANT_GENERATED)?;
-                outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated: true, unverified: false });
+                let (p, generated) = tasks::store_generated(ctx, name, &identity, &v, project, agent)?;
+                outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated, unverified: false });
                 continue;
             }
         }
@@ -693,8 +693,8 @@ fn replacement(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
     // Generated secrets are never pasted: regenerate.
     if let Some(spec) = provider.and_then(|p| p.generate.as_deref()) {
         if let Some(v) = generate(spec) {
-            let p = tasks::store_and_inject(ctx, name, identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown, crate::db::GRANT_GENERATED)?;
-            return Ok(Outcome::Injected { name: name.into(), identity: identity.into(), written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated: true, unverified: false });
+            let (p, generated) = tasks::store_generated(ctx, name, identity, &v, project, agent)?;
+            return Ok(Outcome::Injected { name: name.into(), identity: identity.into(), written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated, unverified: false });
         }
     }
     if !opts.force {

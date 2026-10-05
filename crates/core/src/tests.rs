@@ -2588,6 +2588,41 @@ fn a_generated_secret_already_in_the_env_file_is_adopted_not_regenerated() {
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
+/// Two first requests for a generated secret in one directory both find the stash empty and
+/// each mint a value. The first one stored stays. The other keeps it instead of replacing
+/// it, and its env file write puts in that same value.
+#[test]
+fn concurrent_first_requests_keep_the_first_generated_secret() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-race");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let other_db = Db::open(&home.join("t.db")).unwrap();
+    let other_stash = stash::open(&cfg).unwrap();
+    let identity = need::project_identity(&proj);
+    let key = stash::stash_key("JWT_SECRET", &identity);
+    let first = "first-generated-value-0123456789abcdef";
+    // Right after this `need` finds the stash empty, the other one commits its value. Its
+    // env file write has not run yet.
+    let stash = GetHookStash {
+        inner: stash::open(&cfg).unwrap(),
+        armed: std::cell::Cell::new(false),
+        hook: || {
+            other_stash.set(&key, &SecretString::from(first.to_string())).unwrap();
+            other_db.upsert_secret(&db::SecretMeta { name: "JWT_SECRET".into(), identity: identity.clone(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+        },
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+    stash.armed.set(true);
+    let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    let stored = stash.get(&key).unwrap().unwrap();
+    assert_eq!(secrecy::ExposeSecret::expose_secret(&stored), first, "the first stored value stays in the stash");
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert_eq!(envfile::parse_line(text.lines().next().unwrap()).unwrap().1, first, "and is the one in the env file");
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: false, .. }), "this call kept a value it did not generate: {:?}", out[0]);
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
 /// The card is the human's read of what an agent asked for. The agent writes some of that
 /// text, so it may not carry a link the human clicks into anything but http(s), and may not
 /// contain characters that reorder or hide what is displayed.

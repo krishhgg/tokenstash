@@ -490,7 +490,7 @@ pub fn answer_secret_by(ctx: &Ctx, actor: Actor, task: &Task, value: SecretStrin
             if actor == Actor::Requester && fans_out(ctx, fresh)? {
                 bail!("other directories hold this key, so the paste would reach them too: open this card from the desktop notification or run `tokenstash open`");
             }
-            Ok(())
+            Ok(true)
         },
     )?;
     // A replacement card's answer reaches every project that was ever given this key and
@@ -524,7 +524,26 @@ pub fn store_and_inject(
     verified: Verified,
     grant_source: &str,
 ) -> Result<Option<PathBuf>> {
-    store_and_inject_gated(ctx, name, identity, value, provider, source_url, sensitive, project, agent, answering_task, verified, grant_source, |_| Ok(()))
+    store_and_inject_gated(ctx, name, identity, value, provider, source_url, sensitive, project, agent, answering_task, verified, grant_source, |_| Ok(true))
+}
+
+/// Store a generated secret, unless another process stored this key first. Two `need`s
+/// that both found the key missing, or both found it stale, each generate a value. The
+/// first to take the index write lock stores its own. The second finds a value that is
+/// present and not stale, keeps it, and writes that one to the env file. Storing the second
+/// value would replace the first in the stash after the first had reached the env file,
+/// and the application's signing key would change on a later request. Returns the env file
+/// written and whether `value` is the one stored.
+pub fn store_generated(ctx: &Ctx, name: &str, identity: &str, value: &SecretString, project: &Path, agent: &str) -> Result<(Option<PathBuf>, bool)> {
+    let mut stored = true;
+    let provider = registry::lookup(name).map(|p| p.provider.clone());
+    let written = store_and_inject_gated(ctx, name, identity, value, provider, None, false, project, agent, None, Verified::Unknown, crate::db::GRANT_GENERATED, |_| {
+        let present = ctx.stash.get(&stash_key(name, identity))?.is_some();
+        let stale = ctx.db.get_secret(name, identity)?.is_some_and(|m| m.stale);
+        stored = !present || stale;
+        Ok(stored)
+    })?;
+    Ok((written, stored))
 }
 
 /// Store a value: ONE index write lock (`BEGIN IMMEDIATE`) held across re-reading the card,
@@ -535,7 +554,9 @@ pub fn store_and_inject(
 /// owns the answer, the other is told so and stores nothing.
 ///
 /// `gate` sees the card as it is under the lock (`None` when no card is being answered)
-/// and may refuse; a refusal rolls everything back with nothing written anywhere. A keychain
+/// and may refuse; a refusal rolls everything back with nothing written anywhere. A gate
+/// that returns `Ok(false)` stores and claims nothing, and the env file still receives what
+/// the stash holds. [`store_generated`] does that to keep another process's value. A keychain
 /// write that fails rolls back too. The stash is an external side effect: when it accepts a
 /// value but an index statement or COMMIT later fails, the task, metadata and grants roll
 /// back but the value remains in the stash without an index row. The next `need` adopts it
@@ -561,7 +582,7 @@ fn store_and_inject_gated(
     answering_task: Option<&str>,
     verified: Verified,
     grant_source: &str,
-    gate: impl FnOnce(Option<&Task>) -> Result<()>,
+    gate: impl FnOnce(Option<&Task>) -> Result<bool>,
 ) -> Result<Option<PathBuf>> {
     let pid = project.to_string_lossy().to_string();
     // Every caller reaches this in autocommit; a caller that already holds a transaction
@@ -575,7 +596,9 @@ fn store_and_inject_gated(
             Some(tid) => Some(ctx.db.get_task(tid)?.filter(|t| t.status == TaskStatus::Pending).ok_or_else(|| anyhow!("task {tid} was answered somewhere else while this was in flight; nothing was stored"))?),
             None => None,
         };
-        gate(fresh.as_ref())?;
+        if !gate(fresh.as_ref())? {
+            return Ok(());
+        }
         if let Some(tid) = answering_task {
             if !ctx.db.close_task_if_open(tid, TaskStatus::Answered, None)? {
                 bail!("task {tid} was answered somewhere else while this was in flight; nothing was stored");
@@ -816,8 +839,13 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
                     let source = if adopted.is_some() { crate::db::GRANT_ON_DISK } else { crate::db::GRANT_GENERATED };
                     match adopted.or_else(|| crate::need::generate(&spec)) {
                     Some(v) => {
-                        match store_and_inject(ctx, n, identity, &v, registry::lookup(n).map(|p| p.provider.clone()), None, false, project, &task.agent, None, Verified::Unknown, source) {
-                            Ok(_) => injected.push(n.to_string()),
+                        let stored = if source == crate::db::GRANT_GENERATED {
+                            store_generated(ctx, n, identity, &v, project, &task.agent).map(|_| ())
+                        } else {
+                            store_and_inject(ctx, n, identity, &v, registry::lookup(n).map(|p| p.provider.clone()), None, false, project, &task.agent, None, Verified::Unknown, source).map(|_| ())
+                        };
+                        match stored {
+                            Ok(()) => injected.push(n.to_string()),
                             Err(e) => failures.push(format!("{n}: {e:#}")),
                         }
                         None // delivered here; the loop below is for stashed values
