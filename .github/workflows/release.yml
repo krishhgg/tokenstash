@@ -5,8 +5,8 @@ on:
 permissions: { contents: write }
 jobs:
   test:
-    # A tag on an untested commit must not publish. Same gate as ci.yml, minus the leak test
-    # (the release binaries are checked below).
+    # A tag on an untested commit must not publish. Same gate as ci.yml. The leak test runs
+    # in `build` instead, against the Linux binaries this run packages.
     runs-on: ubuntu-latest
     permissions: { contents: read }
     steps:
@@ -16,6 +16,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --locked
+      # The npm release script against a mock registry and a fake `npm`, with the node and npm
+      # the `npm` job publishes with (keep the two in step). It runs before the draft release
+      # exists, so a failure here stops every publish step below.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version: 22 }
+      - run: npm install -g npm@11.17.0 && npm --version
+      - run: scripts/npm-package-test.sh
   release:
     # Created once, as a DRAFT, so the four build jobs never race on creating the same
     # release and `releases/latest` keeps pointing at the previous version until every
@@ -71,6 +78,13 @@ jobs:
           bin=target/${{ matrix.target }}/release/tokenstash
           "$bin" --version
           if [ "${{ matrix.musl }}" = "true" ]; then ldd "$bin" 2>&1 | grep -q 'statically linked\|not a dynamic executable'; fi
+      # The black-box canary test from ci.yml, run on the binary the next step packages and
+      # uploads, not on a separate build. A failure fails `build`, so npm, crates.io, PyPI and
+      # the tap never run and `publish` leaves the release a draft. Linux only, because the
+      # script is bash plus GNU tools.
+      - name: leak test
+        if: matrix.musl
+        run: scripts/leak-test.sh target/${{ matrix.target }}/release/tokenstash
       - name: package + checksum
         run: |
           mkdir -p dist
@@ -109,7 +123,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: { node-version: 22 }   # no registry-url: it would write an .npmrc with an empty _authToken and break OIDC
-      - run: npm install -g npm@11.17.0 && npm --version   # trusted publishing needs ≥ 11.5.1; pinned on purpose
+      - run: npm install -g npm@11.17.0 && npm --version   # trusted publishing needs ≥ 11.5.1; pinned on purpose, and `test` pins the same
       - name: take the binaries from this run, not from the mutable release
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { pattern: "binary-*", merge-multiple: true, path: /tmp/dist }
