@@ -63,7 +63,7 @@ pub fn next(o: &Outcome, env_file: &Path, task: Option<&Task>, card: &str, reche
             } else {
                 format!("Show the user this link: {card}")
             };
-            let elsewhere = if card.starts_with("http") { crate::remote::hint(cfg) } else { String::new() };
+            let elsewhere = crate::remote::hint(cfg, card);
             format!("{why} ({task_id}).{waited} {link}{elsewhere} Keep working on everything that does not need it, and {}. Do not wait in a loop, and {NO_STAND_IN}", recheck.later(task_id))
         }
         Outcome::Denied { name, .. } => format!("The user declined {name} for this project. Do not ask again, and {NO_STAND_IN} {INSTEAD}"),
@@ -91,7 +91,7 @@ pub fn confirm_next(task: &Task, card: &str, cfg: &tokenstash_core::Config) -> S
     } else if !is_loopback_link(card) {
         format!("On any device signed in to the user's Tailscale account this link opens the card as them, so they can confirm there: {card}")
     } else {
-        format!("Confirming takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg))
+        format!("Confirming takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg, card))
     };
     format!(
         "The user has been asked to confirm \"{}\" ({}). {link} Keep working, and check on card {} later with `tokenstash tasks --history`. If the user declines, leave it: do not ask again unless they tell you to.",
@@ -105,7 +105,7 @@ pub fn rotation_next(name: &str, task: &Task, card: &str, cfg: &tokenstash_core:
     let link = if card.starts_with("http") && !is_loopback_link(card) {
         format!("On any device signed in to the user's Tailscale account this link opens the card as them, so they can paste it there: {card}")
     } else if card.starts_with("http") {
-        format!("Pasting it takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg))
+        format!("Pasting it takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg, card))
     } else {
         format!("The inbox is unavailable ({card}).")
     };

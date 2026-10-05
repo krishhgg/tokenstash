@@ -173,14 +173,19 @@ pub fn looks_remote() -> Option<&'static str> {
     None
 }
 
-/// What the agent should know when the person may not be able to open a 127.0.0.1 link.
-/// Empty when remote access is on, or nothing suggests the person is elsewhere.
-pub fn hint(cfg: &Config) -> String {
-    if cfg.remote != Remote::Off {
+/// What the agent should know when the person may not be able to open `card`. Decided by
+/// the link itself, not the setting: remote access can be on while links fell back to
+/// 127.0.0.1 (the inbox has not proved it answers on the Tailscale address). Empty for a
+/// Tailscale link, or when nothing suggests the person is elsewhere.
+pub fn hint(cfg: &Config, card: &str) -> String {
+    if !card.starts_with("http://127.0.0.1:") {
         return String::new();
     }
-    let Some(why) = looks_remote() else { return String::new() };
     let port = cfg.inbox_port;
+    if cfg.remote == Remote::Tailscale {
+        return format!(" Remote access is on, but the inbox has not answered on this machine's Tailscale address, so this link points at 127.0.0.1 and only opens here; run `tokenstash doctor` and `tokenstash remote tailscale` again, or have the user forward the port with `ssh -L {port}:127.0.0.1:{port} <this machine>`.");
+    }
+    let Some(why) = looks_remote() else { return String::new() };
     let tailscale = if tailscale_bin().is_some() {
         "run `tokenstash remote tailscale` (Tailscale is installed here) and give them the new link; "
     } else {
@@ -282,6 +287,18 @@ mod tests {
         assert!(started.elapsed() < TAILSCALE_TIMEOUT + Duration::from_secs(2), "{:?}", started.elapsed());
         assert!(format!("{err:#}").contains("did not answer"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Greptile on #69: the advice follows the link that was produced. Remote access on with
+    /// links fallen back to loopback says so; a Tailscale link needs no advice.
+    #[test]
+    fn the_advice_follows_the_link_not_the_setting() {
+        let mut cfg = Config { inbox_port: 7433, remote: Remote::Tailscale, remote_ip: Some("100.68.81.23".into()), ..Default::default() };
+        assert!(hint(&cfg, "http://100.68.81.23:7433/p/t_x?t=c").is_empty());
+        let fell_back = hint(&cfg, "http://127.0.0.1:7433/p/t_x?t=c");
+        assert!(fell_back.contains("has not answered on this machine's Tailscale address") && fell_back.contains("ssh -L 7433:127.0.0.1:7433"), "{fell_back}");
+        cfg.remote = Remote::Off;
+        assert!(hint(&cfg, "tokenstash: the inbox is not running").is_empty());
     }
 
     #[test]
