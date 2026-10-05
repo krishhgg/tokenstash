@@ -9,48 +9,62 @@ use secrecy::{ExposeSecret, SecretString};
 const SHORT: usize = 4;
 
 pub struct Redactor {
-    values: Vec<String>,
+    patterns: Vec<Pattern>,
+}
+
+/// One string to mask. A whole-token pattern is masked only where it is not glued to other
+/// alphanumerics.
+struct Pattern {
+    text: String,
+    whole_token: bool,
 }
 
 impl Redactor {
     pub fn new() -> Self {
-        Self { values: vec![] }
+        Self { patterns: vec![] }
     }
     pub fn with(mut self, v: &SecretString) -> Self {
         self.add(v);
         self
     }
-    /// Register `v`, and also each line of it when it spans several. `run` redacts a child's
-    /// output one line at a time, so a printed PEM key or service-account JSON never shows the
-    /// whole value to a single `redact` call. Each line is trimmed and kept if it is at least
-    /// as long as the shortest secret the stash accepts and is not PEM armor.
+    /// Register a secret value, and also each line of it when it spans several. `run` redacts a
+    /// child's output one line at a time, so a printed PEM key or service-account JSON never
+    /// shows the whole value to a single `redact` call. Lines are trimmed, and PEM armor is
+    /// skipped. A line shorter than the shortest secret the stash accepts is masked only where
+    /// it stands alone, so the `apple` of `apple\nberry` does not mask `pineapple`.
     pub fn add(&mut self, v: &SecretString) {
+        self.add_whole_value(v);
         let s = v.expose_secret();
-        if s.is_empty() {
-            return;
-        }
-        // The whole value first, so text that holds all of it becomes one `[redacted]`.
-        self.values.push(s.to_string());
         if !s.contains(['\n', '\r']) {
             return;
         }
         for line in s.split(['\n', '\r']).map(str::trim) {
-            if line.chars().count() >= crate::tasks::MIN_SECRET_CHARS && !is_pem_armor(line) {
-                self.values.push(line.to_string());
+            let short = line.chars().count() < crate::tasks::MIN_SECRET_CHARS;
+            // A short line with no letter or digit (`{`, `},`) is structure, and as a whole
+            // token it would match wherever it appears.
+            if is_pem_armor(line) || (short && !line.chars().any(char::is_alphanumeric)) {
+                continue;
             }
+            self.patterns.push(Pattern { text: line.to_string(), whole_token: short });
+        }
+    }
+    /// Register `v` as one string only. For a value that is only suspected to be a secret,
+    /// whose lines on their own may be ordinary text.
+    pub fn add_whole_value(&mut self, v: &SecretString) {
+        let s = v.expose_secret();
+        // Registered before any of its lines, so text that holds the whole value becomes one
+        // `[redacted]`.
+        if !s.is_empty() {
+            self.patterns.push(Pattern { text: s.to_string(), whole_token: s.chars().count() < SHORT });
         }
     }
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
-        for v in &self.values {
-            if !out.contains(v.as_str()) {
+        for p in &self.patterns {
+            if !out.contains(p.text.as_str()) {
                 continue;
             }
-            if v.chars().count() >= SHORT {
-                out = out.replace(v.as_str(), "[redacted]");
-            } else {
-                out = redact_whole_token(&out, v);
-            }
+            out = if p.whole_token { redact_whole_token(&out, &p.text) } else { out.replace(p.text.as_str(), "[redacted]") };
         }
         out
     }

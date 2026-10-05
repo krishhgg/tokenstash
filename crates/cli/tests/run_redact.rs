@@ -61,13 +61,45 @@ fn run_masks_every_line_of_a_multiline_value_the_child_prints() {
     }
 }
 
+/// A stored value can be long enough to be a secret while each of its lines is not. Those
+/// lines are masked where they stand alone, and not inside other words.
+#[test]
+fn run_masks_short_lines_of_a_multiline_value_as_whole_words() {
+    let home = home("home-short");
+    let proj = tmp("proj-short");
+    std::fs::write(proj.join(".env.local"), "DB_PASSWORD=\"apple\\nberry\"\n").unwrap();
+    let out = run_sh(&home, &proj, r#"printf '%s\n' "$DB_PASSWORD"; echo $DB_PASSWORD; echo pineapple blueberry"#, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, "[redacted]\n[redacted]\n[redacted] [redacted]\npineapple blueberry\n");
+}
+
+/// An inherited variable is redacted when its value is not a known benign one, and that takes
+/// in build configuration. Only a name that says "secret" gets each line of its value masked.
+#[test]
+fn run_masks_lines_of_an_inherited_value_only_when_its_name_says_secret() {
+    let home = home("home-inherit");
+    let proj = tmp("proj-inherit");
+    let body = fake_pem_body();
+    let key = format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----", body.join("\n"));
+    let out = run_sh(&home, &proj, r#"printf '%s\n' "$DEPLOY_SSH_KEY"; echo 'error here: return 0;'"#,
+        &[("DEPLOY_SSH_KEY", key.as_str()), ("buildPhase", "runHook preBuild\nreturn 0;\nrunHook postBuild")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    for line in &body {
+        assert!(!stdout.contains(line.as_str()), "a line of the inherited key reached stdout: {stdout}");
+    }
+    assert!(stdout.contains("error here: return 0;"), "a line of buildPhase was masked: {stdout}");
+}
+
 /// An exported shell function is a multi-line inherited value made of code. Its lines are not
-/// secrets, and `return 0;` in a compiler error must reach the agent as written.
+/// secrets, even when the function's name has TOKEN in it, and `return 0;` in a compiler error
+/// must reach the agent as written.
 #[test]
 fn run_leaves_lines_of_an_exported_shell_function_alone() {
     let home = home("home-func");
     let proj = tmp("proj-func");
-    let out = run_sh(&home, &proj, r#"echo 'error here: return 0;'"#, &[("BASH_FUNC_tsprobe%%", "() {  echo probe;\n return 0;\n}")]);
+    let out = run_sh(&home, &proj, r#"echo 'error here: return 0;'"#, &[("BASH_FUNC_get_token%%", "() {  echo probe;\n return 0;\n}")]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("error here: return 0;"), "stdout: {stdout}");

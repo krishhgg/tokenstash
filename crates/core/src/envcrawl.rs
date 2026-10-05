@@ -92,7 +92,9 @@ fn name_ok(name: &str) -> bool {
     crate::need::valid_name(name) && name.bytes().all(|b| !b.is_ascii_lowercase())
 }
 
-fn secret_ish_name(name: &str) -> bool {
+/// Does an uppercase variable name say it holds a credential? Also used by `run` to decide
+/// which inherited values get each of their lines masked.
+pub fn secret_ish_name(name: &str) -> bool {
     ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "DSN", "CREDENTIAL", "CREDENTIALS", "AUTH", "PRIVATE"].iter().any(|k| name.contains(k))
 }
 

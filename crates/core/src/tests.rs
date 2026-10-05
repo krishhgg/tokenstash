@@ -278,6 +278,17 @@ fn redactor_masks_each_line_of_a_multiline_value() {
     let r = redact::Redactor::new().with(&SecretString::from(json.to_string()));
     assert_eq!(r.redact("\"private_key_id\": \"0123456789abcdef\","), "[redacted]");
     assert_eq!(r.redact("{ } x"), "{ } x");
+    // A value long enough to store can have every line shorter than that. Such a line is
+    // masked where it stands alone, like a short value, and not inside other words.
+    let r = redact::Redactor::new().with(&SecretString::from("apple\nberry".to_string()));
+    assert_eq!(r.redact("apple"), "[redacted]");
+    assert_eq!(r.redact("apple berry"), "[redacted] [redacted]");
+    assert_eq!(r.redact("pineapple blueberry"), "pineapple blueberry");
+    // A value that is only suspected to be a secret keeps the whole-value match.
+    let mut r = redact::Redactor::new();
+    r.add_whole_value(&SecretString::from("runHook preBuild\nreturn 0;".to_string()));
+    assert_eq!(r.redact("error: return 0;"), "error: return 0;");
+    assert_eq!(r.redact("x runHook preBuild\nreturn 0; y"), "x [redacted] y");
 }
 
 #[test]

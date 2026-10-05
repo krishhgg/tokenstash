@@ -111,9 +111,23 @@ fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String
     // value is treated as redactable unless it is a well-known benign variable or looks like
     // a filesystem path/list. Over-redacting an echoed benign value is harmless; missing a
     // secret is not.
+    //
+    // Values from the env file are secrets tokenstash delivered, so each line of a multi-line
+    // one is masked too. An inherited value gets that only when its name says it is a secret
+    // (a registry name, or one with KEY, TOKEN, SECRET, PASSWORD, ... in it), which covers a
+    // deploy key a CI job exports as SSH_PRIVATE_KEY. The rest are redacted only because they
+    // are not on the benign list, and that takes in multi-line build configuration (nix-shell's
+    // `buildPhase`, `shellHook`). Masking each of its lines would hide `return 0;` or
+    // `make install` in the child's errors, so those keep the whole-value match.
     for (k, v) in std::env::vars() {
-        if should_redact_inherited(&k, &v) {
-            redactor.add(&SecretString::from(v));
+        if !should_redact_inherited(&k, &v) {
+            continue;
+        }
+        let v = SecretString::from(v);
+        if tokenstash_core::registry::lookup(&k).is_some() || tokenstash_core::envcrawl::secret_ish_name(&k.to_ascii_uppercase()) {
+            redactor.add(&v);
+        } else {
+            redactor.add_whole_value(&v);
         }
     }
     let redactor = std::sync::Arc::new(redactor);
@@ -154,8 +168,9 @@ fn should_redact_inherited(name: &str, value: &str) -> bool {
         return false;
     }
     // An exported shell function (`export -f`, RHEL's `which`, Lmod's `module`) is a
-    // multi-line value of code. The redactor masks each line of a multi-line value, and lines
-    // like `return 0;` would be masked in every compiler error the child prints.
+    // multi-line value of code, never a secret. Its whole value never matches one line of
+    // output, and a function named like `get_token` would count as secret by name and have
+    // lines like `return 0;` masked in every compiler error the child prints.
     if u.starts_with("BASH_FUNC_") {
         return false;
     }
