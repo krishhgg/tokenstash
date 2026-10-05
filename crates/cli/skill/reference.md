@@ -99,7 +99,7 @@ Checks the setup, one line each: config file, stash backend (and how long keys l
 
 ### `tokenstash remote [tailscale [--login LOGIN] | off]`
 
-Whether the inbox can be reached from the user's other computers. With no argument, prints the setting. `tailscale`: the inbox also listens on this machine's Tailscale address, every link and notification uses that address, and a request from another device signed in to the owner's Tailscale account (`--login`, or the account this machine is signed in with) counts as the user, so it can approve. Nothing else on the tailnet gets an answer. A running inbox picks the change up within a second; links printed before still point at 127.0.0.1. `off`: back to 127.0.0.1 only. You may run it when the user is on another computer; it needs `tailscale` connected here.
+Whether the inbox can be reached from the user's other computers. With no argument, prints the setting. `tailscale`: the inbox also listens on this machine's Tailscale address, every link and notification uses that address, and a request from another device signed in to the owner's Tailscale account (`--login`, or the account this machine is signed in with) counts as the user, so it can approve. Nothing else on the tailnet gets an answer. A running inbox picks the change up within a second; links printed before still point at 127.0.0.1. `off`: back to 127.0.0.1 only. You may run it when the user is on another computer; it needs `tailscale` connected here. `--login` is for a tagged node, which has no owner; on a machine signed in to Tailscale, naming another login is the user's to do at a terminal.
 
 ### `tokenstash registry`
 

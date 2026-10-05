@@ -56,9 +56,34 @@ fn tailscale_bin() -> Option<PathBuf> {
     mac.is_file().then_some(mac)
 }
 
+/// How long one `tailscale` call may take. `whois` runs on the inbox's request thread, so a
+/// stalled one would stop every answer, loopback included.
+const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn tailscale_json(args: &[&str]) -> Result<serde_json::Value> {
+    use std::io::Read;
     let bin = tailscale_bin().context("the `tailscale` command is not installed here")?;
-    let out = std::process::Command::new(&bin).args(args).stdin(std::process::Stdio::null()).output().with_context(|| format!("running {}", bin.display()))?;
+    let mut child = std::process::Command::new(&bin).args(args)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .spawn().with_context(|| format!("running {}", bin.display()))?;
+    // Read the output on threads so a chatty child cannot fill a pipe and stall the wait.
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let out_t = std::thread::spawn(move || { let mut b = Vec::new(); let _ = stdout.read_to_end(&mut b); b });
+    let err_t = std::thread::spawn(move || { let mut b = Vec::new(); let _ = stderr.read_to_end(&mut b); b });
+    let deadline = Instant::now() + TAILSCALE_TIMEOUT;
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("`tailscale {}` did not answer within {TAILSCALE_TIMEOUT:?}", args.join(" "));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let out = std::process::Output { status, stdout: out_t.join().unwrap_or_default(), stderr: err_t.join().unwrap_or_default() };
     if !out.status.success() {
         bail!("`tailscale {}` failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -176,8 +201,13 @@ pub fn remote(a: RemoteArgs) -> Result<i32> {
         Some("tailscale") => {
             let net = status()?;
             let login = match (a.login, net.login) {
-                (Some(l), _) => l,
                 (None, Some(l)) => l,
+                (Some(l), Some(owner)) if l == owner => l,
+                // Naming someone else as the person on a machine that has an owner hands their
+                // devices the full session: the person's own call.
+                (Some(l), Some(_)) if crate::util::looks_human() => l,
+                (Some(_), Some(owner)) => bail!("this machine is signed in to Tailscale as {owner}; naming another login as the person is for a person at a terminal"),
+                (Some(l), None) => l,
                 (None, None) => bail!("this machine is a tagged Tailscale node, so it has no owner to recognise; name yours: `tokenstash remote tailscale --login you@example.com`"),
             };
             cfg.remote = Remote::Tailscale;
@@ -199,6 +229,27 @@ pub fn remote(a: RemoteArgs) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Greptile on #69: a `tailscale` that stalls must not hold the caller (the inbox's
+    /// request thread, for `whois`) past the time limit.
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_tailscale_call_gives_up_on_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::inbox_auth::env_lock();
+        let dir = std::env::temp_dir().join(format!("tokenstash-stalled-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("tailscale");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("TOKENSTASH_TAILSCALE", &bin);
+        let started = Instant::now();
+        let err = status().unwrap_err();
+        std::env::remove_var("TOKENSTASH_TAILSCALE");
+        assert!(started.elapsed() < TAILSCALE_TIMEOUT + Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(format!("{err:#}").contains("did not answer"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn links_name_the_tailnet_host_only_when_remote_access_is_on() {

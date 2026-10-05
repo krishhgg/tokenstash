@@ -76,7 +76,7 @@ impl Drop for Inbox {
 fn curl(w: &World, from: &str, method: &str, path: &str, host: Option<&str>, cookie: Option<&str>, body: Option<&str>) -> (u16, String, String) {
     let url = format!("http://127.0.0.2:{}{path}", w.port);
     let mut c = Command::new("curl");
-    c.args(["-s", "-i", "--max-time", "10", "--interface", from, "-X", method, &url]);
+    c.args(["-s", "-i", "--noproxy", "*", "--max-time", "10", "--interface", from, "-X", method, &url]);
     if let Some(h) = host { c.args(["-H", &format!("Host: {h}")]); }
     if let Some(k) = cookie { c.args(["-H", &format!("Cookie: {k}")]); }
     if let Some(b) = body { c.args(["--data", b]); }
@@ -107,7 +107,7 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     let w = World { tailscale: fake_tailscale(&root), home, proj, port };
     let inbox = Inbox(w.cmd().args(["inbox", "--port", &port.to_string(), "--keep"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let start = Instant::now();
-    while Command::new("curl").args(["-s", "-o", "/dev/null", &format!("http://127.0.0.1:{port}/verify?c=ready")]).status().map(|s| !s.success()).unwrap_or(true) {
+    while Command::new("curl").args(["-s", "--noproxy", "*", "-o", "/dev/null", &format!("http://127.0.0.1:{port}/verify?c=ready")]).status().map(|s| !s.success()).unwrap_or(true) {
         assert!(start.elapsed() < Duration::from_secs(20), "the inbox did not come up");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -116,15 +116,19 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     let need = w.run(&["need", "OPENAI_API_KEY"]);
     assert!(String::from_utf8_lossy(&need.stdout).contains(&format!("http://127.0.0.1:{port}/p/")));
 
+    // An agent may not name another login as the person on a machine that has an owner.
+    let other = w.run(&["remote", "tailscale", "--login", "someone@else.example"]);
+    assert!(!other.status.success() && String::from_utf8_lossy(&other.stderr).contains("for a person at a terminal"), "{}", String::from_utf8_lossy(&other.stderr));
     // On, from an agent's shell: the person it is for cannot reach the inbox until it is.
     let on = w.run(&["remote", "tailscale"]);
     assert!(on.status.success(), "{}", String::from_utf8_lossy(&on.stderr));
     assert!(String::from_utf8_lossy(&on.stdout).contains(&format!("http://127.0.0.2:{port}/")));
     let cfg = std::fs::read_to_string(w.home.join("config.toml")).unwrap();
     assert!(cfg.contains("remote = \"tailscale\"") && cfg.contains(&format!("remote_login = \"{OWNER}\"")), "{cfg}");
-    // The running inbox starts listening on the Tailscale address within a second or so.
+    // The running inbox starts listening on the Tailscale address within a second or so
+    // (anything but a refused connection: this machine without a credential gets a 404).
     let start = Instant::now();
-    while curl(&w, "127.0.0.2", "GET", "/verify?c=x", None, None, None).0 != 200 {
+    while curl(&w, "127.0.0.2", "GET", "/", None, None, None).0 == 0 {
         assert!(start.elapsed() < Duration::from_secs(10), "the inbox did not start listening on the Tailscale address");
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -134,6 +138,9 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     let card_path = link.strip_prefix(&format!("http://127.0.0.2:{port}")).unwrap().to_string();
     let id = card_path.trim_start_matches("/p/").split('?').next().unwrap().to_string();
 
+    // The ownership check is loopback's alone: no tailnet peer gets a signed reply.
+    assert_eq!(curl(&w, "127.0.0.4", "GET", "/verify?c=nonce", None, None, None).0, 404);
+    assert_eq!(curl(&w, "127.0.0.3", "GET", "/verify?c=nonce", None, None, None).0, 404);
     // Someone else's device: nothing, link or no link.
     assert_eq!(curl(&w, "127.0.0.4", "GET", &card_path, None, None, None).0, 404);
     assert_eq!(curl(&w, "127.0.0.4", "GET", "/", None, None, None).0, 404);
@@ -158,6 +165,12 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     let (st, _, _) = curl(&w, "127.0.0.3", "POST", &format!("/t/{id}"), None, Some(&format!("tokenstash_inbox={session}")), Some(&format!("value=sk-proj-fromthelaptop0123456789ab&skip_check=1&t={session}")));
     assert_eq!(st, 303);
     assert_eq!(w.status_of(&id), "answered");
+    // A setting that cannot be read is not "on": the owner's device gets nothing meanwhile.
+    let good = std::fs::read_to_string(w.home.join("config.toml")).unwrap();
+    std::fs::write(w.home.join("config.toml"), format!("{good}this is not toml\n")).unwrap();
+    assert_eq!(curl(&w, "127.0.0.3", "GET", "/", None, None, None).0, 404);
+    std::fs::write(w.home.join("config.toml"), &good).unwrap();
+    assert_eq!(curl(&w, "127.0.0.3", "GET", "/", None, None, None).0, 200);
     // Another name in the Host header is not this machine: the DNS-rebinding defence holds
     // on this listener too.
     assert_eq!(curl(&w, "127.0.0.3", "GET", "/", Some("evil.example"), None, None).0, 404);

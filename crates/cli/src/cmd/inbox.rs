@@ -119,7 +119,7 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     eprintln!("tokenstash inbox → http://127.0.0.1:{port}/");
     let (req_tx, requests) = mpsc::sync_channel::<Request>(READERS);
     spawn_readers(listener, false, req_tx.clone());
-    let mut tailnet_bound = false;
+    let mut tailnet_bound = None;
     let mut last_activity = Instant::now();
     loop {
         listen_tailnet(port, &mut tailnet_bound, &req_tx);
@@ -160,7 +160,9 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     // fresh nonce with HMAC(proof key, nonce); a process squatting the port cannot, and
     // neither can anyone holding a session or card link captured from a URL — the proof key
     // never travels.
-    if path == "/verify" {
+    // Loopback only: the CLI asks over 127.0.0.1, and a tailnet peer is owed nothing before
+    // the checks below.
+    if path == "/verify" && !req.tailnet {
         return match q.get("c") {
             Some(c) if !c.is_empty() && c.len() <= inbox_auth::MAX_CHALLENGE => {
                 respond(req, 200, "text/plain", inbox_auth::verify_response(tokens.proof(), c))
@@ -176,7 +178,9 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     // device, so the owner's other devices are the person.
     let mut person_device = false;
     if req.tailnet {
-        let cfg = tokenstash_core::Config::load().unwrap_or_else(|_| app.cfg.clone());
+        // The setting as it is now. One that cannot be read is not "on": falling back to what
+        // the inbox read at start could keep answering after `remote off`.
+        let Ok(cfg) = tokenstash_core::Config::load() else { return not_found(req) };
         if cfg.remote != tokenstash_core::config::Remote::Tailscale || !host_is_one_of(&req, &[cfg.remote_host.as_deref(), cfg.remote_ip.as_deref()]) {
             return not_found(req);
         }
@@ -713,22 +717,23 @@ fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<
 
 /// Listen on this machine's Tailscale address too, when remote access is on and nothing
 /// listens there yet. Checked at start and once a second, so `tokenstash remote tailscale`
-/// takes effect in a running inbox. Turning it off needs no unbinding: every tailnet request
-/// is checked against the setting as it is then.
-fn listen_tailnet(port: u16, bound: &mut bool, req_tx: &mpsc::SyncSender<Request>) {
-    if *bound {
-        return;
-    }
+/// takes effect in a running inbox, including after the address changed. Turning it off needs
+/// no unbinding: every tailnet request is checked against the setting as it is then, so an
+/// old address's listener answers nothing.
+fn listen_tailnet(port: u16, bound: &mut Option<std::net::IpAddr>, req_tx: &mpsc::SyncSender<Request>) {
     let Ok(cfg) = tokenstash_core::Config::load() else { return };
     if cfg.remote != tokenstash_core::config::Remote::Tailscale {
         return;
     }
     let Some(ip) = cfg.remote_ip.as_deref().and_then(|i| i.parse::<std::net::IpAddr>().ok()) else { return };
+    if *bound == Some(ip) {
+        return;
+    }
     match TcpListener::bind((ip, port)) {
         Ok(l) => {
             eprintln!("tokenstash inbox → {}/ (Tailscale)", crate::remote::base_url(&cfg));
             spawn_readers(l, true, req_tx.clone());
-            *bound = true;
+            *bound = Some(ip);
         }
         Err(e) => eprintln!("inbox: cannot listen on {ip}:{port}: {e}"),
     }
