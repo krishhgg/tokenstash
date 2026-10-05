@@ -116,7 +116,7 @@ Agents that prefer MCP can have it too: `tokenstash init --mcp` also registers t
 
 ## Uninstall
 
-1. **Take tokenstash out of your agents:** `tokenstash init --undo`. It puts back the agent config files `init` changed, from the copies it saved at the time, and deletes the files it created. An edit you made to one of those files since `init` (another MCP server added to Cursor, say) is lost with it, so check them first.
+1. **Take tokenstash out of your agents:** `tokenstash init --undo` (or ask your agent: you confirm the card). It removes the skill files `init` wrote, and from shared configs (`~/.claude.json`, `~/.codex/config.toml`, an `AGENTS.md`) it takes out only tokenstash's entry, putting back whatever was there under that name before. Anything else you added to those files since `init` stays.
 2. **Optionally, remove your stored keys and data**: expand the section below. Do this after step 1, since the data directory holds the copies `init --undo` restores from.
 3. **Remove the program:** `brew uninstall tokenstash`, or `npm uninstall -g tokenstash`, `uv tool uninstall tokenstash`, `pipx uninstall tokenstash`.
 

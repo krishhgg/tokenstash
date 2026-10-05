@@ -167,8 +167,7 @@ impl Manifest {
         let backup = if p.exists() {
             let dir = self.root.join("init-backups");
             fs::create_dir_all(&dir)?;
-            let name = p.to_string_lossy().replace(['/', '\\'], "_");
-            let b = dir.join(name);
+            let b = dir.join(backup_name(p));
             fs::copy(p, &b)?;
             Some(b)
         } else { None };
@@ -209,7 +208,7 @@ impl Manifest {
         let Some(i) = self.files.iter().position(|(q, _)| q == p) else { return Ok(false) };
         let (_, backup) = self.files[i].clone();
         match &backup {
-            Some(b) if b.exists() => { fs::copy(b, p)?; }
+            Some(b) if b.exists() => restore(b, p)?,
             Some(b) => anyhow::bail!("backup of {} missing at {}", p.display(), b.display()),
             None => remove_file_if_present(p)?,
         }
@@ -336,10 +335,14 @@ fn undo_with(m: Manifest, claude_cli: bool, home: &Path) -> Result<i32> {
     let mut i = 0;
     while i < cur.files.len() {
         let (p, backup) = cur.files[i].clone();
-        let r: Result<()> = match &backup {
-            Some(b) if b.exists() => fs::copy(b, &p).map(|_| ()).map_err(Into::into),
-            Some(b) => Err(anyhow::anyhow!("backup missing at {}", b.display())),
-            None => remove_file_if_present(&p),
+        let r: Result<()> = if is_shared(&p) {
+            undo_shared(&p, backup.as_deref())
+        } else {
+            match &backup {
+                Some(b) if b.exists() => restore(b, &p),
+                Some(b) => Err(anyhow::anyhow!("backup missing at {}", b.display())),
+                None => remove_file_if_present(&p),
+            }
         };
         match r {
             Ok(()) => {
@@ -393,6 +396,98 @@ fn undo_with(m: Manifest, claude_cli: bool, home: &Path) -> Result<i32> {
     Ok(if all_done { 0 } else { 1 })
 }
 
+/// A backup's file name: a digest of the whole path, then the file's own name for a person
+/// looking in the folder. Flattening the path (`/` → `_`) made `/a_b/c` and `/a/b_c` one
+/// backup, and undo then restored one project's file into the other.
+fn backup_name(p: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(p.as_os_str().as_encoded_bytes());
+    let short: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{short}-{}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+}
+
+/// Replace `p` with `contents` in one step: written beside it, then renamed over it, keeping
+/// the file's permissions. A full disk or a crash leaves the old file, never half of a new
+/// one; `~/.claude.json` is also written by every running Claude Code session.
+fn write_file(p: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{}.tokenstash-{}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), std::process::id()));
+    let written = (|| -> Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        if let Ok(md) = fs::metadata(p) {
+            f.set_permissions(md.permissions())?;
+        }
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, p)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(|e| e.context(format!("writing {}", p.display())))
+}
+
+/// Put a backup back in place, atomically.
+fn restore(backup: &Path, p: &Path) -> Result<()> {
+    let s = fs::read_to_string(backup).map_err(|e| anyhow::anyhow!("reading {}: {e}", backup.display()))?;
+    write_file(p, &s)
+}
+
+/// A file other tools and the person also write: an agent's config or an AGENTS.md. Undo
+/// takes tokenstash's entry out of it rather than putting an old copy back over it.
+fn is_shared(p: &Path) -> bool {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    name.ends_with(".json") || name == "config.toml" || name == "AGENTS.md"
+}
+
+/// Undo for a shared file: take tokenstash's entry or section out of the file as it is now,
+/// then put back what the backup held under that name, if anything. Whatever the person or
+/// another tool added since `init` stays. A file init created and that holds nothing else
+/// is removed. A file that is gone is restored from its backup, as before.
+fn undo_shared(p: &Path, backup: Option<&Path>) -> Result<()> {
+    if !p.exists() {
+        return match backup {
+            Some(b) if b.exists() => restore(b, p),
+            Some(b) => Err(anyhow::anyhow!("backup missing at {}", b.display())),
+            None => Ok(()),
+        };
+    }
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name == "AGENTS.md" {
+        if has_snippet(p) {
+            strip_snippet(p)?;
+        }
+    } else if name == "config.toml" {
+        let mut doc = read_toml(p)?;
+        if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) {
+            servers.remove("tokenstash");
+        }
+        write_file(p, &doc.to_string())?;
+    } else {
+        let mut v = read_json(p)?;
+        if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+            m.remove("tokenstash");
+        }
+        write_file(p, &serde_json::to_string_pretty(&v)?)?;
+    }
+    match backup {
+        Some(b) => {
+            if let Some((key, value)) = original_entry(b)? {
+                reinsert(&Removed { file: p.to_path_buf(), key, value })?;
+            }
+        }
+        None => {
+            if effectively_empty(p) {
+                remove_file_if_present(p)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Put a removed registration back where it was, unless a tokenstash entry is there already
 /// (the user re-added one since; theirs wins). The file, and its directory, may be gone by
 /// now (an agent uninstalled in between): they are recreated around the entry.
@@ -411,7 +506,7 @@ fn reinsert(r: &Removed) -> Result<()> {
         if !s.is_empty() { s.push('\n'); }
         s.push_str(&r.value);
         s.push('\n');
-        fs::write(&r.file, s)?;
+        write_file(&r.file, &s)?;
         return Ok(());
     }
     if r.key == "mcp_servers" {
@@ -423,7 +518,7 @@ fn reinsert(r: &Removed) -> Result<()> {
         if servers.get("tokenstash").is_none() { servers.insert("tokenstash", item); }
         let out = doc.to_string();
         toml::from_str::<toml::Value>(&out).map_err(|e| anyhow::anyhow!("refusing to write: result would not parse ({e})"))?;
-        fs::write(&r.file, out)?;
+        write_file(&r.file, &out)?;
         return Ok(());
     }
     let value: serde_json::Value = serde_json::from_str(&r.value).map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
@@ -436,7 +531,7 @@ fn reinsert(r: &Removed) -> Result<()> {
     };
     let m = scope.entry("mcpServers").or_insert(serde_json::json!({})).as_object_mut().ok_or_else(|| anyhow::anyhow!("mcpServers is not an object"))?;
     m.entry("tokenstash").or_insert(value);
-    fs::write(&r.file, serde_json::to_string_pretty(&v)?)?;
+    write_file(&r.file, &serde_json::to_string_pretty(&v)?)?;
     Ok(())
 }
 
@@ -493,7 +588,7 @@ fn write_skill_dir(manifest: &mut Manifest, dir: &Path, text: &str, policy: bool
     for (p, t) in files {
         manifest.mutate(&p, || {
             if let Some(d) = p.parent() { fs::create_dir_all(d)?; }
-            Ok(fs::write(&p, t)?)
+            write_file(&p, t)
         })?;
     }
     if !policy && manifest.release(&dir.join(CODEX_POLICY))? {
@@ -683,7 +778,7 @@ fn remove_json_server(manifest: &mut Manifest, p: &Path, name: &str, claude: boo
         // if absent, so a crash between the two leaves nothing wrong. Ownership of init's
         // registration is given up only once it is gone.
         manifest.save()?;
-        fs::write(p, serde_json::to_string_pretty(&v)?)?;
+        write_file(p, &serde_json::to_string_pretty(&v)?)?;
         println!("✓ {name}: MCP server removed from {}", p.display());
     }
     if claude && manifest.claude_mcp_registered && !json_server_state(p, false)? {
@@ -714,7 +809,7 @@ fn remove_toml_server(manifest: &mut Manifest, p: &Path) -> Result<()> {
         if back.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
             anyhow::bail!("refusing to write {}: could not take the tokenstash entry out cleanly; edit it by hand", p.display());
         }
-        fs::write(p, out)?;
+        write_file(p, &out)?;
         println!("✓ Codex: MCP server removed from {}", p.display());
     }
     if recorded { manifest.retire(p)?; }
@@ -1042,7 +1137,7 @@ fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
         anyhow::bail!("refusing to write {}: could not set the tokenstash entry cleanly; edit it by hand", p.display());
     }
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
-    fs::write(p, out)?;
+    write_file(p, &out)?;
     Ok(())
 }
 
@@ -1089,7 +1184,7 @@ fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool, ts_home: Option<&str>)
     }
     m.insert("tokenstash".into(), entry);
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
-    fs::write(p, serde_json::to_string_pretty(&v)?)?;
+    write_file(p, &serde_json::to_string_pretty(&v)?)?;
     Ok(())
 }
 
@@ -1182,7 +1277,7 @@ fn strip_snippet(p: &Path) -> Result<()> {
         if s[..start].ends_with("\n\n") { start -= 1; } else if start == 0 && s[end..].starts_with('\n') { end += 1; }
         s = format!("{}{}", &s[..start], &s[end..]);
     }
-    fs::write(p, s)?;
+    write_file(p, &s)?;
     Ok(())
 }
 
@@ -1786,5 +1881,52 @@ mod tests {
         choose(&mut c, Some(Mode::Explicit), false, false).unwrap();
         assert!(c.agent_mode == AgentMode::Explicit && !c.mcp, "explicit mode has no server");
         assert!(choose(&mut c, None, true, false).is_err(), "no server in explicit mode");
+    }
+
+    /// Codex review #7: undo after `--mcp` used to put the whole pre-init file back, losing a
+    /// server the user added since. Only tokenstash's entry goes now, and what the file held
+    /// under that name before init comes back.
+    #[test]
+    fn undo_takes_out_only_tokenstashs_entry_and_keeps_later_edits() {
+        let (w, mut m) = machine("undo-entries");
+        write(&w.codex().join("config.toml"), "# mine\n[mcp_servers.github]\ncommand = \"gh-mcp\"\n");
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}}}");
+        wire(&mut m, &w, AgentMode::Auto, Some(true)).unwrap();
+        assert!(m.recorded(&w.codex().join("config.toml")) && m.recorded(&w.cursor().join("mcp.json")));
+        let codex = format!("{}\n[mcp_servers.linear]\ncommand = \"linear-mcp\"\n", read(&w.codex().join("config.toml")));
+        write(&w.codex().join("config.toml"), &codex);
+        let mut cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
+        cursor["mcpServers"]["linear"] = serde_json::json!({ "command": "linear-mcp" });
+        write(&w.cursor().join("mcp.json"), &cursor.to_string());
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        let codex = read(&w.codex().join("config.toml"));
+        assert!(codex.contains("# mine") && codex.contains("gh-mcp") && codex.contains("linear-mcp") && !toml_has_server(&w.codex().join("config.toml")), "{codex}");
+        let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
+        assert_eq!(cursor["mcpServers"]["linear"]["command"], "linear-mcp");
+        assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash", "the entry init replaced comes back");
+        assert!(!w.claude_json().exists() && !w.gemini().join("settings.json").exists(), "files init created for the server alone are gone");
+    }
+
+    /// Codex review #8: two paths that flatten to the same name get two backups.
+    #[test]
+    fn backups_of_different_paths_never_share_a_name() {
+        let a = backup_name(Path::new("/tmp/a_b/c/AGENTS.md"));
+        let b = backup_name(Path::new("/tmp/a/b_c/AGENTS.md"));
+        assert_ne!(a, b);
+        assert!(a.ends_with("-AGENTS.md") && b.ends_with("-AGENTS.md"));
+    }
+
+    /// Codex review #10: a write replaces the file in one step and keeps its permissions.
+    #[test]
+    fn a_config_write_is_atomic_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("atomic");
+        let p = d.join("config.toml");
+        fs::write(&p, "old = 1\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        write_file(&p, "new = 2\n").unwrap();
+        assert_eq!(read(&p), "new = 2\n");
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1, "no temporary file left behind");
     }
 }
