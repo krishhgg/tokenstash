@@ -2,6 +2,7 @@ use crate::cmd::need::status_icon;
 use crate::util::{self, App};
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
+use secrecy::ExposeSecret;
 use std::path::PathBuf;
 use tokenstash_core::stash::stash_key;
 use tokenstash_core::tasks::{Ctx, Probe};
@@ -467,6 +468,10 @@ pub fn sweep_pairs(app: &App, pairs: &[(String, String)], print: bool) -> Result
     sweep_where(app, Probe::Network, &|m| pairs.iter().any(|(n, i)| n == &m.name && i == &m.identity), print)
 }
 
+/// The sweep's result for a key stored while its request was out. The answer was about the
+/// old key, so the key now stored was not checked.
+const REPLACED_DURING_CHECK: &str = "replaced during the check; not checked";
+
 fn sweep_where(app: &App, probe: Probe, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
     let ctx = Ctx { probe, ..app.ctx() };
     let mut rows = vec![];
@@ -485,7 +490,7 @@ fn sweep_where(app: &App, probe: Probe, select: &dyn Fn(&tokenstash_core::db::Se
         // the index write lock. A key pasted while the request was out is not judged by its
         // predecessor's answer. An Unknown records nothing, so it does not wait for the lock.
         let judge = |record: &dyn Fn() -> Result<String>| -> Result<String> {
-            Ok(tokenstash_core::tasks::if_still_stored(&ctx, &m.name, &m.identity, Some(&v), record)?.unwrap_or_else(|| "replaced during the check; not judged".to_string()))
+            Ok(tokenstash_core::tasks::if_still_stored(&ctx, &m.name, &m.identity, Some(&v), record)?.unwrap_or_else(|| REPLACED_DURING_CHECK.to_string()))
         };
         let status = match verdict {
             Liveness::Ok => judge(&|| { app.db.set_verified(&m.name, &m.identity)?; Ok("ok".to_string()) })?,
@@ -495,7 +500,12 @@ fn sweep_where(app: &App, probe: Probe, select: &dyn Fn(&tokenstash_core::db::Se
                 app.db.audit(None, None, "check.rejected", Some(&m.name), Some(&m.identity), Some(&format!("HTTP {code}")))?;
                 Ok(format!("REJECTED (HTTP {code}) → stale"))
             })?,
-            Liveness::Unknown(e) => format!("unknown ({})", e.chars().take(40).collect::<String>()),
+            // Nothing to record, so no lock. A plain re-read still keeps the old key's answer
+            // off the row of a key stored while the request was out.
+            Liveness::Unknown(e) => match app.stash.get(&stash_key(&m.name, &m.identity))? {
+                Some(now) if now.expose_secret() == v.expose_secret() => format!("unknown ({})", e.chars().take(40).collect::<String>()),
+                _ => REPLACED_DURING_CHECK.to_string(),
+            },
         };
         let stale_now = app.db.get_secret(&m.name, &m.identity)?.map(|x| x.stale).unwrap_or(false);
         rows.push((m.name.clone(), m.identity.clone(), status, stale_now));
@@ -579,8 +589,24 @@ mod tests {
         };
         let rows = sweep_where(&app, Probe::Stub(&rejecting), &|_| true, false).unwrap();
         assert_eq!(calls.get(), 1, "one request per key");
-        assert_eq!(rows[0].2, "replaced during the check; not judged", "{rows:?}");
+        assert_eq!(rows[0].2, REPLACED_DURING_CHECK, "{rows:?}");
         assert!(!app.db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale, "the old key's 401 is not recorded against the new one");
+        done(&home);
+    }
+
+    /// An Unknown records nothing, but the report must not print the old key's "unknown"
+    /// beside a key stored while the request was out. That key was never checked.
+    #[test]
+    fn an_unknown_for_a_replaced_key_reports_the_replacement_as_not_checked() {
+        let _g = crate::inbox_auth::env_lock();
+        let (app, home) = app_with_key("replaced-unknown", "sk-old-aaaaaaaaaaaaaaaaaaaaa");
+        let human = FileStash::new().unwrap();
+        let unreachable = |_: &registry::Check| {
+            human.set(&stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-new-bbbbbbbbbbbbbbbbbbbbb".to_string())).unwrap();
+            Liveness::Unknown("HTTP 503".into())
+        };
+        let rows = sweep_where(&app, Probe::Stub(&unreachable), &|_| true, false).unwrap();
+        assert_eq!(rows[0].2, REPLACED_DURING_CHECK, "{rows:?}");
         done(&home);
     }
 }
