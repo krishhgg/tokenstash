@@ -3516,3 +3516,30 @@ fn an_expired_action_card_is_not_reused() {
     assert_ne!(first.id, second.id);
     assert_eq!(db.get_task(&first.id).unwrap().unwrap().status, db::TaskStatus::Expired);
 }
+
+/// Greptile on #68: a confirm that stops half way must not leave its card looking done. The
+/// claim keeps the card pending, holds off a second confirm, and runs out.
+#[test]
+fn an_action_claim_holds_off_a_second_confirm_and_runs_out() {
+    use crate::actions::Action;
+    let _env = env_lock();
+    let home = tmp("claim-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("claim-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let t = crate::actions::request(&ctx, &proj, "agent", &Action::Undo, None).unwrap();
+    let a_minute_ago = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(db.claim_action(&t.id, &a_minute_ago).unwrap());
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Pending, "still pending while it runs");
+    assert!(!db.claim_action(&t.id, &a_minute_ago).unwrap(), "a second confirm waits");
+    // The process that held it stopped: once the claim is older than the cut-off, it is taken over.
+    let later = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(db.claim_action(&t.id, &later).unwrap());
+    db.release_action_claim(&t.id).unwrap();
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().note, None);
+    assert!(db.claim_action(&t.id, &a_minute_ago).unwrap(), "a released claim can be taken again");
+}

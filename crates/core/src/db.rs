@@ -5,6 +5,9 @@ use std::path::Path;
 
 /// (ts, project, agent, action, name, identity, detail) — never a value.
 /// (ts, project, agent, action, name, identity, detail, grant_source)
+/// The note an action card carries while it is being carried out, before the time.
+pub const CONFIRMING: &str = "confirming since ";
+
 pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
 
 pub struct Db {
@@ -757,9 +760,21 @@ impl Db {
         Ok(n == 1)
     }
 
-    /// The answer's note, set after the card was claimed (what a confirmed action did).
-    pub fn set_task_note(&self, id: &str, note: &str) -> Result<()> {
-        self.conn.execute("UPDATE tasks SET note=?2 WHERE id=?1", params![id, note])?;
+    /// Mark a pending action card as being carried out, so a second confirm does not run it
+    /// again. True if this caller holds the claim now. A claim older than `stale_before` was
+    /// left by a process that stopped mid-action, and is taken over: the card stays pending
+    /// until the action has run, so an interrupted one can be confirmed again.
+    pub fn claim_action(&self, id: &str, stale_before: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET note=?2 WHERE id=?1 AND status='pending' AND (note IS NULL OR note NOT LIKE 'confirming since %' OR substr(note, 18) < ?3)",
+            params![id, format!("{CONFIRMING}{}", crate::now()), stale_before],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Give a claim back after the action failed, so the person can try again or decline.
+    pub fn release_action_claim(&self, id: &str) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET note=NULL WHERE id=?1 AND status='pending' AND note LIKE 'confirming since %'", params![id])?;
         Ok(())
     }
 

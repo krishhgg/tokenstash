@@ -475,6 +475,19 @@ pub(crate) fn adoptable(project: &Path, env_file: &str, name: &str) -> Option<Se
     Some(v)
 }
 
+/// Has the person said no to `name` for this project within the TTL: a declined paste card,
+/// or a declined pairing or sensitive card that named it? The identity is resolved the way
+/// `need` resolves it (the one given, else the project's binding, else `default`). An agent
+/// asking again (`need --force`) counts as a second ask only after a no.
+pub fn denied_here(ctx: &Ctx, project: &Path, name: &str, identity: Option<&str>) -> Result<bool> {
+    let Ok(project) = project.canonicalize() else { return Ok(false) };
+    let pid = project.to_string_lossy().to_string();
+    let bound = match ctx.db.find_workspace(&project)? { Some(ws) => ctx.db.binding(&ws.id, name)?, None => None };
+    let identity = identity.map(String::from).or(bound).unwrap_or_else(|| "default".into());
+    let since = ctx.cfg.ttl_since();
+    Ok(ctx.db.recent_denial(&pid, name, &identity, &since)?.is_some() || denied_card_for(ctx, &pid, &format!("{name}@{identity}"), &since)?.is_some())
+}
+
 /// A denied pairing or sensitive card within the TTL that named this entry. A denied
 /// "this run only" card says nothing about the key in general.
 fn denied_card_for(ctx: &Ctx, pid: &str, entry: &str, since: &str) -> Result<Option<String>> {

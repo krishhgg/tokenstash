@@ -8,9 +8,10 @@ TS="$(cd "$(dirname "${1:-target/debug/tokenstash}")" 2>/dev/null && pwd)/$(base
 # wrong thing; the gate passes the freshly built release binary explicitly.
 [ -x "$TS" ] || { echo "leak test: no binary at $TS — build it, or pass the path as \$1"; exit 2; }
 command -v script >/dev/null || { echo "leak test: needs script(1) from util-linux"; exit 2; }
-# A person at a terminal. The inventory commands (list, audit, tasks --all, forget, open) refuse
-# a pipe or an agent marker, so the steps of this script that read the stash as its owner run
-# them under a pseudo-terminal with every marker cleared. `script` merges stderr into stdout and
+# A person at a terminal. The inventory commands show an agent only its own directory (list,
+# audit), file a card for it (forget), or refuse it (tasks --all, open), so the steps of this
+# script that read the stash as its owner run them under a pseudo-terminal with every marker
+# cleared. `script` merges stderr into stdout and
 # ends lines with CRLF; the CR is stripped here. The refusal itself is asserted separately below
 # and in crates/cli/tests/human_only.rs.
 HUMAN_ENV=(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT)
@@ -384,10 +385,10 @@ grep -q "name=t value=\"$TOKEN\"" "$WEB/both-scoped.html" && { echo "LEAK: the s
 # (a pending approval card offers a scoped session no form at all, hence no CSRF field; any
 # CSRF field a scoped page ever carries is the card credential, checked on the paste card above)
 grep -q "name=t value=\"" "$WEB/both-scoped.html" && ! grep -q "name=t value=\"$ACAP\"" "$WEB/both-scoped.html" && { echo "FAIL: the scoped page carries a CSRF field that is not its own"; exit 1; }
-grep -q "select this card there" "$WEB/both-scoped.html" || { echo "FAIL: the scoped approval page does not send the person to the full inbox"; exit 1; }
+grep -q "your own inbox link" "$WEB/both-scoped.html" || { echo "FAIL: the scoped approval page does not send the person to the full inbox"; exit 1; }
 for act in allow allow_broad deny; do
   code=$(curl -s -c "$JAR" -b "$JAR" -o "$WEB/both-try.html" -w '%{http_code}' --data "action=$act&t=$ACAP" "http://127.0.0.1:$PORT/p/$ATID")
-  [ "$code" = 200 ] && grep -q "full inbox" "$WEB/both-try.html" || { echo "FAIL: scoped $act with both cookies was not refused with an explanation ($code)"; exit 1; }
+  [ "$code" = 200 ] && grep -q "your own inbox link" "$WEB/both-try.html" || { echo "FAIL: scoped $act with both cookies was not refused with an explanation ($code)"; exit 1; }
   code=$(curl -s -c "$JAR" -b "$JAR" -o /dev/null -w '%{http_code}' --data "action=$act&t=$TOKEN" "http://127.0.0.1:$PORT/p/$ATID")
   [ "$code" = 404 ] || { echo "FAIL: the session as CSRF field on the scoped route was accepted for $act ($code)"; exit 1; }
   human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
@@ -519,11 +520,15 @@ grep -q "$PGOOD" "$OUT/report1.txt" "$OUT/report2.txt" && { echo "LEAK: report-b
 human "$TS" audit >"$OUT/audit-after-report.txt" 2>&1; grep -q "$PGOOD" "$OUT/audit-after-report.txt" && { echo "LEAK: the reported message reached the audit log"; fail=1; }
 human "$TS" list >"$OUT/list-after-report.txt" 2>&1; grep -q "PASTE_TARGET_KEY.*STALE\|PASTE_TARGET_KEY@default:" "$OUT/list-after-report.txt" || { echo "FAIL: a report from the delivering project did not mark the key stale"; fail=1; }
 grep -q "$PGOOD" "$OUT/list-after-report.txt" && { echo "LEAK: list shows the value in the stale reason"; fail=1; }
-# rotate refuses an agent / a pipe, and its refusal names nothing
-"$TS" rotate OPENAI_API_KEY >"$OUT/rotate-pipe.txt" 2>&1 && { echo "FAIL: rotate ran without a terminal"; fail=1; }
-# check refuses a pipe (it is for a person at a terminal); the refusal must not list keys
-"$TS" check >"$OUT/check-pipe.txt" 2>&1 && { echo "FAIL: check ran without a terminal"; fail=1; }
-grep -q "OPENAI_API_KEY" "$OUT/check-pipe.txt" && { echo "FAIL: check's refusal listed a key name"; fail=1; }
+# rotate from an agent / a pipe never completes on its own: it files a Replace card (exit 10)
+# or refuses a key this directory never received, and its output carries no value
+"$TS" rotate OPENAI_API_KEY >"$OUT/rotate-pipe.txt" 2>&1 && { echo "FAIL: rotate completed without a person"; fail=1; }
+grep -q "$CANARY" "$OUT/rotate-pipe.txt" && { echo "LEAK: rotate's output contains the value"; fail=1; }
+# check from a pipe covers only this directory's keys; asked about a key the directory never
+# received it checks nothing, and its output names no other key (no inventory). A key with a
+# provider check is not used here: that would send the canary to the provider.
+"$TS" check NEVER_RECEIVED_KEY >"$OUT/check-pipe.txt" 2>&1 || { echo "FAIL: check from a pipe failed"; cat "$OUT/check-pipe.txt"; fail=1; }
+grep -q "OPENAI_API_KEY\|PASTE_TARGET_KEY" "$OUT/check-pipe.txt" && { echo "FAIL: check from a pipe listed a key name"; fail=1; }
 # rotate (human, via a pty when util-linux `script` exists) marks stale and files a card;
 # the old value stays out of every output. Without a pty the stale path is exercised by the
 # report above; the replacement flow below runs either way.

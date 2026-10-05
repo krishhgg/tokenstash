@@ -30,22 +30,32 @@ pub fn print_pending(app: &App, project: &Path, agent: &str, t: &Task) -> Result
     Ok(tokenstash_core::exit::PENDING)
 }
 
-/// Person side, from the inbox's full session or the person's terminal: claim the card, then
-/// do what it says. Claiming first means a second confirm (another tab, a double click) finds
-/// the card answered and runs nothing: an old forget card confirmed again would delete a key
-/// stored since. If the action fails, the card is put back for another try or a decline.
+/// How long a claim on an action card holds before it counts as left behind by a process that
+/// stopped mid-action. Every action finishes in seconds.
+const CLAIM_HOLDS: chrono::Duration = chrono::Duration::minutes(2);
+
+/// Person side, from the inbox's full session or the person's terminal: claim the card, do
+/// what it says, then close it. The claim means a second confirm (another tab, a double click)
+/// runs nothing: an old forget card confirmed again would delete a key stored since. The card
+/// stays pending until the action has run, so if this process stops half way the claim runs
+/// out and the person can confirm it again; if the action fails, the claim is given back.
 pub fn confirm(app: &App, task: &Task, action: &Action) -> Result<String> {
-    if !app.db.close_task_if_open(&task.id, tokenstash_core::db::TaskStatus::Answered, None)? {
-        bail!("this card was already answered");
+    use tokenstash_core::db::TaskStatus;
+    let stale_before = (chrono::Utc::now() - CLAIM_HOLDS).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    if !app.db.claim_action(&task.id, &stale_before)? {
+        match app.db.get_task(&task.id)?.map(|t| t.status) {
+            Some(TaskStatus::Pending) => bail!("this card is being carried out right now; reload the page in a minute"),
+            _ => bail!("this card was already answered"),
+        }
     }
     match perform(app, task, action) {
         Ok(done) => {
-            app.db.set_task_note(&task.id, &done)?;
+            app.db.close_task_if_open(&task.id, TaskStatus::Answered, Some(&done))?;
             app.db.audit(Some(&task.project), Some(&task.agent), "action.confirmed", None, None, Some(&task.expects))?;
             Ok(done)
         }
         Err(e) => {
-            app.db.reopen_task(&task.id)?;
+            app.db.release_action_claim(&task.id)?;
             Err(e)
         }
     }

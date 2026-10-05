@@ -114,6 +114,13 @@ fn an_agent_asks_on_a_card_and_nothing_changes_until_the_person_answers() {
     assert_eq!(out.status.code(), Some(10), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("keeps working") && !stdout.contains("rejected"), "{stdout}");
 
+    // --force on a key nobody declined is an ordinary request and spends nothing.
+    assert_eq!(run(&home, &proj, &["need", "GROQ_API_KEY", "--force"]).status.code(), Some(10));
+    let groq = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "GROQ_API_KEY").unwrap();
+    assert!(!groq["why"].as_str().unwrap_or("").starts_with("Asked again"), "{groq}");
+    assert!(run(&home, &proj, &["answer", groq["id"].as_str().unwrap(), "--deny"]).status.success());
+    assert_eq!(run(&home, &proj, &["need", "GROQ_API_KEY", "--force"]).status.code(), Some(10), "the extra ask is still there after the first real no");
+
     // Asking again after a no: once, and a request that fails does not spend it.
     assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY"]).status.code(), Some(10));
     let resend = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "RESEND_API_KEY").unwrap();

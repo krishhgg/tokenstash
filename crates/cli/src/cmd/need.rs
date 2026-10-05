@@ -54,11 +54,21 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     // ask again over it once per key and project in that window, when the user tells it to:
     // the card says it is a second ask, and a second "no" stands for the rest of the window.
     let mut why = a.why.clone();
-    let ask_again = a.force && !util::looks_human();
     let pid = project.to_string_lossy().to_string();
+    // Only a key the person declined here is asked "again"; for any other, --force from an
+    // agent is an ordinary request and spends nothing.
+    let mut denied: Vec<String> = vec![];
+    if a.force && !util::looks_human() {
+        for name in &a.names {
+            if tokenstash_core::need::denied_here(&app.ctx(), &project, name, a.identity.as_deref())? {
+                denied.push(name.clone());
+            }
+        }
+    }
+    let ask_again = !denied.is_empty();
     if ask_again {
         let since = app.cfg.ttl_since();
-        for name in &a.names {
+        for name in &denied {
             if app.db.audited_since(&pid, name, "need.force", &since)? {
                 anyhow::bail!("{name} was already asked for again once after the user declined it here; that answer stands for {} hours from the first no. Tell the user; do not ask again", app.cfg.task_ttl_hours);
             }
@@ -80,10 +90,8 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     let mut outcomes = need::need(&app.ctx(), &project, &agent, &a.names, &opts)?;
     // The one extra ask is spent only by a request that filed a card for the key: a request
     // that failed, or found the key already allowed, leaves it for later.
-    if ask_again {
-        for o in outcomes.iter().filter(|o| o.is_pending()) {
-            app.db.audit(Some(&pid), Some(&agent), "need.force", Some(o.name()), None, None)?;
-        }
+    for o in outcomes.iter().filter(|o| o.is_pending() && denied.iter().any(|d| d == o.name())) {
+        app.db.audit(Some(&pid), Some(&agent), "need.force", Some(o.name()), None, None)?;
     }
 
     if outcomes.iter().any(|o| o.is_pending()) {
