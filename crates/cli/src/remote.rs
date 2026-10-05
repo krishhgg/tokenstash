@@ -236,7 +236,13 @@ pub fn remote(a: RemoteArgs) -> Result<i32> {
                 (Some(l), None) => l,
                 (None, None) => bail!("this machine is a tagged Tailscale node, so it has no owner to recognise; name yours: `tokenstash remote tailscale --login you@example.com`"),
             };
+            // What remote access was when this command read the setting. Tailscale can take
+            // seconds to answer; a change made meanwhile (a `remote off`) is the later choice.
+            let seen = (cfg.remote, cfg.remote_ip.clone(), cfg.remote_login.clone());
             cfg = Config::update(|cfg| {
+                if (cfg.remote, cfg.remote_ip.clone(), cfg.remote_login.clone()) != seen {
+                    bail!("remote access changed while this waited for Tailscale (it is now {}); nothing was changed. Run `tokenstash remote tailscale` again to turn it on", if cfg.remote.is_off() { "off" } else { "set to another address or login" });
+                }
                 cfg.remote = Remote::Tailscale;
                 cfg.remote_ip = Some(net.ip.to_string());
                 cfg.remote_host = Some(net.dns_name.clone().unwrap_or_else(|| net.ip.to_string()));

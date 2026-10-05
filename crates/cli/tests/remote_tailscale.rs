@@ -28,7 +28,7 @@ fn fake_tailscale(dir: &Path) -> PathBuf {
     let p = dir.join("tailscale");
     std::fs::write(&p, format!(r#"#!/bin/sh
 case "$1" in
-status) echo '{{"BackendState":"Running","Self":{{"TailscaleIPs":["127.0.0.2","fd7a::2"],"DNSName":"","UserID":1,"Tags":[]}},"User":{{"1":{{"LoginName":"{OWNER}"}}}}}}' ;;
+status) [ -n "$TS_SLOW" ] && sleep "$TS_SLOW"; echo '{{"BackendState":"Running","Self":{{"TailscaleIPs":["127.0.0.2","fd7a::2"],"DNSName":"","UserID":1,"Tags":[]}},"User":{{"1":{{"LoginName":"{OWNER}"}}}}}}' ;;
 whois)
   case "$3" in
   127.0.0.3) echo '{{"Node":{{"Tags":[]}},"UserProfile":{{"LoginName":"{OWNER}"}}}}' ;;
@@ -232,6 +232,15 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
         assert!(start.elapsed() < Duration::from_secs(10), "the inbox did not move back to the old address");
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    // The person turns remote access off while an agent's `remote tailscale` still waits for
+    // Tailscale: the later choice stands, and the slower command changes nothing.
+    let slow = w.cmd().args(["remote", "tailscale"]).env("TS_SLOW", "2").current_dir(&w.proj).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(w.run(&["remote", "off"]).status.success());
+    let slow = slow.wait_with_output().unwrap();
+    assert!(!slow.status.success() && String::from_utf8_lossy(&slow.stderr).contains("changed while this waited"), "{}", String::from_utf8_lossy(&slow.stderr));
+    assert!(!std::fs::read_to_string(w.home.join("config.toml")).unwrap().contains("remote = \"tailscale\""));
 
     // Off again: the Tailscale address stops answering, at once, and then closes.
     assert!(w.run(&["remote", "off"]).status.success());

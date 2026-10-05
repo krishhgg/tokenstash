@@ -771,15 +771,17 @@ pub fn init(a: InitArgs) -> Result<i32> {
     // 2. trust: nothing is inferred and nothing is added. The first time a directory asks
     // for stored keys the human approves exactly which ones; that is the whole model.
     // The mode and the MCP choice are remembered here too, so a later plain `init` keeps them.
-    let switched = !fresh && mode != cfg.agent_mode;
-    let mcp = if a.mcp { true } else if a.no_mcp || mode == AgentMode::Explicit { false } else { cfg.mcp };
+    // Only what this command line chose is written. The rest is read again under the lock,
+    // so a mode or MCP card the person confirmed while init probed the stash stands.
+    let before = cfg.agent_mode;
     let pinned = cfg.stash_backend.clone();
     cfg = Config::update(|c| {
         if c.stash_backend.is_none() { c.stash_backend = pinned; }
-        c.agent_mode = mode;
-        c.mcp = mcp;
+        choose(c, a.mode, a.mcp, a.no_mcp)?;
         Ok(c.clone())
     })?;
+    let mode = cfg.agent_mode;
+    let switched = !fresh && mode != before;
     tokenstash_core::Db::open_default()?;
     if !a.trust.is_empty() {
         println!("! --trust is retired: directories are not trusted by folder any more. The first stored key a directory asks for shows you one card; approve it and those keys are silent there.");
@@ -868,6 +870,17 @@ fn request_choice(a: &InitArgs) -> Result<i32> {
         code = crate::cmd::actions::request(&app, &project, &agent, action, a.why.clone())?;
     }
     Ok(code)
+}
+
+/// What `init`'s flags change in the config as it is now: the mode only with `--mode`, the
+/// MCP choice only with `--mcp` or `--no-mcp` (or explicit mode, which has no server).
+fn choose(c: &mut Config, mode: Option<Mode>, mcp: bool, no_mcp: bool) -> Result<()> {
+    if let Some(m) = mode { c.agent_mode = m.into(); }
+    if mcp && c.agent_mode == AgentMode::Explicit {
+        anyhow::bail!("explicit mode has no MCP server: with one registered, the agent calls tokenstash on its own. Use `tokenstash init --mode auto --mcp`, or leave out --mcp");
+    }
+    if mcp { c.mcp = true; } else if no_mcp || c.agent_mode == AgentMode::Explicit { c.mcp = false; }
+    Ok(())
 }
 
 /// What a confirmed action card changes: the mode or the MCP server. The person decided on
@@ -1758,5 +1771,20 @@ mod tests {
             assert_eq!(effectively_empty(&t), empty, "{text:?}");
         }
         assert!(effectively_empty(&d.join("missing.json")));
+    }
+
+    /// Greptile on #69: a plain `init` keeps the mode and MCP choice the config holds now,
+    /// so a card the person confirmed while init ran is not undone.
+    #[test]
+    fn a_plain_init_keeps_the_choices_the_config_holds() {
+        let mut c = Config { agent_mode: AgentMode::Explicit, ..Config::default() };
+        choose(&mut c, None, false, false).unwrap();
+        assert_eq!(c.agent_mode, AgentMode::Explicit);
+        let mut c = Config { mcp: true, ..Config::default() };
+        choose(&mut c, None, false, false).unwrap();
+        assert!(c.mcp);
+        choose(&mut c, Some(Mode::Explicit), false, false).unwrap();
+        assert!(c.agent_mode == AgentMode::Explicit && !c.mcp, "explicit mode has no server");
+        assert!(choose(&mut c, None, true, false).is_err(), "no server in explicit mode");
     }
 }
