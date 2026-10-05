@@ -62,11 +62,23 @@ pub trait Stash {
     fn get(&self, key: &str) -> Result<Option<SecretString>>;
     fn set(&self, key: &str, value: &SecretString) -> Result<()>;
     fn delete(&self, key: &str) -> Result<bool>;
-    /// Among `keys`, the ones with a copy this backend cannot keep up to date, each with what
-    /// was found. `doctor` shows them.
-    fn stray_copies(&self, _keys: &[String]) -> Vec<String> {
+    /// Among `keys`, the ones with a copy this backend cannot keep up to date. `doctor` shows
+    /// them.
+    fn stray_copies(&self, _keys: &[String]) -> Vec<StrayCopy> {
         vec![]
     }
+}
+
+/// A key with a copy its backend cannot keep up to date (see [`Stash::stray_copies`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrayCopy {
+    /// `NAME@identity`.
+    pub key: String,
+    /// The two places a read looks hold different values, so a read can return the old one.
+    pub differs: bool,
+    /// Live copies that only other login sessions hold. They matter only while an older
+    /// tokenstash runs in one of those sessions.
+    pub elsewhere: usize,
 }
 
 /// Stash key format: `NAME@identity`. Decided day one so identities never need a migration.
@@ -481,22 +493,13 @@ impl Stash for KernelKeyring {
             Ok(!copies.is_empty())
         })
     }
-    fn stray_copies(&self, keys: &[String]) -> Vec<String> {
+    fn stray_copies(&self, keys: &[String]) -> Vec<StrayCopy> {
         let Ok(user) = kernel::user() else { return vec![] };
         let persistent = kernel::persistent();
         keys.iter()
             .filter_map(|key| {
                 let (differs, elsewhere) = kernel::strays(&user, persistent.as_ref(), &kernel::description(key)).ok()?;
-                let mut found = vec![];
-                if differs {
-                    found.push("the user keyring and the persistent keyring hold different values".to_string());
-                }
-                match elsewhere {
-                    0 => {}
-                    1 => found.push("1 copy in another login session".into()),
-                    n => found.push(format!("{n} copies in other login sessions")),
-                }
-                (!found.is_empty()).then(|| format!("{key}: {}", found.join(", ")))
+                (differs || elsewhere > 0).then(|| StrayCopy { key: key.clone(), differs, elsewhere })
             })
             .collect()
     }
@@ -809,10 +812,12 @@ mod kernel_tests {
         let persistent = KeyRing::get_persistent(KeyRingIdentifier::Session).unwrap();
         assert_ne!(user.search(&desc).unwrap(), persistent.search(&desc).unwrap(), "the setup must reproduce the old process's link");
 
-        assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![format!("{key}: the user keyring and the persistent keyring hold different values")]);
+        assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![StrayCopy { key: key.into(), differs: true, elsewhere: 0 }]);
         assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-current-value"));
         assert_eq!(persistent.search(&desc).unwrap(), user.search(&desc).unwrap(), "the read linked the user keyring's key into the persistent keyring again");
-        assert!(KernelKeyring.stray_copies(&[key.to_string()]).iter().all(|s| !s.contains("different values")));
+        // The old copy may still count as held elsewhere until the kernel collects the dead
+        // session keyring that linked it, but the two keyrings agree again.
+        assert!(KernelKeyring.stray_copies(&[key.to_string()]).iter().all(|c| !c.differs));
         println!("{RAN}");
     }
 
@@ -841,7 +846,7 @@ mod kernel_tests {
         KernelKeyring.set(key, &SecretString::from("sk-current-value")).unwrap();
         assert!(KernelKeyring.stray_copies(&[key.to_string()]).is_empty(), "one object, linked into both keyrings");
         while_another_session_holds(NAME, || {
-            assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![format!("{key}: 1 copy in another login session")]);
+            assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![StrayCopy { key: key.into(), differs: false, elsewhere: 1 }]);
             // It is not the key read here.
             assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-current-value"));
         });

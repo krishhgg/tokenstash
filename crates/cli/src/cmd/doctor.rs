@@ -32,10 +32,21 @@ pub fn doctor() -> Result<i32> {
                 .map(|v| v.iter().map(|m| tokenstash_core::stash::stash_key(&m.name, &m.identity)).collect())
                 .unwrap_or_default();
             let strays = s.stray_copies(&keys);
-            if !strays.is_empty() {
+            // Two keyrings that disagree are a fault, because a read can return the old key now.
+            let differ: Vec<&str> = strays.iter().filter(|c| c.differs).map(|c| c.key.as_str()).collect();
+            if !differ.is_empty() {
                 ok &= check("older copies", false, format!(
-                    "{}. tokenstash 0.3.0 and earlier keep a copy of a key in each login session they ran in, and one still running there (an inbox or `tokenstash mcp` started before the upgrade) can put an old value back. Stop it; its copies go when that session ends. If the old key is the one in use, replace it with `tokenstash rotate NAME`",
-                    strays.join("; ")
+                    "the user keyring and the persistent keyring hold different values for {}, so a read can return the old key. tokenstash 0.3.0 or earlier, still running in another login session (an inbox or `tokenstash mcp` started before the upgrade), put the other value there. Stop it, then replace the key with `tokenstash rotate NAME` if the old one is in use",
+                    differ.join(", ")
+                ));
+            }
+            // A copy only another session holds is a note. It does nothing until an older
+            // tokenstash runs there, and an upgrade leaves idle sessions holding them.
+            let held: Vec<&str> = strays.iter().filter(|c| c.elsewhere > 0).map(|c| c.key.as_str()).collect();
+            if !held.is_empty() {
+                check("older copies", true, format!(
+                    "other login sessions hold their own copy of {}, left by tokenstash 0.3.0 or earlier. It matters only while an older tokenstash still runs in one of them (an inbox or `tokenstash mcp` started before the upgrade), because it could put the old key back. Stop it, or end that session",
+                    held.join(", ")
                 ));
             }
         }
