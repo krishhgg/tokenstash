@@ -210,3 +210,20 @@ fn init_registers_the_mcp_server_only_for_a_person() {
     assert!(out.status.success());
     assert!(!String::from_utf8_lossy(&out.stdout).contains("skill installed") && !user_home.join(".agents").exists());
 }
+
+/// Greptile on #68: a checkout re-created at the same path does not show the old one's
+/// history to its agent, before or after it pairs again.
+#[test]
+fn a_recreated_checkout_does_not_read_the_old_ones_audit() {
+    let home = home("recreated");
+    let proj = tmp("recreated-proj");
+    assert_eq!(run(&home, &proj, &["need", "OPENAI_API_KEY"]).status.code(), Some(10));
+    let card = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "OPENAI_API_KEY").unwrap();
+    paste(&home, &proj, card["id"].as_str().unwrap(), "sk-proj-oldcheckout0123456789abcdef");
+    assert!(String::from_utf8_lossy(&run(&home, &proj, &["audit", "--json"]).stdout).contains("OPENAI_API_KEY"));
+    std::fs::remove_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(proj.join("other")).unwrap();
+    let audit = String::from_utf8_lossy(&run(&home, &proj, &["audit", "--json"]).stdout).into_owned();
+    assert!(!audit.contains("OPENAI_API_KEY"), "{audit}");
+}
+

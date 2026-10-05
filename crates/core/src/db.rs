@@ -819,6 +819,12 @@ impl Db {
                 if card.is_some() || ts >= in_flight {
                     return Ok(None);
                 }
+                // A process that filed its card and stopped before naming it: the card is
+                // the proof, so the ask is spent, not left behind.
+                if let Some(tid) = self.card_since_reservation(id, project, name)? {
+                    self.bind_force(id, &tid)?;
+                    return Ok(None);
+                }
                 self.conn.execute("DELETE FROM audit WHERE id=?1", params![id])?;
             }
             self.audit(Some(project), Some(agent), "need.force", Some(name), None, None)?;

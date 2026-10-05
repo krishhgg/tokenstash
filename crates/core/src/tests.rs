@@ -3601,6 +3601,12 @@ fn the_extra_ask_is_spent_on_its_card_and_recovered_when_none_was_filed() {
     db.conn.execute("UPDATE audit SET ts='2000-01-01T00:00:00Z' WHERE id=?1", rusqlite::params![row]).unwrap();
     let old = cfg.ttl_since().replace(&cfg.ttl_since()[..4], "1999");
     let row = db.reserve_force(&pid, "agent", "GROQ_API_KEY", &old).unwrap().expect("a reservation left behind is taken back");
+    // A card filed under a reservation that a stopped process never named still spends it.
+    let stray = tasks::create_secret_task(&ctx, &proj, "agent", "RESEND_API_KEY", "default", &tasks::SecretRequest::default()).unwrap();
+    let r2 = db.reserve_force(&pid, "agent", "RESEND_API_KEY", &old).unwrap().unwrap();
+    db.conn.execute("UPDATE tasks SET created='2001-01-01T00:00:00Z' WHERE id=?1", rusqlite::params![stray.id]).unwrap();
+    db.conn.execute("UPDATE audit SET ts='2000-06-01T00:00:00Z' WHERE id=?1", rusqlite::params![r2]).unwrap();
+    assert!(db.reserve_force(&pid, "agent", "RESEND_API_KEY", &old).unwrap().is_none(), "the card filed under it proves the ask was used");
     // Spent on the card it filed: no more asks in the window.
     let card = tasks::create_secret_task(&ctx, &proj, "agent", "GROQ_API_KEY", "default", &tasks::SecretRequest::default()).unwrap();
     assert_eq!(db.card_since_reservation(row, &pid, "GROQ_API_KEY").unwrap(), Some(card.id.clone()));
