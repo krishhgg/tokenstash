@@ -501,10 +501,11 @@ fn sweep_where(app: &App, probe: Probe, select: &dyn Fn(&tokenstash_core::db::Se
                 Ok(format!("REJECTED (HTTP {code}) → stale"))
             })?,
             // Nothing to record, so no lock. A plain re-read still keeps the old key's answer
-            // off the row of a key stored while the request was out.
-            Liveness::Unknown(e) => match app.stash.get(&stash_key(&m.name, &m.identity))? {
-                Some(now) if now.expose_secret() == v.expose_secret() => format!("unknown ({})", e.chars().take(40).collect::<String>()),
-                _ => REPLACED_DURING_CHECK.to_string(),
+            // off the row of a key stored while the request was out. A re-read that fails
+            // cannot tell, so the row keeps the provider's answer and the check goes on.
+            Liveness::Unknown(e) => match app.stash.get(&stash_key(&m.name, &m.identity)) {
+                Ok(now) if now.as_ref().map(|n| n.expose_secret()) != Some(v.expose_secret()) => REPLACED_DURING_CHECK.to_string(),
+                _ => format!("unknown ({})", e.chars().take(40).collect::<String>()),
             },
         };
         let stale_now = app.db.get_secret(&m.name, &m.identity)?.map(|x| x.stale).unwrap_or(false);
@@ -607,6 +608,41 @@ mod tests {
         };
         let rows = sweep_where(&app, Probe::Stub(&unreachable), &|_| true, false).unwrap();
         assert_eq!(rows[0].2, REPLACED_DURING_CHECK, "{rows:?}");
+        done(&home);
+    }
+
+    /// The file stash, with every second read failing: the keyring went away between the
+    /// read the probe used and the re-read for the report.
+    struct RereadFails { inner: FileStash, reads: std::cell::Cell<u32> }
+
+    impl Stash for RereadFails {
+        fn backend(&self) -> &'static str { "reread-fails" }
+        fn get(&self, key: &str) -> Result<Option<SecretString>> {
+            let n = self.reads.get();
+            self.reads.set(n + 1);
+            if n % 2 == 1 {
+                bail!("the keyring is unavailable");
+            }
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &SecretString) -> Result<()> { self.inner.set(key, value) }
+        fn delete(&self, key: &str) -> Result<bool> { self.inner.delete(key) }
+    }
+
+    /// The re-read behind an Unknown only decides how the row reads. When it fails, `check`
+    /// cannot tell whether the key changed, so it reports the provider's answer for that key
+    /// and goes on to the next one.
+    #[test]
+    fn a_failed_reread_after_an_unknown_does_not_stop_the_check() {
+        let _g = crate::inbox_auth::env_lock();
+        let (app, home) = app_with_key("reread-fails", "sk-live-aaaaaaaaaaaaaaaaaaaa");
+        app.stash.set(&stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_live_bbbbbbbbbbbbbbbbbbbb".to_string())).unwrap();
+        app.db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+        let app = App { stash: Box::new(RereadFails { inner: FileStash::new().unwrap(), reads: std::cell::Cell::new(0) }), ..app };
+        let unknown = |_: &registry::Check| Liveness::Unknown("HTTP 503".into());
+        let rows = sweep_where(&app, Probe::Stub(&unknown), &|_| true, false).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r.2 == "unknown (HTTP 503)"), "{rows:?}");
         done(&home);
     }
 }
