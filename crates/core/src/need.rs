@@ -19,16 +19,30 @@ pub struct NeedOpts {
     pub identity: Option<String>,
     pub blocking: bool,
     pub timeout: Duration,
-    /// Ask again even if the user recently denied this key for this project.
+    /// Ask again even if the user recently denied this key for this project. This is the
+    /// person's own `need --force`, and it sets every recent "no" aside.
     pub force: bool,
     /// Never inject silently: route every hit through a fresh approval task, even if this
     /// project was approved before. Used when the request was derived from untrusted input
     /// (a program's output in `run`) — each invocation needs its own human yes.
     pub require_approval: bool,
-    /// An agent asking again after the person said no (`need --force` from an agent). With
-    /// `force`, a denied key gets a fresh card, and never arrives on the strength of a broad
-    /// grant or an on-disk match: those decided about the directory before the no.
-    pub ask_again: bool,
+    /// Keys an agent asks for again after the person said no (`need --force` from an agent),
+    /// as `NAME@identity`, each holding the one extra ask reserved for it. Only the "no" to a
+    /// listed key is set aside. Any other key keeps its denials, including one that lands
+    /// while this request runs. A listed key gets a fresh card that says it is a second ask,
+    /// and never arrives on the strength of a grant, because the grant came before the no.
+    pub ask_again: Vec<String>,
+}
+
+impl NeedOpts {
+    /// Is this `NAME@identity` asked for again after a no?
+    fn asks_again(&self, entry: &str) -> bool {
+        self.ask_again.iter().any(|e| e == entry)
+    }
+    /// Is a recent "no" to this `NAME@identity` set aside for this request?
+    fn forced(&self, entry: &str) -> bool {
+        self.force || self.asks_again(entry)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,16 +136,12 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 anyhow::bail!("{i:?} is not an identity (letters, digits, dot, dash and underscore, up to 64 characters)");
             }
         }
-        // A generated secret is this directory's own signing key and nothing else's. The
-        // caller does not get to choose its identity: `identity: "default"` from project B
-        // would hit the value an older tokenstash stored for project A under the shared
-        // label, and a broad grant would deliver A's key to B without a card. The binding
-        // is ignored for the same reason.
-        let identity = if provider.and_then(|p| p.generate.as_deref()).is_some() {
-            project_identity(project)
-        } else {
-            opts.identity.clone().or(ctx.db.binding(&ws.id, name)?).unwrap_or_else(|| "default".into())
-        };
+        let identity = identity_for(ctx, project, Some(&ws), name, opts.identity.as_deref())?;
+        // The person's own --force sets any recent "no" aside; an agent's sets aside only the
+        // "no" to a key it holds the extra ask for.
+        let entry = format!("{name}@{identity}");
+        let again = opts.asks_again(&entry);
+        let force = opts.forced(&entry);
         // When this read finds a generated key missing or stale, the store that follows
         // looks for a store recorded after this mark (`tasks::store_generated`).
         let read_mark = ctx.db.audit_mark()?;
@@ -210,7 +220,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 // Asked again after a no: the person answers a card again, whatever grant
                 // opened the gate before the no, an exact one included (a grant outlives
                 // `forget`, and the key may since have been stored from another directory).
-                Gate::Open { .. } if opts.ask_again && denied_now(ctx)? => Gate::NeedsApproval { reason: if sensitive { GateReason::Sensitive } else { GateReason::Pairing } },
+                Gate::Open { .. } if again && denied_now(ctx)? => Gate::NeedsApproval { reason: if sensitive { GateReason::Sensitive } else { GateReason::Pairing } },
                 Gate::Open { source } if source == crate::db::GRANT_BROAD || source == crate::db::GRANT_ON_DISK => {
                     let since = ctx.cfg.ttl_since();
                     // Both kinds of "no" count: a refused paste card and a refused pairing or
@@ -222,7 +232,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                         None => denied_card_for(ctx, &pid, &format!("{name}@{identity}"), &since)?,
                     };
                     match denied {
-                        Some(tid) if !opts.force => {
+                        Some(tid) if !force => {
                             ctx.db.audit(Some(&pid), Some(agent), "deny.honored", Some(name), Some(&identity), Some("a broad grant does not overrule a denial for this key here"))?;
                             outcomes.push(Outcome::Denied { name: name.clone(), task_id: tid });
                             continue;
@@ -289,14 +299,17 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
         }
 
         // Honor a recent refusal: "denied — do not ask again" must actually mean that.
-        if !opts.force {
+        if !force {
             let since = ctx.cfg.ttl_since();
             if let Some(d) = ctx.db.recent_denial(&pid, name, &identity, &since)? {
                 outcomes.push(Outcome::Denied { name: name.clone(), task_id: d.id });
                 continue;
             }
         }
-        let t = tasks::create_secret_task(ctx, project, agent, name, &identity, &opts.req)?;
+        // Only the key asked for again says so on its card; the others in the same request
+        // were never declined.
+        let req = if again { asked_again(&opts.req, agent) } else { opts.req.clone() };
+        let t = tasks::create_secret_task(ctx, project, agent, name, &identity, &req)?;
         outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: t.id, title: t.title, url: t.url });
     }
 
@@ -318,7 +331,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                     continue;
                 }
                 for g in entries {
-                    if denied_entries.iter().any(|(e, _)| e == g) {
+                    if opts.asks_again(g) || denied_entries.iter().any(|(e, _)| e == g) {
                         continue;
                     }
                     let name_only = tasks::split_identity(g).0.to_string();
@@ -487,17 +500,48 @@ pub(crate) fn adoptable(project: &Path, env_file: &str, name: &str) -> Option<Se
     Some(v)
 }
 
+/// The identity `need` uses for `name` in the canonical `project`. That is the one asked for,
+/// else the directory's binding, else `default`, and for a generated secret the directory's
+/// own label.
+///
+/// A generated secret is this directory's own signing key and nothing else's. The caller
+/// does not get to choose its identity: `identity: "default"` from project B would hit the
+/// value an older tokenstash stored for project A under the shared label, and a broad grant
+/// would deliver A's key to B without a card. The binding is ignored for the same reason.
+fn identity_for(ctx: &Ctx, project: &Path, ws: Option<&crate::db::Workspace>, name: &str, asked: Option<&str>) -> Result<String> {
+    if registry::lookup(name).and_then(|p| p.generate.as_deref()).is_some() {
+        return Ok(project_identity(project));
+    }
+    if let Some(i) = asked {
+        return Ok(i.to_string());
+    }
+    let bound = match ws { Some(ws) => ctx.db.binding(&ws.id, name)?, None => None };
+    Ok(bound.unwrap_or_else(|| "default".into()))
+}
+
 /// Has the person said no to `name` for this project within the TTL: a declined paste card,
-/// or a declined pairing or sensitive card that named it? The identity is resolved the way
-/// `need` resolves it (the one given, else the project's binding, else `default`). An agent
-/// asking again (`need --force`) counts as a second ask only after a no.
-pub fn denied_here(ctx: &Ctx, project: &Path, name: &str, identity: Option<&str>) -> Result<bool> {
-    let Ok(project) = project.canonicalize() else { return Ok(false) };
+/// or a declined pairing or sensitive card that named it? Returns the identity that was
+/// declined, resolved the way `need` resolves it, or `None` when there was no "no". An agent
+/// asking again (`need --force`) counts as a second ask only after a no, and only for that
+/// identity.
+pub fn denied_here(ctx: &Ctx, project: &Path, name: &str, identity: Option<&str>) -> Result<Option<String>> {
+    let Ok(project) = project.canonicalize() else { return Ok(None) };
     let pid = project.to_string_lossy().to_string();
-    let bound = match ctx.db.find_workspace(&project)? { Some(ws) => ctx.db.binding(&ws.id, name)?, None => None };
-    let identity = identity.map(String::from).or(bound).unwrap_or_else(|| "default".into());
+    let ws = ctx.db.find_workspace(&project)?;
+    let identity = identity_for(ctx, &project, ws.as_ref(), name, identity)?;
     let since = ctx.cfg.ttl_since();
-    Ok(ctx.db.recent_denial(&pid, name, &identity, &since)?.is_some() || denied_card_for(ctx, &pid, &format!("{name}@{identity}"), &since)?.is_some())
+    let denied = ctx.db.recent_denial(&pid, name, &identity, &since)?.is_some() || denied_card_for(ctx, &pid, &format!("{name}@{identity}"), &since)?.is_some();
+    Ok(denied.then_some(identity))
+}
+
+/// The request for a key asked for again after a no. Its card says so first.
+fn asked_again(req: &SecretRequest, agent: &str) -> SecretRequest {
+    let note = format!("Asked again after you declined, because you asked {agent} to.");
+    let why = match &req.why {
+        Some(w) => format!("{note} {w}"),
+        None => note,
+    };
+    SecretRequest { why: Some(why), ..req.clone() }
 }
 
 /// A denied pairing or sensitive card within the TTL that named this entry. A denied
@@ -707,7 +751,7 @@ fn replacement(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
             return Ok(Outcome::Injected { name: name.into(), identity: identity.into(), written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated, unverified: false });
         }
     }
-    if !opts.force {
+    if !opts.forced(&format!("{name}@{identity}")) {
         let since = ctx.cfg.ttl_since();
         if let Some(d) = ctx.db.recent_denial(&pid, name, identity, &since)? {
             return Ok(Outcome::Denied { name: name.into(), task_id: d.id });

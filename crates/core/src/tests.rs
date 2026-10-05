@@ -4090,7 +4090,7 @@ fn asking_again_after_a_no_files_a_card_even_under_a_broad_grant() {
     let name = ["GROQ_API_KEY".to_string()];
     let plain = need::need(&ctx, &proj, "agent", &name, &need::NeedOpts::default()).unwrap();
     assert!(matches!(plain[0], need::Outcome::Denied { .. }), "{plain:?}");
-    let again = need::need(&ctx, &proj, "agent", &name, &need::NeedOpts { force: true, ask_again: true, ..Default::default() }).unwrap();
+    let again = need::need(&ctx, &proj, "agent", &name, &need::NeedOpts { ask_again: vec!["GROQ_API_KEY@default".into()], ..Default::default() }).unwrap();
     assert!(matches!(again[0], need::Outcome::Pending { .. }), "a card, not the key: {again:?}");
     assert!(!crate::envfile::has(&proj, ".env.local", "GROQ_API_KEY"), "nothing written");
     let person = need::need(&ctx, &proj, "human", &name, &need::NeedOpts { force: true, ..Default::default() }).unwrap();
@@ -4174,7 +4174,7 @@ fn asking_again_files_a_card_even_with_an_exact_grant() {
     // Stored since, from another directory.
     stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_storedelsewhere_0123456789".to_string())).unwrap();
     db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: Some("Groq".into()), sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
-    let again = need::need(&ctx, &proj, "agent", &["GROQ_API_KEY".to_string()], &need::NeedOpts { force: true, ask_again: true, ..Default::default() }).unwrap();
+    let again = need::need(&ctx, &proj, "agent", &["GROQ_API_KEY".to_string()], &need::NeedOpts { ask_again: vec!["GROQ_API_KEY@default".into()], ..Default::default() }).unwrap();
     assert!(matches!(again[0], need::Outcome::Pending { .. }), "{again:?}");
     assert!(!crate::envfile::has(&proj, ".env.local", "GROQ_API_KEY"));
 }
@@ -4195,33 +4195,113 @@ fn the_extra_ask_is_spent_on_its_card_and_recovered_when_none_was_filed() {
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let since = cfg.ttl_since();
-    let row = db.reserve_force(&pid, "agent", "GROQ_API_KEY", &since).unwrap().expect("the first ask is free");
-    assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", &since).unwrap().is_none(), "one in flight holds it");
+    let row = db.reserve_force(&pid, "agent", "GROQ_API_KEY", "default", &since).unwrap().expect("the first ask is free");
+    assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", "default", &since).unwrap().is_none(), "one in flight holds it");
     // The process stopped before filing anything: a minute on, the ask comes back.
     db.conn.execute("UPDATE audit SET ts='2000-01-01T00:00:00Z' WHERE id=?1", rusqlite::params![row]).unwrap();
     let old = cfg.ttl_since().replace(&cfg.ttl_since()[..4], "1999");
-    let row = db.reserve_force(&pid, "agent", "GROQ_API_KEY", &old).unwrap().expect("a reservation left behind is taken back");
+    let row = db.reserve_force(&pid, "agent", "GROQ_API_KEY", "default", &old).unwrap().expect("a reservation left behind is taken back");
     // A card filed under a reservation that a stopped process never named still spends it...
     let filed = tasks::create_secret_task(&ctx, &proj, "agent", "RESEND_API_KEY", "default", &tasks::SecretRequest::default()).unwrap();
-    let r2 = db.reserve_force(&pid, "agent", "RESEND_API_KEY", &old).unwrap().unwrap();
+    let r2 = db.reserve_force(&pid, "agent", "RESEND_API_KEY", "default", &old).unwrap().unwrap();
     db.conn.execute("UPDATE audit SET ts='2000-06-01T00:00:00Z' WHERE id=?1", rusqlite::params![r2]).unwrap();
     db.conn.execute("UPDATE tasks SET created='2000-06-01T00:00:20Z' WHERE id=?1", rusqlite::params![filed.id]).unwrap();
-    assert!(db.reserve_force(&pid, "agent", "RESEND_API_KEY", &old).unwrap().is_none(), "the card filed under it proves the ask was used");
+    assert!(db.reserve_force(&pid, "agent", "RESEND_API_KEY", "default", &old).unwrap().is_none(), "the card filed under it proves the ask was used");
     // ...but a later card from another request, or another agent, does not.
-    let r3 = db.reserve_force(&pid, "agent", "STRIPE_SECRET_KEY", &old).unwrap().unwrap();
+    let r3 = db.reserve_force(&pid, "agent", "STRIPE_SECRET_KEY", "default", &old).unwrap().unwrap();
     db.conn.execute("UPDATE audit SET ts='2000-06-01T00:00:00Z' WHERE id=?1", rusqlite::params![r3]).unwrap();
     let later = tasks::create_secret_task(&ctx, &proj, "agent", "STRIPE_SECRET_KEY", "default", &tasks::SecretRequest::default()).unwrap();
     db.conn.execute("UPDATE tasks SET created='2000-06-01T00:05:00Z' WHERE id=?1", rusqlite::params![later.id]).unwrap();
     let other = tasks::create_secret_task(&ctx, &proj, "someone-else", "STRIPE_SECRET_KEY", "work", &tasks::SecretRequest::default()).unwrap();
     db.conn.execute("UPDATE tasks SET created='2000-06-01T00:00:10Z' WHERE id=?1", rusqlite::params![other.id]).unwrap();
     assert_eq!(db.card_since_reservation(r3, &pid, "STRIPE_SECRET_KEY").unwrap(), None);
-    assert!(db.reserve_force(&pid, "agent", "STRIPE_SECRET_KEY", &old).unwrap().is_some(), "an ask that never reached the user comes back");
+    assert!(db.reserve_force(&pid, "agent", "STRIPE_SECRET_KEY", "default", &old).unwrap().is_some(), "an ask that never reached the user comes back");
     // Spent on the card it filed: no more asks in the window.
     let card = tasks::create_secret_task(&ctx, &proj, "agent", "GROQ_API_KEY", "default", &tasks::SecretRequest::default()).unwrap();
     assert_eq!(db.card_since_reservation(row, &pid, "GROQ_API_KEY").unwrap(), Some(card.id.clone()));
     db.bind_force(row, &card.id).unwrap();
     db.conn.execute("UPDATE audit SET ts='2000-01-01T00:00:01Z' WHERE id=?1", rusqlite::params![row]).unwrap();
-    assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", &old).unwrap().is_none(), "a spent ask stays spent however old");
+    assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", "default", &old).unwrap().is_none(), "a spent ask stays spent however old");
+}
+
+/// Greptile on #63: an agent's `need --force` sets aside only the "no" to a key it holds the
+/// extra ask for. Every other key keeps its denial, including one the person gave after the
+/// CLI looked. A broad grant from before that "no" does not deliver it, a missing key gets no
+/// new card, and a declined sensitive card is not filed again.
+#[test]
+fn an_agents_force_sets_aside_only_the_no_it_holds_the_ask_for() {
+    let _env = env_lock();
+    let home = tmp("force-scope-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("force-scope-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    for (name, value, sensitive) in [("GROQ_API_KEY", "gsk_forcescope_0123456789", false), ("MISTRAL_API_KEY", "mistral_forcescope_0123456789", false), ("TWILIO_AUTH_TOKEN", "twilio_forcescope_0123456789", true)] {
+        stash.set(&stash::stash_key(name, "default"), &SecretString::from(value.to_string())).unwrap();
+        db.upsert_secret(&db::SecretMeta { name: name.into(), identity: "default".into(), provider: None, sensitive, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+    }
+    let ws = db.workspace_for(&proj).unwrap();
+    db.grant(&ws.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    // The person declined each key here. GROQ_API_KEY was declined before the agent looked,
+    // so the agent holds the extra ask for it; the others were declined after.
+    for name in ["GROQ_API_KEY", "MISTRAL_API_KEY", "RESEND_API_KEY"] {
+        let t = tasks::create_secret_task(&ctx, &proj, "agent", name, "default", &tasks::SecretRequest::default()).unwrap();
+        tasks::deny(&ctx, &t, None).unwrap();
+    }
+    let sensitive = tasks::create_approval_task(&ctx, &proj, "agent", &["TWILIO_AUTH_TOKEN@default".to_string()], tasks::ApprovalKind::Sensitive).unwrap();
+    tasks::deny(&ctx, &sensitive, None).unwrap();
+    let names: Vec<String> = ["GROQ_API_KEY", "MISTRAL_API_KEY", "RESEND_API_KEY", "TWILIO_AUTH_TOKEN"].iter().map(|s| s.to_string()).collect();
+    let opts = need::NeedOpts { ask_again: vec!["GROQ_API_KEY@default".into()], ..Default::default() };
+    let out = need::need(&ctx, &proj, "agent", &names, &opts).unwrap();
+    let need::Outcome::Pending { task_id, .. } = &out[0] else { panic!("the key asked for again gets a card: {out:?}") };
+    assert_eq!(db.get_task(task_id).unwrap().unwrap().names, vec!["GROQ_API_KEY@default".to_string()], "the card asks for that key alone");
+    for o in &out[1..] {
+        assert!(matches!(o, need::Outcome::Denied { .. }), "the newer no stands: {out:?}");
+    }
+    assert!(!crate::envfile::has(&proj, ".env.local", "MISTRAL_API_KEY"), "the broad grant delivered nothing");
+    assert_eq!(db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().iter().filter(|t| t.status == db::TaskStatus::Pending).count(), 1, "one card, for the key asked again");
+}
+
+/// Greptile on #67: the extra ask after a no is reserved per identity. The person declines
+/// each identity of a key on its own card, so asking again for one leaves the other's ask, and
+/// only a card for the reservation's own identity spends it. A reservation written before
+/// identities were recorded still counts for every identity of the key.
+#[test]
+fn the_extra_ask_is_reserved_per_identity() {
+    let _env = env_lock();
+    let home = tmp("force-identity-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("force-identity-proj").canonicalize().unwrap();
+    let pid = proj.to_string_lossy().to_string();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let since = cfg.ttl_since();
+    let work = db.reserve_force(&pid, "agent", "GROQ_API_KEY", "work", &since).unwrap().expect("work's ask");
+    let personal = db.reserve_force(&pid, "agent", "GROQ_API_KEY", "personal", &since).unwrap().expect("personal keeps its own ask");
+    assert!(db.reserve_force(&pid, "agent", "GROQ_API_KEY", "work", &since).unwrap().is_none(), "work's is taken");
+    // A card for one identity is not the card the other's reservation filed.
+    let paste = tasks::create_secret_task(&ctx, &proj, "agent", "GROQ_API_KEY", "personal", &tasks::SecretRequest::default()).unwrap();
+    assert_eq!(db.card_since_reservation(work, &pid, "GROQ_API_KEY").unwrap(), None);
+    assert_eq!(db.card_since_reservation(personal, &pid, "GROQ_API_KEY").unwrap(), Some(paste.id.clone()));
+    let approval = tasks::create_approval_task(&ctx, &proj, "agent", &["GROQ_API_KEY@work".to_string()], tasks::ApprovalKind::Pairing).unwrap();
+    assert_eq!(db.card_since_reservation(work, &pid, "GROQ_API_KEY").unwrap(), Some(approval.id.clone()));
+    db.bind_force(personal, &paste.id).unwrap();
+    assert_eq!(db.force_card(&pid, "GROQ_API_KEY", "personal", &since).unwrap(), Some(paste.id.clone()));
+    assert_eq!(db.force_card(&pid, "GROQ_API_KEY", "work", &since).unwrap(), None, "work's ask is not spent yet");
+    db.conn.execute(
+        "INSERT INTO audit (ts, project, agent, action, name, identity, detail) VALUES (?1, ?2, 'agent', 'need.force', 'MISTRAL_API_KEY', NULL, 't_legacy')",
+        rusqlite::params![now(), pid],
+    ).unwrap();
+    for identity in ["default", "work"] {
+        assert!(db.reserve_force(&pid, "agent", "MISTRAL_API_KEY", identity, &since).unwrap().is_none(), "{identity}");
+        assert_eq!(db.force_card(&pid, "MISTRAL_API_KEY", identity, &since).unwrap().as_deref(), Some("t_legacy"));
+    }
 }
 
 

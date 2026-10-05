@@ -95,7 +95,7 @@ Some commands act for the user. Run them only when the user asks, and pass `--wh
 | Replace a key that still works | `tokenstash rotate NAME` |
 | Delete a stored key | `tokenstash forget NAME` |
 | Always use another identity for a key in this project | `tokenstash bind NAME --identity work` |
-| Ask again for a key they declined | `tokenstash need NAME --force` (once per key until the "no" expires) |
+| Ask again for a key they declined | `tokenstash need NAME --force` (once per key and identity until the "no" expires) |
 | Stop agents loading this skill on their own, or let them again | `tokenstash init --mode explicit`, `tokenstash init --mode auto` |
 | Register or remove the MCP server | `tokenstash init --mcp`, `tokenstash init --no-mcp` |
 | Take tokenstash out of their agents | `tokenstash init --undo` |

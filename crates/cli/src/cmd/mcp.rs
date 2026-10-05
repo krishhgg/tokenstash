@@ -418,7 +418,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             for s in &specs {
                 let opts = NeedOpts {
                     req: SecretRequest { why: s.why.clone(), url: s.url.clone(), steps: s.steps.clone(), pattern: s.pattern.clone() },
-                    identity: s.identity.clone(), blocking: false, timeout, force: false, require_approval: false, ask_again: false,
+                    identity: s.identity.clone(), blocking: false, timeout, force: false, require_approval: false, ask_again: vec![],
                 };
                 results.extend(need::need_with_budget(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts, &mut budget)?);
             }

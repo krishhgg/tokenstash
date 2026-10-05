@@ -826,16 +826,20 @@ impl Db {
         )? == 1)
     }
 
-    /// Reserve the one extra ask after a no (`need --force` from an agent) for (project, name),
-    /// in one step. A reservation is spent once it names the card it filed ([`bind_force`]).
-    /// One that names none is an ask still being filed for a minute, then one a stopped process
-    /// left behind, which is taken back here. The row id when this caller got the ask.
-    pub fn reserve_force(&self, project: &str, agent: &str, name: &str, since: &str) -> Result<Option<i64>> {
+    /// Reserve the one extra ask after a no (`need --force` from an agent) for (project, name,
+    /// identity), in one step. The person declines each identity of a key on its own card, so
+    /// each identity has its own ask. A reservation is spent once it names the card it filed ([`bind_force`]). One that names
+    /// none is an ask still being filed for a minute, then one a stopped process left behind,
+    /// which is taken back here. The row id when this caller got the ask.
+    ///
+    /// A row with no identity was written before reservations named one, and counts for every
+    /// identity of the key, as it did then.
+    pub fn reserve_force(&self, project: &str, agent: &str, name: &str, identity: &str, since: &str) -> Result<Option<i64>> {
         let in_flight = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
         let r = (|| -> Result<Option<i64>> {
-            let mut st = self.conn.prepare("SELECT id, ts, detail FROM audit WHERE project=?1 AND name=?2 AND action='need.force' AND ts >= ?3")?;
-            let rows: Vec<(i64, String, Option<String>)> = st.query_map(params![project, name, since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+            let mut st = self.conn.prepare("SELECT id, ts, detail FROM audit WHERE project=?1 AND name=?2 AND (identity=?3 OR identity IS NULL) AND action='need.force' AND ts >= ?4")?;
+            let rows: Vec<(i64, String, Option<String>)> = st.query_map(params![project, name, identity, since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
             for (id, ts, card) in rows {
                 if card.is_some() || ts >= in_flight {
                     return Ok(None);
@@ -848,7 +852,7 @@ impl Db {
                 }
                 self.conn.execute("DELETE FROM audit WHERE id=?1", params![id])?;
             }
-            self.audit(Some(project), Some(agent), "need.force", Some(name), None, None)?;
+            self.audit(Some(project), Some(agent), "need.force", Some(name), Some(identity), None)?;
             Ok(Some(self.conn.last_insert_rowid()))
         })();
         match r {
@@ -869,12 +873,24 @@ impl Db {
         Ok(())
     }
 
+    /// The card the extra ask for (project, name, identity) was spent on within the window,
+    /// if it was spent ([`reserve_force`] then returns `None`).
+    pub fn force_card(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT detail FROM audit WHERE project=?1 AND name=?2 AND (identity=?3 OR identity IS NULL) AND action='need.force' AND ts >= ?4 AND detail IS NOT NULL ORDER BY id DESC LIMIT 1",
+            params![project, name, identity, since],
+            |r| r.get(0),
+        ).optional()?)
+    }
+
     /// The card the request behind reservation `row` filed for `name`, if any: a card for that
-    /// key in `project`, from the same agent, filed within the minute after the reservation
-    /// (a request files its cards at once; anything later is another request's).
+    /// key and the reservation's identity in `project`, from the same agent, filed within the
+    /// minute after the reservation (a request files its cards at once; anything later is
+    /// another request's). A reservation with no identity matches the key in any identity.
     pub fn card_since_reservation(&self, row: i64, project: &str, name: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row(
-            "SELECT t.id FROM tasks t, audit a WHERE a.id=?1 AND t.project=?2 AND t.agent=a.agent AND t.created >= a.ts AND t.created <= strftime('%Y-%m-%dT%H:%M:%SZ', a.ts, '+60 seconds') AND (t.name=?3 OR instr(t.names, '\"' || ?3 || '@') > 0) ORDER BY t.created LIMIT 1",
+            "SELECT t.id FROM tasks t, audit a WHERE a.id=?1 AND t.project=?2 AND t.agent=a.agent AND t.created >= a.ts AND t.created <= strftime('%Y-%m-%dT%H:%M:%SZ', a.ts, '+60 seconds') \
+             AND ((t.name=?3 AND (a.identity IS NULL OR t.identity=a.identity)) OR instr(t.names, '\"' || ?3 || '@' || COALESCE(a.identity || '\"', '')) > 0) ORDER BY t.created LIMIT 1",
             params![row, project, name],
             |r| r.get(0),
         ).optional()?)

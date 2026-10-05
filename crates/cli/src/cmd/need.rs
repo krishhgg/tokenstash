@@ -3,6 +3,7 @@ use crate::util::{self, App};
 use anyhow::Result;
 use clap::Args;
 use std::time::Duration;
+use tokenstash_core::db::TaskStatus;
 use tokenstash_core::exit;
 use tokenstash_core::need::{self, NeedOpts, Outcome};
 use tokenstash_core::tasks::{self, HumanRequest, SecretRequest};
@@ -51,56 +52,69 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     let project = util::project_from(&None);
     let agent = util::agent_from(&a.agent);
     // "Denied" is remembered for a day so a program failing in a loop cannot nag. An agent may
-    // ask again over it once per key and project in that window, when the user tells it to:
-    // the card says it is a second ask, and a second "no" stands for the rest of the window.
-    let mut why = a.why.clone();
+    // ask again over it once per key, identity and project in that window, when the user tells
+    // it to. The card says it is a second ask, and a second "no" stands for the rest of the
+    // window. A person's own --force sets every "no" aside.
+    let human = util::looks_human();
     let pid = project.to_string_lossy().to_string();
-    // Only a key the person declined here is asked "again"; for any other, --force from an
-    // agent is an ordinary request and spends nothing.
-    let mut denied: Vec<String> = vec![];
-    if a.force && !util::looks_human() {
+    // Only a key the person declined here is asked "again", in the identity they declined;
+    // for any other, --force from an agent is an ordinary request and spends nothing.
+    let mut denied: Vec<(String, String)> = vec![];
+    if a.force && !human {
         for name in &a.names {
-            if tokenstash_core::need::denied_here(&app.ctx(), &project, name, a.identity.as_deref())? {
-                denied.push(name.clone());
+            if let Some(identity) = need::denied_here(&app.ctx(), &project, name, a.identity.as_deref())? {
+                denied.push((name.clone(), identity));
             }
         }
     }
-    let ask_again = !denied.is_empty();
     // The one extra ask is reserved before the card is filed, in one step, so two requests
     // at once cannot both take it; one that ends without a card for the key hands it back.
-    let mut reserved: Vec<(String, i64)> = vec![];
-    if ask_again {
-        let since = app.cfg.ttl_since();
-        for name in &denied {
-            match app.db.reserve_force(&pid, &agent, name, &since)? {
-                Some(row) => reserved.push((name.clone(), row)),
-                None => {
-                    for (_, row) in &reserved { app.db.delete_audit_row(*row)?; }
-                    anyhow::bail!("{name} was already asked for again once after the user declined it here; that answer stands for {} hours from the first no. Tell the user; do not ask again", app.cfg.task_ttl_hours);
-                }
+    // An ask already spent on a card that still waits returns that card, because running the
+    // same command again is how an agent checks on it.
+    let since = app.cfg.ttl_since();
+    let mut reserved: Vec<(String, String, i64)> = vec![];
+    let mut waiting: Vec<Outcome> = vec![];
+    for (name, identity) in &denied {
+        if let Some(row) = app.db.reserve_force(&pid, &agent, name, identity, &since)? {
+            reserved.push((name.clone(), identity.clone(), row));
+            continue;
+        }
+        app.db.expire_overdue()?;
+        let card = match app.db.force_card(&pid, name, identity, &since)? {
+            Some(id) => app.db.get_task(&id)?,
+            None => None,
+        };
+        match card {
+            Some(t) if t.status == TaskStatus::Pending => {
+                waiting.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: t.id, title: t.title, url: t.url });
+            }
+            // The person said yes to the second ask, so this is an ordinary request now.
+            Some(t) if t.status == TaskStatus::Answered => {}
+            _ => {
+                for (_, _, row) in &reserved { app.db.delete_audit_row(*row)?; }
+                anyhow::bail!("{name} was already asked for again once after the user declined it here; that answer stands for {} hours from the first no. Tell the user; do not ask again", app.cfg.task_ttl_hours);
             }
         }
-        why = Some(match why {
-            Some(w) => format!("Asked again after you declined, because you asked {agent} to. {w}"),
-            None => format!("Asked again after you declined, because you asked {agent} to."),
-        });
     }
+    let rest: Vec<String> = a.names.iter().filter(|n| !waiting.iter().any(|o| o.name() == n.as_str())).cloned().collect();
     let opts = NeedOpts {
-        req: SecretRequest { why, url: a.url.clone(), steps: a.steps.clone(), pattern: a.pattern.clone() },
+        req: SecretRequest { why: a.why.clone(), url: a.url.clone(), steps: a.steps.clone(), pattern: a.pattern.clone() },
         identity: a.identity.clone(),
         blocking: false,
         timeout: Duration::from_secs(a.timeout),
-        force: a.force,
+        // An agent's --force sets aside only the "no" to each key it reserved the extra ask
+        // for. A "no" to another key still stands, even one given after the check above.
+        force: a.force && human,
         require_approval: false,
-        ask_again,
+        ask_again: reserved.iter().map(|(name, identity, _)| format!("{name}@{identity}")).collect(),
     };
-    let outcomes = need::need(&app.ctx(), &project, &agent, &a.names, &opts);
-    let mut outcomes = match outcomes {
+    let filed = if rest.is_empty() { Ok(vec![]) } else { need::need(&app.ctx(), &project, &agent, &rest, &opts) };
+    let filed = match filed {
         Ok(o) => o,
         Err(e) => {
             // A request that failed part way may already have filed a card for some keys:
             // those asks are spent; the rest are handed back.
-            for (name, row) in &reserved {
+            for (name, _, row) in &reserved {
                 match app.db.card_since_reservation(*row, &pid, name)? {
                     Some(tid) => app.db.bind_force(*row, &tid)?,
                     None => app.db.delete_audit_row(*row)?,
@@ -111,10 +125,19 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     };
     // The one extra ask is spent only by a request that filed a card for the key: a request
     // that failed, or found the key already allowed, leaves it for later.
-    for (name, row) in &reserved {
-        match outcomes.iter().find_map(|o| match o { Outcome::Pending { name: n, task_id, .. } if n == name => Some(task_id.clone()), _ => None }) {
+    for (name, identity, row) in &reserved {
+        match filed.iter().find_map(|o| match o { Outcome::Pending { name: n, identity: i, task_id, .. } if n == name && i == identity => Some(task_id.clone()), _ => None }) {
             Some(tid) => app.db.bind_force(*row, &tid)?,
             None => app.db.delete_audit_row(*row)?,
+        }
+    }
+    // One result per name, in the order asked.
+    let mut filed = filed.into_iter();
+    let mut outcomes: Vec<Outcome> = Vec::with_capacity(a.names.len());
+    for name in &a.names {
+        match waiting.iter().position(|o| o.name() == name.as_str()) {
+            Some(i) => outcomes.push(waiting.remove(i)),
+            None => outcomes.extend(filed.next()),
         }
     }
 

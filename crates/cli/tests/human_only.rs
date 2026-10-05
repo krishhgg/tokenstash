@@ -135,6 +135,82 @@ fn an_agent_asks_on_a_card_and_nothing_changes_until_the_person_answers() {
     assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("already asked for again once"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// Have the person decline this directory's open card for `name`.
+fn decline(home: &PathBuf, cwd: &PathBuf, name: &str, identity: &str) {
+    let card = tasks_json(home, cwd).into_iter().find(|t| t["name"] == name && t["identity"] == identity && t["status"] == "pending").unwrap();
+    assert!(run(home, cwd, &["answer", card["id"].as_str().unwrap(), "--deny"]).status.success());
+}
+
+/// Greptile on #63: in one `need A B --force`, only the key the person declined says on its
+/// card that it is a second ask. The other key was never declined, so its card is an ordinary
+/// first ask with the agent's own reason.
+#[test]
+fn only_the_declined_key_is_called_a_second_ask() {
+    let home = home("again-label");
+    let proj = tmp("again-label-proj");
+    assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY"]).status.code(), Some(10));
+    decline(&home, &proj, "RESEND_API_KEY", "default");
+    let out = run(&home, &proj, &["need", "RESEND_API_KEY", "GROQ_API_KEY", "--force", "--why", "the signup emails"]);
+    assert_eq!(out.status.code(), Some(10), "{}", String::from_utf8_lossy(&out.stderr));
+    let cards = tasks_json(&home, &proj);
+    let again = cards.iter().find(|t| t["name"] == "RESEND_API_KEY" && t["status"] == "pending").unwrap();
+    assert!(again["why"].as_str().unwrap().starts_with("Asked again after you declined") && again["why"].as_str().unwrap().ends_with("the signup emails"), "{again}");
+    let groq = cards.iter().find(|t| t["name"] == "GROQ_API_KEY").unwrap();
+    assert_eq!(groq["why"], "the signup emails", "{groq}");
+}
+
+/// Greptile on #65: running the same `need NAME --force` again while its second-ask card waits
+/// returns that card, with its `next`, as an ordinary pending result. Once the person answers
+/// it, the same command delivers the key.
+#[test]
+fn asking_again_twice_returns_the_waiting_card() {
+    let home = home("again-repeat");
+    let proj = tmp("again-repeat-proj");
+    assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY"]).status.code(), Some(10));
+    decline(&home, &proj, "RESEND_API_KEY", "default");
+    let ask = |extra: &[&str]| {
+        let mut args = vec!["need", "RESEND_API_KEY", "--force", "--json"];
+        args.extend(extra);
+        let out = run(&home, &proj, &args);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+        (out.status.code(), v)
+    };
+    let (code, first) = ask(&[]);
+    assert_eq!(code, Some(10), "{first}");
+    let id = first["results"][0]["task_id"].as_str().unwrap().to_string();
+    let (code, repeat) = ask(&[]);
+    assert_eq!(code, Some(10), "{repeat}");
+    let r = &repeat["results"][0];
+    assert_eq!((r["status"].as_str(), r["task_id"].as_str()), (Some("pending"), Some(id.as_str())), "{repeat}");
+    assert!(r["next"].as_str().unwrap().contains(&id) && r["inbox"].is_string(), "{repeat}");
+    // With another key in the same call, each result keeps its place and the other key is asked.
+    let out = run(&home, &proj, &["need", "GROQ_API_KEY", "RESEND_API_KEY", "--force", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((v["results"][0]["name"].as_str(), v["results"][1]["task_id"].as_str()), (Some("GROQ_API_KEY"), Some(id.as_str())), "{v}");
+    assert_eq!(tasks_json(&home, &proj).iter().filter(|t| t["name"] == "RESEND_API_KEY").count(), 2, "no third card");
+    paste(&home, &proj, &id, "re_askedagain_0123456789abcdef");
+    let (code, done) = ask(&[]);
+    assert_eq!((code, done["results"][0]["status"].as_str()), (Some(0), Some("injected")), "{done}");
+}
+
+/// Greptile on #67: the person declines each identity of a key on its own card, and an agent
+/// may ask again once for each.
+#[test]
+fn each_declined_identity_gets_its_own_ask_again() {
+    let home = home("again-identity");
+    let proj = tmp("again-identity-proj");
+    for identity in ["work", "personal"] {
+        assert_eq!(run(&home, &proj, &["need", "GROQ_API_KEY", "--identity", identity]).status.code(), Some(10));
+        decline(&home, &proj, "GROQ_API_KEY", identity);
+    }
+    for identity in ["work", "personal"] {
+        let out = run(&home, &proj, &["need", "GROQ_API_KEY", "--identity", identity, "--force"]);
+        assert_eq!(out.status.code(), Some(10), "{identity}: {}", String::from_utf8_lossy(&out.stderr));
+        let card = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "GROQ_API_KEY" && t["identity"] == identity && t["status"] == "pending").unwrap();
+        assert!(card["why"].as_str().unwrap().starts_with("Asked again after you declined"), "{card}");
+    }
+}
+
 /// `list` and `audit` show an agent its own directory and nothing else: the rest of the stash
 /// and the log are the person's inventory.
 #[test]

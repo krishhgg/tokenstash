@@ -30,7 +30,7 @@ Writes each key to the project's env file, or files a card for it. The project i
 | `--blocking` | Wait for the user instead of returning at once |
 | `--timeout SECONDS` | With `--blocking`, how long to wait (default 600) |
 | `--agent NAME` | Your name on the card and in the audit log (detected otherwise) |
-| `--force` | Ask again after the user declined. Once per key and project until the "no" expires; the card says it is a second ask |
+| `--force` | Ask again after the user declined. Once per key, identity and project until the "no" expires; the card says it is a second ask, and the same command run again while that card waits returns it |
 | `--json` | One JSON object instead of lines |
 
 Generated secrets (`AUTH_SECRET`, `JWT_SECRET`, `SESSION_SECRET`, `NEXTAUTH_SECRET`, `ENCRYPTION_KEY`) are never asked for: tokenstash generates one per project, or keeps the value the env file already holds.
