@@ -1185,6 +1185,24 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The newest audit row's id, 0 when there is none. Writers take turns and an id is never
+    /// reused (AUTOINCREMENT), so a row with a larger id was committed after this was read.
+    pub fn audit_mark(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM audit", [], |r| r.get(0))?)
+    }
+
+    /// Did a store (`store`, by `tasks::record_stored`), an import (`import`, by `tokenstash
+    /// import`) or an adoption (`adopt`, by `need`) record `name@identity` after `mark`, a
+    /// value of [`Db::audit_mark`]? Each writes the key's index row and this audit row in one
+    /// transaction, so a match means a finished store whatever `created` time it recorded.
+    /// An import keeps the time from its bundle.
+    pub fn recorded_since(&self, name: &str, identity: &str, mark: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare("SELECT 1 FROM audit WHERE id > ?1 AND name = ?2 AND identity = ?3 AND action IN ('store', 'import', 'adopt')")?
+            .exists(params![mark, name, identity])?)
+    }
+
     /// Is there an audit row `action` for (project, name) since `since`?
     pub fn audited_since(&self, project: &str, name: &str, action: &str, since: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(

@@ -2742,14 +2742,18 @@ fn concurrent_first_requests_keep_the_first_generated_secret() {
     let identity = need::project_identity(&proj);
     let key = stash::stash_key("JWT_SECRET", &identity);
     let first = "first-generated-value-0123456789abcdef";
-    // Right after this `need` finds the stash empty, the other one commits its value. Its
-    // env file write has not run yet.
+    // Right after this `need` finds the stash empty, the other one commits its value with
+    // its index row and audit line, as `record_stored` writes them. Its env file write has
+    // not run yet.
     let stash = GetHookStash {
         inner: stash::open(&cfg).unwrap(),
         armed: std::cell::Cell::new(false),
         hook: || {
-            other_stash.set(&key, &SecretString::from(first.to_string())).unwrap();
-            other_db.upsert_secret(&db::SecretMeta { name: "JWT_SECRET".into(), identity: identity.clone(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+            other_db.locked(|| {
+                other_stash.set(&key, &SecretString::from(first.to_string()))?;
+                other_db.upsert_secret(&db::SecretMeta { name: "JWT_SECRET".into(), identity: identity.clone(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false })?;
+                other_db.audit(None, Some("other"), "store", Some("JWT_SECRET"), Some(&identity), None)
+            }).unwrap();
         },
     };
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
@@ -2760,6 +2764,48 @@ fn concurrent_first_requests_keep_the_first_generated_secret() {
     let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
     assert_eq!(envfile::parse_line(text.lines().next().unwrap()).unwrap().1, first, "and is the one in the env file");
     assert!(matches!(&out[0], need::Outcome::Injected { generated: false, .. }), "this call kept a value it did not generate: {:?}", out[0]);
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// Greptile on #60: `tokenstash import` can store a generated key after a `need` found it
+/// missing and before that `need` stores the value it generated. The import keeps the key's
+/// `created` time from the bundle, older than the `need`'s read, but it is a finished store
+/// all the same. The `need` keeps the imported value and writes it to the env file, so the
+/// application's signing key is the one the user imported.
+#[test]
+fn a_generated_key_imported_while_need_generates_one_is_kept() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-import");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let other_db = Db::open(&home.join("t.db")).unwrap();
+    let other_stash = stash::open(&cfg).unwrap();
+    let identity = need::project_identity(&proj);
+    let key = stash::stash_key("JWT_SECRET", &identity);
+    let imported = "imported-signing-key-0123456789abcdef";
+    // Right after this `need` finds the stash empty, an import stores the key the way
+    // `bundle::apply_entry` does: stash value, index row with the bundle's `created`, and
+    // audit line, under the index write lock.
+    let stash = GetHookStash {
+        inner: stash::open(&cfg).unwrap(),
+        armed: std::cell::Cell::new(false),
+        hook: || {
+            other_db.locked(|| {
+                other_stash.set(&key, &SecretString::from(imported.to_string()))?;
+                other_db.upsert_secret(&db::SecretMeta { name: "JWT_SECRET".into(), identity: identity.clone(), provider: None, sensitive: false, source_url: None, created: "2020-01-01T00:00:00Z".into(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false })?;
+                other_db.audit(None, None, "import", Some("JWT_SECRET"), Some(&identity), Some("bundle"))
+            }).unwrap();
+        },
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+    stash.armed.set(true);
+    let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    let stored = stash.get(&key).unwrap().unwrap();
+    assert_eq!(secrecy::ExposeSecret::expose_secret(&stored), imported, "the imported value stays in the stash");
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert_eq!(envfile::parse_line(text.lines().next().unwrap()).unwrap().1, imported, "and is the one in the env file");
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: false, .. }), "this call kept a value it did not generate: {:?}", out[0]);
+    assert_eq!(db.get_secret("JWT_SECRET", &identity).unwrap().unwrap().created, "2020-01-01T00:00:00Z", "the import's row is untouched");
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 

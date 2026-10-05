@@ -532,25 +532,26 @@ pub fn store_and_inject(
 /// first to take the index write lock stores its own. The second finds that finished store,
 /// keeps its value, and writes that one to the env file. Storing the second value would
 /// replace the first in the stash after the first had reached the env file, and the
-/// application's signing key would change on a later request. `read_at` is [`crate::now`]
-/// taken by the caller just before the stash read that found the key missing or stale.
-/// Returns the env file written and whether `value` is the one stored.
-pub fn store_generated(ctx: &Ctx, name: &str, identity: &str, value: &SecretString, project: &Path, agent: &str, read_at: &str) -> Result<(Option<PathBuf>, bool)> {
+/// application's signing key would change on a later request. `read_mark` is
+/// [`crate::db::Db::audit_mark`] taken by the caller just before the stash read that found
+/// the key missing or stale. Returns the env file written and whether `value` is the one
+/// stored.
+pub fn store_generated(ctx: &Ctx, name: &str, identity: &str, value: &SecretString, project: &Path, agent: &str, read_mark: i64) -> Result<(Option<PathBuf>, bool)> {
     let mut stored = true;
     let provider = registry::lookup(name).map(|p| p.provider.clone());
     let written = store_and_inject_gated(ctx, name, identity, value, provider, None, false, project, agent, None, Verified::Unknown, crate::db::GRANT_GENERATED, |_| {
         // A finished store wrote its stash value after the caller's read, which found
-        // nothing usable, and its index row commits with that value. So the value counts as
-        // another process's finished store only if its row is fresh and was recorded at or
-        // after `read_at`. A value with no row, or beside a row recorded before that read,
-        // is left by a store whose index write or COMMIT failed after its stash write, the
-        // one step SQLite cannot roll back. That store returned before its env file write,
-        // so no application has the value, and this value is stored in its place with the
-        // row and the grant. Keeping it would deliver a value no row or grant describes.
-        // Timestamps have one-second resolution. A row from the same second as the read
-        // counts as later, which errs toward keeping a finished store.
+        // nothing usable, and its index row and audit row commit with that value. So the
+        // value counts as another process's finished store only if its row is fresh and a
+        // store, import or adoption of this key was recorded after `read_mark`. The row's
+        // `created` time cannot say that, because an import keeps the time from its bundle,
+        // older than the read. A value with no such record is left by a store whose index write or
+        // COMMIT failed after its stash write, the one step SQLite cannot roll back. That
+        // store returned before its env file write, so no application has the value, and
+        // this value is stored in its place with the row and the grant. Keeping it would
+        // deliver a value no row or grant describes.
         let present = ctx.stash.get(&stash_key(name, identity))?.is_some();
-        let finished = present && ctx.db.get_secret(name, identity)?.is_some_and(|m| !m.stale && m.created.as_str() >= read_at);
+        let finished = present && ctx.db.get_secret(name, identity)?.is_some_and(|m| !m.stale) && ctx.db.recorded_since(name, identity, read_mark)?;
         stored = !finished;
         Ok(stored)
     })?;
@@ -839,7 +840,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
         // generatable name is approved *before* anything is generated, so the stash is
         // empty here. Approving is the human saying yes to the delivery — generate it now,
         // or the card would be answered and nothing would ever arrive.
-        let read_at = crate::now();
+        let read_mark = ctx.db.audit_mark()?;
         let stashed = ctx.stash.get(&stash_key(n, identity))?;
         let stashed = match stashed {
             Some(v) => Some(v),
@@ -852,7 +853,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
                     match adopted.or_else(|| crate::need::generate(&spec)) {
                     Some(v) => {
                         let stored = if source == crate::db::GRANT_GENERATED {
-                            store_generated(ctx, n, identity, &v, project, &task.agent, &read_at).map(|_| ())
+                            store_generated(ctx, n, identity, &v, project, &task.agent, read_mark).map(|_| ())
                         } else {
                             store_and_inject(ctx, n, identity, &v, registry::lookup(n).map(|p| p.provider.clone()), None, false, project, &task.agent, None, Verified::Unknown, source).map(|_| ())
                         };

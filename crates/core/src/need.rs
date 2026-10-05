@@ -133,8 +133,8 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
             opts.identity.clone().or(ctx.db.binding(&ws.id, name)?).unwrap_or_else(|| "default".into())
         };
         // When this read finds a generated key missing or stale, the store that follows
-        // compares the key's index row with this moment (`tasks::store_generated`).
-        let read_at = crate::now();
+        // looks for a store recorded after this mark (`tasks::store_generated`).
+        let read_mark = ctx.db.audit_mark()?;
         let hit = ctx.stash.get(&stash_key(name, &identity))?;
 
         if let Some(value) = hit {
@@ -162,8 +162,12 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                     next_probe: None,
                     verify_off: false,
                 };
-                ctx.db.upsert_secret(&m)?;
-                ctx.db.audit(Some(&pid), Some(agent), "adopt", Some(name), Some(&identity), Some("found in the stash but not in this home's index"))?;
+                // The row and its audit line commit together, because a generated key's store
+                // reads them as one record (`Db::recorded_since`).
+                ctx.db.locked(|| {
+                    ctx.db.upsert_secret(&m)?;
+                    ctx.db.audit(Some(&pid), Some(agent), "adopt", Some(name), Some(&identity), Some("found in the stash but not in this home's index"))
+                })?;
                 meta = Some(m);
             }
             let sensitive = meta.as_ref().map(|m| m.sensitive).unwrap_or(false) || provider.map(|p| p.sensitive).unwrap_or(false);
@@ -233,7 +237,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                     Delivery::Injected { path, unverified } => {
                         outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: path.display().to_string(), generated: false, unverified });
                     }
-                    Delivery::Rejected { reason } => outcomes.push(replacement(ctx, project, agent, name, &identity, opts, &reason, &read_at)?),
+                    Delivery::Rejected { reason } => outcomes.push(replacement(ctx, project, agent, name, &identity, opts, &reason, read_mark)?),
                     // The value changed under an on-disk delivery: the directory never held the
                     // new one, so it pairs like any other first delivery.
                     Delivery::NotDelivered => {
@@ -278,7 +282,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 continue;
             }
             if let Some(v) = generate(spec) {
-                let (p, generated) = tasks::store_generated(ctx, name, &identity, &v, project, agent, &read_at)?;
+                let (p, generated) = tasks::store_generated(ctx, name, &identity, &v, project, agent, read_mark)?;
                 outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated, unverified: false });
                 continue;
             }
@@ -690,15 +694,16 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
 
 /// The stash holds a value the project may have, but it is stale: regenerate a generated
 /// secret, honour a recent "do not ask again", else file the replacement card.
-/// `read_at` is when the caller read the stale value from the stash.
+/// `read_mark` is [`crate::db::Db::audit_mark`] taken just before the caller read the stale
+/// value from the stash.
 #[allow(clippy::too_many_arguments)]
-fn replacement(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, opts: &NeedOpts, reason: &str, read_at: &str) -> Result<Outcome> {
+fn replacement(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, opts: &NeedOpts, reason: &str, read_mark: i64) -> Result<Outcome> {
     let pid = project.to_string_lossy().to_string();
     let provider = registry::lookup(name);
     // Generated secrets are never pasted: regenerate.
     if let Some(spec) = provider.and_then(|p| p.generate.as_deref()) {
         if let Some(v) = generate(spec) {
-            let (p, generated) = tasks::store_generated(ctx, name, identity, &v, project, agent, read_at)?;
+            let (p, generated) = tasks::store_generated(ctx, name, identity, &v, project, agent, read_mark)?;
             return Ok(Outcome::Injected { name: name.into(), identity: identity.into(), written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated, unverified: false });
         }
     }
