@@ -118,7 +118,7 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     };
     eprintln!("tokenstash inbox → http://127.0.0.1:{port}/");
     let (req_tx, requests) = mpsc::sync_channel::<Request>(READERS);
-    spawn_readers(listener, false, req_tx.clone());
+    spawn_readers(listener, false, req_tx.clone(), None);
     let mut tailnet_bound = None;
     let mut last_activity = Instant::now();
     loop {
@@ -681,8 +681,10 @@ fn reason(code: u16) -> &'static str {
 /// Accept connections and read complete requests off them on threads of their own, so the
 /// main thread only ever sees whole requests. Returns the receiving end of that hand-off.
 /// Readers for one listener, all handing complete requests to `req_tx`. `tailnet` marks the
-/// requests from the Tailscale listener.
-fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<Request>) {
+/// requests from the Tailscale listener. A listener with `stop` can be closed: its acceptor
+/// polls, checks the flag between accepts, and its readers end once the acceptor has. The
+/// loopback listener has none and blocks in accept, so an idle inbox does not wake up.
+fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<Request>, stop: Option<Arc<std::sync::atomic::AtomicBool>>) {
     // A rendezvous: the acceptor hands a connection over only when a reader is free to take
     // it; until then new connections wait in the kernel's listen backlog. No queue of our
     // own, so nothing here grows with the number of clients.
@@ -701,14 +703,26 @@ fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<
             }
         });
     }
+    // Non-blocking, so the flag is seen within a tick; a stopped acceptor drops the listener
+    // (the port is free again) and the channel (its readers end).
+    if stop.is_some() {
+        let _ = listener.set_nonblocking(true);
+    }
     std::thread::spawn(move || loop {
+        if stop.as_ref().is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
+            return;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
+                // Reads use timeouts, which need a blocking socket; some systems hand an
+                // accepted socket the listener's non-blocking mode.
+                let _ = stream.set_nonblocking(false);
                 if conn_tx.send(stream).is_err() {
                     return;
                 }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(25)),
             // Out of descriptors, or a connection that reset before we got to it: keep listening.
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -720,20 +734,27 @@ fn spawn_readers(listener: TcpListener, tailnet: bool, req_tx: mpsc::SyncSender<
 /// takes effect in a running inbox, including after the address changed. Turning it off needs
 /// no unbinding: every tailnet request is checked against the setting as it is then, so an
 /// old address's listener answers nothing.
-fn listen_tailnet(port: u16, bound: &mut Option<std::net::IpAddr>, req_tx: &mpsc::SyncSender<Request>) {
+/// The Tailscale listener in use: its address, and the flag that stops it.
+type Tailnet = Option<(std::net::IpAddr, Arc<std::sync::atomic::AtomicBool>)>;
+
+fn listen_tailnet(port: u16, bound: &mut Tailnet, req_tx: &mpsc::SyncSender<Request>) {
     let Ok(cfg) = tokenstash_core::Config::load() else { return };
-    if cfg.remote != tokenstash_core::config::Remote::Tailscale {
+    let want = if cfg.remote == tokenstash_core::config::Remote::Tailscale { cfg.remote_ip.as_deref().and_then(|i| i.parse::<std::net::IpAddr>().ok()) } else { None };
+    if bound.as_ref().map(|(ip, _)| *ip) == want {
         return;
     }
-    let Some(ip) = cfg.remote_ip.as_deref().and_then(|i| i.parse::<std::net::IpAddr>().ok()) else { return };
-    if *bound == Some(ip) {
-        return;
+    // Turned off, or the address changed: close the old listener first, so its port is free
+    // and none of its threads outlive it.
+    if let Some((_, stop)) = bound.take() {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    let Some(ip) = want else { return };
     match TcpListener::bind((ip, port)) {
         Ok(l) => {
             eprintln!("tokenstash inbox → {}/ (Tailscale)", crate::remote::base_url(&cfg));
-            spawn_readers(l, true, req_tx.clone());
-            *bound = Some(ip);
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            spawn_readers(l, true, req_tx.clone(), Some(Arc::clone(&stop)));
+            *bound = Some((ip, stop));
         }
         Err(e) => eprintln!("inbox: cannot listen on {ip}:{port}: {e}"),
     }

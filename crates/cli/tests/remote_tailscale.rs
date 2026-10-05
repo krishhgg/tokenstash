@@ -87,6 +87,14 @@ fn curl(w: &World, from: &str, method: &str, path: &str, host: Option<&str>, coo
     (status, head.to_string(), rest.to_string())
 }
 
+/// GET `path` on `to` (another tailnet address of this machine) from `from`.
+fn curl_to(w: &World, to: &str, from: &str, path: &str) -> (u16, String) {
+    let out = Command::new("curl").args(["-s", "-i", "--noproxy", "*", "--max-time", "10", "--interface", from, &format!("http://{to}:{}{path}", w.port)]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let status = text.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (status, text)
+}
+
 fn session_cookie(head: &str) -> Option<String> {
     head.lines().find_map(|l| l.strip_prefix("Set-Cookie: tokenstash_inbox=").or_else(|| l.strip_prefix("set-cookie: tokenstash_inbox="))).map(|v| v.split(';').next().unwrap().to_string())
 }
@@ -178,9 +186,27 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     // what loopback gets, which without a credential is nothing.
     assert_eq!(curl(&w, "127.0.0.2", "GET", "/", None, None, None).0, 404);
 
-    // Off again: the Tailscale address stops answering, at once.
+    // The address changes (Tailscale handed out a new one; here written into the setting):
+    // the inbox listens on the new one and closes the old one, freeing its port.
+    let moved = std::fs::read_to_string(w.home.join("config.toml")).unwrap().replace("127.0.0.2", "127.0.0.5");
+    std::fs::write(w.home.join("config.toml"), moved).unwrap();
+    let start = Instant::now();
+    while curl_to(&w, "127.0.0.5", "127.0.0.3", "/").0 != 200 || curl(&w, "127.0.0.3", "GET", "/", None, None, None).0 != 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the inbox did not move to the new address");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(TcpListener::bind(("127.0.0.2", port)).is_ok(), "the old listener let go of its port");
+    let back = std::fs::read_to_string(w.home.join("config.toml")).unwrap().replace("127.0.0.5", "127.0.0.2");
+    std::fs::write(w.home.join("config.toml"), back).unwrap();
+    let start = Instant::now();
+    while curl(&w, "127.0.0.3", "GET", "/", None, None, None).0 != 200 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the inbox did not move back to the old address");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Off again: the Tailscale address stops answering, at once, and then closes.
     assert!(w.run(&["remote", "off"]).status.success());
-    assert_eq!(curl(&w, "127.0.0.3", "GET", "/", None, None, None).0, 404);
+    assert_ne!(curl(&w, "127.0.0.3", "GET", "/", None, None, None).0, 200);
     let need = w.run(&["need", "RESEND_API_KEY"]);
     assert!(String::from_utf8_lossy(&need.stdout).contains(&format!("http://127.0.0.1:{port}/p/")), "links point at loopback again");
     drop(inbox);
