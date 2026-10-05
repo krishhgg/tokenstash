@@ -115,7 +115,8 @@ fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String
     // Values from the env file are secrets tokenstash delivered, so each line of a multi-line
     // one is masked too. An inherited value gets that only when its name says it is a secret
     // (a registry name, or one with KEY, TOKEN, SECRET, PASSWORD, ... in it), which covers a
-    // deploy key a CI job exports as SSH_PRIVATE_KEY. The rest are redacted only because they
+    // deploy key a CI job exports as SSH_PRIVATE_KEY, or when it holds a PEM block, which
+    // covers the same key exported as SSH_IDENTITY. The rest are redacted only because they
     // are not on the benign list, and that takes in multi-line build configuration (nix-shell's
     // `buildPhase`, `shellHook`). Masking each of its lines would hide `return 0;` or
     // `make install` in the child's errors, so those keep the whole-value match.
@@ -123,8 +124,10 @@ fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String
         if !should_redact_inherited(&k, &v) {
             continue;
         }
+        let secret_by_name = tokenstash_core::registry::lookup(&k).is_some() || tokenstash_core::envcrawl::secret_ish_name(&k.to_ascii_uppercase());
+        let split = secret_by_name || tokenstash_core::redact::holds_pem_block(&v);
         let v = SecretString::from(v);
-        if tokenstash_core::registry::lookup(&k).is_some() || tokenstash_core::envcrawl::secret_ish_name(&k.to_ascii_uppercase()) {
+        if split {
             redactor.add(&v);
         } else {
             redactor.add_whole_value(&v);

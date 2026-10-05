@@ -292,6 +292,31 @@ fn redactor_masks_each_line_of_a_multiline_value() {
 }
 
 #[test]
+fn a_pem_block_is_found_raw_or_inside_other_text() {
+    let body = "MIIfake0MIIfake0\nMIIfake1MIIfake1";
+    for s in [
+        format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\n"),
+        format!("-----BEGIN PRIVATE KEY-----\r\n{body}\r\n-----END PRIVATE KEY-----"),
+        // a pretty-printed service-account JSON escapes the key's own newlines
+        "{\n  \"private_key\": \"-----BEGIN PRIVATE KEY-----\\nMIIfake0\\n-----END PRIVATE KEY-----\\n\"\n}".to_string(),
+        // public blocks count too, and not every secret block says PRIVATE
+        format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----"),
+        format!("-----BEGIN OpenVPN Static key V1-----\n{body}\n-----END OpenVPN Static key V1-----"),
+    ] {
+        assert!(redact::holds_pem_block(&s), "{s:?}");
+    }
+    for s in [
+        "runHook preBuild\nreturn 0;\nrunHook postBuild",
+        "-----BEGIN PRIVATE KEY-----\nMIIfake0",
+        "-----BEGIN PRIVATE KEY-----\nMIIfake0\n-----END RSA PRIVATE KEY-----",
+        "-----END PRIVATE KEY-----\nMIIfake0\n-----BEGIN PRIVATE KEY-----",
+        "echo -----BEGIN -----",
+    ] {
+        assert!(!redact::holds_pem_block(s), "{s:?}");
+    }
+}
+
+#[test]
 fn envfile_round_trips_adversarial_values() {
     let dir = tmp("envfile-rt");
     let cases = [

@@ -75,7 +75,8 @@ fn run_masks_short_lines_of_a_multiline_value_as_whole_words() {
 }
 
 /// An inherited variable is redacted when its value is not a known benign one, and that takes
-/// in build configuration. Only a name that says "secret" gets each line of its value masked.
+/// in build configuration. Only a name that says "secret", or a PEM block in the value (next
+/// test), gets each line of the value masked.
 #[test]
 fn run_masks_lines_of_an_inherited_value_only_when_its_name_says_secret() {
     let home = home("home-inherit");
@@ -90,6 +91,25 @@ fn run_masks_lines_of_an_inherited_value_only_when_its_name_says_secret() {
         assert!(!stdout.contains(line.as_str()), "a line of the inherited key reached stdout: {stdout}");
     }
     assert!(stdout.contains("error here: return 0;"), "a line of buildPhase was masked: {stdout}");
+}
+
+/// A private key does not need a secret-sounding name to be one. An inherited value holding a
+/// PEM block, raw or inside a pretty-printed JSON, gets each line masked.
+#[test]
+fn run_masks_lines_of_an_inherited_pem_block_whatever_its_name() {
+    let home = home("home-pem");
+    let proj = tmp("proj-pem");
+    let body = fake_pem_body();
+    let key = format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----", body.join("\n"));
+    let json = format!("{{\n  \"type\": \"service_account\",\n  \"private_key\": \"-----BEGIN PRIVATE KEY-----\\n{}\\n-----END PRIVATE KEY-----\\n\"\n}}", body.join("\\n"));
+    let out = run_sh(&home, &proj, r#"printf '%s\n' "$SSH_IDENTITY"; printf '%s\n' "$GCP_SA""#,
+        &[("SSH_IDENTITY", key.as_str()), ("GCP_SA", json.as_str())]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("-----BEGIN OPENSSH PRIVATE KEY-----"), "the child printed the key: {stdout}");
+    for line in &body {
+        assert!(!stdout.contains(line.as_str()), "a line of an inherited key reached stdout: {stdout}");
+    }
 }
 
 /// An exported shell function is a multi-line inherited value made of code. Its lines are not

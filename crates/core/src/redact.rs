@@ -76,6 +76,23 @@ fn is_pem_armor(line: &str) -> bool {
     (line.starts_with("-----BEGIN ") || line.starts_with("-----END ")) && line.ends_with("-----")
 }
 
+/// Does `s` hold a PEM block, a `-----BEGIN X-----` and a later `-----END X-----`? They need
+/// not stand on lines of their own, so a key inside a pretty-printed JSON counts. Any label
+/// counts, public ones (CERTIFICATE, PUBLIC KEY) too. Masking a certificate's lines costs
+/// nothing, and not every secret block says PRIVATE (`-----BEGIN OpenVPN Static key V1-----`).
+pub fn holds_pem_block(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(i) = rest.find("-----BEGIN ") {
+        rest = &rest[i + "-----BEGIN ".len()..];
+        let Some(j) = rest.find("-----") else { return false };
+        let label = &rest[..j];
+        if !label.is_empty() && !label.contains(['\n', '\r']) && rest[j..].contains(&format!("-----END {label}-----")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Replace `v` only where it is not glued to other alphanumerics.
 fn redact_whole_token(text: &str, v: &str) -> String {
     let mut out = String::with_capacity(text.len());
