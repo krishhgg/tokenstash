@@ -28,8 +28,14 @@ fn home(name: &str) -> PathBuf {
     h
 }
 
+/// $HOME and the config root are scratch too. `init` installs the skill into the agents'
+/// directories under $HOME and keeps its undo record under the fixed config dir, so with the
+/// developer's own $HOME a test run rewrites their agent setup.
 fn run(home: &PathBuf, cwd: &PathBuf, args: &[&str]) -> std::process::Output {
+    let user_home = home.join("user-home");
+    std::fs::create_dir_all(&user_home).unwrap();
     Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(args).current_dir(cwd)
+        .env("HOME", &user_home).env("XDG_CONFIG_HOME", user_home.join(".config"))
         .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
         .stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
 }
@@ -83,21 +89,32 @@ fn an_agent_cannot_answer_another_directorys_card() {
     assert_eq!(v.as_array().unwrap()[0]["status"], "pending", "nothing changed: {v}");
 }
 
-/// `init` sets up the stash and config for anyone, but registering this binary as every
-/// agent's MCP server is a person's decision: from a hostile checkout an agent could point
-/// every future session at a build that hands values to the model.
+/// `init` sets up the stash and installs the skill for anyone: the skill is fixed text naming
+/// no binary. Registering this binary as every agent's MCP server is a person's decision:
+/// from a hostile checkout an agent could point every future session at a build that hands
+/// values to the model.
 #[test]
-fn init_registers_agents_only_for_a_person() {
+fn init_registers_the_mcp_server_only_for_a_person() {
     let home = home("home-init");
     let proj = tmp("proj-init");
+    let user_home = home.join("user-home");
+    std::fs::create_dir_all(user_home.join(".codex")).unwrap();
     let out = run(&home, &proj, &["init"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "init itself still succeeds: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("Agents were not registered"), "{stdout}");
-    assert!(stdout.contains("stash backend"), "the stash was still set up: {stdout}");
-    assert!(!stdout.contains("Files outside"), "nothing was written into agent config: {stdout}");
-    // ...and --no-agents, which scripts use, is quiet about it.
+    assert!(out.status.success(), "init itself succeeds: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("stash backend") && stdout.contains("skill installed"), "{stdout}");
+    assert!(user_home.join(".agents/skills/tokenstash/SKILL.md").is_file());
+    assert!(!user_home.join(".codex/config.toml").exists(), "no MCP server: {stdout}");
+    // With the server chosen for this machine, an agent's `init` leaves the registrations alone.
+    let cfg = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    std::fs::write(home.join("config.toml"), format!("{cfg}mcp = true\n")).unwrap();
+    let out = run(&home, &proj, &["init"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains("MCP registrations were left as they are"), "{stdout}");
+    assert!(!user_home.join(".codex/config.toml").exists());
+    // ...and --no-agents, which scripts use, touches no agent at all.
+    std::fs::remove_dir_all(user_home.join(".agents")).unwrap();
     let out = run(&home, &proj, &["init", "--no-agents"]);
     assert!(out.status.success());
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("Agents were not registered"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("skill installed") && !user_home.join(".agents").exists());
 }

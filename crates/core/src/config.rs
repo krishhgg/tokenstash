@@ -36,14 +36,18 @@ pub struct Config {
     /// before the agent ever sees a 401.
     #[serde(default)]
     pub verify_every: VerifyEvery,
-    /// How agents reach tokenstash. `auto` (default): `init` registers the MCP server and
-    /// installs a skill the agent loads on its own, so keys are requested whenever code needs
-    /// one. `explicit`: no MCP server and nothing the agent reads unprompted; `init` installs a
-    /// slash command (`/tokenstash`) the person types, which runs the CLI.
+    /// How agents reach tokenstash. Either way `init` installs one skill that documents the
+    /// CLI. `auto` (default): the agent sees the skill's one-line description and loads it
+    /// when code needs a key. `explicit`: the skill loads only when the person invokes it
+    /// (`/tokenstash`, or `$tokenstash` in Codex).
     /// Not written while it is the default, so a config this version saved still loads in
     /// 0.2 (which rejects unknown fields) unless explicit mode was chosen.
     #[serde(default, skip_serializing_if = "AgentMode::is_auto")]
     pub agent_mode: AgentMode,
+    /// Also register tokenstash as an MCP server with each agent (`init --mcp`). Off by
+    /// default: agents run the CLI. Not written while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp: bool,
 }
 
 /// See [`Config::agent_mode`].
@@ -145,6 +149,7 @@ impl Default for Config {
             inbox_links: default_links(),
             verify_every: VerifyEvery::default(),
             agent_mode: AgentMode::Auto,
+            mcp: false,
         }
     }
 }

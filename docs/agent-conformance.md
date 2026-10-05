@@ -1,7 +1,9 @@
 # Agent conformance
 
 Humans mostly never type `tokenstash`; agents do. The only things that make an agent use it
-are the skill file, the MCP `instructions` and tool descriptions, and what `init` wires up.
+are the skill (`crates/cli/skill/`: `SKILL.md` plus the reference files beside it), the
+CLI's own output, and, when someone opts in with `init --mcp`, the MCP `instructions` and
+tool descriptions.
 So "works with Claude Code, Codex and Cursor" is a claim that has to be measured, and
 `scripts/agent-conformance.sh` is how. This page says what the suite checks, how to run it,
 and how to read the result.
@@ -40,8 +42,9 @@ chat"). The matched sentence is printed so a person can judge it.
 - GNU `timeout` (`coreutils` on macOS) and a sha256 tool (`sha256sum`, `gsha256sum` or `shasum`).
 - `python3`.
 
-The suite must be run from a checkout: it installs this checkout's `crates/cli/SKILL.md`
-into the Claude world and the `AGENTS.md` snippet the binary prints into the Codex world.
+The suite must be run from a checkout: it installs this checkout's `crates/cli/skill/` at
+project level for each agent (`.claude/skills`, `.agents/skills`, `.cursor/skills`), the way
+`init` installs it globally. `CONF_MCP=1` also registers the MCP server.
 
 ## Running it
 
@@ -86,9 +89,10 @@ a release.
 What the suite configures: every tokenstash call it makes, and every one the agent is wired
 to make, runs against a scratch `TOKENSTASH_HOME` with the stash backend set to
 `insecure-file` before the first call, so `init` does not probe the keyring on the way to
-choosing a backend. MCP wiring is passed on the command line (Claude: `--mcp-config
---strict-mcp-config`; Codex: `--ignore-user-config` plus `-c mcp_servers…`; Cursor: a
-project-local `.cursor/mcp.json`). Every project-scoped tokenstash call the harness makes
+choosing a backend. Agents use the CLI. With `CONF_MCP=1` the MCP wiring is passed on the
+command line (Claude: `--mcp-config --strict-mcp-config`; Codex: `--ignore-user-config` plus
+`-c mcp_servers…`; Cursor: a project-local `.cursor/mcp.json`); without it Claude runs with
+an empty `--strict-mcp-config`. Every project-scoped tokenstash call the harness makes
 runs inside the scratch project. The canary is a random string, never a real key.
 
 What the suite does not guarantee: the agent has a shell as your user. Nothing stops it
@@ -122,7 +126,8 @@ Each of these was observed in a real run and is what the corresponding check exi
 - **Omitting the inbox link**: "the secure tokenstash prompt you received" with nothing the
   user can click. Caught by the link check in scenario 2.
 
-The guidance agents receive is shaped by these: every MCP result carries a `next` field for
-its outcome, blocking calls are capped at 30 s, and the "no stand-in by any route" rule
-names the routes (env file, environment variable, shim, shadowed module, default in code) in
-the skill file, the `AGENTS.md` snippet, the MCP instructions and the results alike.
+The guidance agents receive is shaped by these: every `need` result, from the CLI and from
+the MCP tool alike, carries a `next` line for its outcome, blocking MCP calls are capped at
+30 s, and the "no stand-in by any route" rule names the routes (env file, environment
+variable, shim, shadowed module, default in code) in the skill, the MCP instructions and the
+results alike.

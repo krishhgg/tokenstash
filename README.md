@@ -18,7 +18,7 @@
   <a href="https://github.com/kgarg2468/tokenstash/actions/workflows/ci.yml"><img alt="Tests" src="https://github.com/kgarg2468/tokenstash/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="MIT" src="https://img.shields.io/badge/License-MIT-BF6A2B?style=flat-square">
   <img alt="macOS and Linux" src="https://img.shields.io/badge/macOS_·_Linux-2D2A26?style=flat-square">
-  <img alt="MCP" src="https://img.shields.io/badge/MCP-server-2D2A26?style=flat-square">
+  <img alt="CLI and agent skill" src="https://img.shields.io/badge/CLI-agent_skill-2D2A26?style=flat-square">
   <img alt="No telemetry" src="https://img.shields.io/badge/Telemetry-none-BF6A2B?style=flat-square">
 </p>
 
@@ -42,7 +42,7 @@ Then, once:
 tokenstash init
 ```
 
-`init` picks your OS keychain and adds tokenstash to the agents it finds: Claude Code, Codex, Cursor and Gemini CLI. macOS and Linux; Windows is not supported yet.
+`init` picks your OS keychain and installs the tokenstash skill for the agents it finds: Claude Code, Codex, Gemini CLI and Cursor. Agents run the CLI, and nothing is added to your `AGENTS.md` or `CLAUDE.md`. macOS and Linux; Windows is not supported yet.
 
 <details>
 <summary><strong>Other ways to install</strong></summary>
@@ -64,7 +64,7 @@ Prebuilt binaries for macOS (Apple Silicon, Intel) and Linux (x64, arm64; static
   <img src="docs/assets/how-it-works.svg" alt="The agent runs tokenstash need. If the key is stored and this folder is approved, it is written to .env.local and the agent gets a status line, not the value. If the key is stored but the folder isn't approved yet, you approve it once in the inbox on localhost. If the key isn't stored yet, you are notified with a link to a page on localhost, you paste it once, and it is stored and written." width="880">
 </p>
 
-When the agent needs a key, it runs `tokenstash need OPENAI_API_KEY` (or asks over MCP). There are three outcomes:
+When the agent needs a key, it runs `tokenstash need OPENAI_API_KEY`. There are three outcomes:
 
 - **You have the key and this folder is approved:** it's written to `.env.local` and the agent carries on.
 - **You have the key but this folder hasn't been approved:** you get a notification. Open it, see exactly which keys would go into which file, and approve once.
@@ -85,7 +85,7 @@ When the agent needs a key, it runs `tokenstash need OPENAI_API_KEY` (or asks ov
   <img src="docs/assets/key-path.svg" alt="You paste the key on a page on localhost. It is stored in your OS keychain and written to the project's .env.local, which your app loads. From delivery, the agent gets a status line such as: OPENAI_API_KEY injected to .env.local, with no key value in it. It is not a sandbox: a shell in that folder can still read .env.local." width="880">
 </p>
 
-The value goes from the page you paste it on, to your OS keychain, to the project's `.env.local` (mode `0600`, and added to `.gitignore`). `need` and the MCP tool report back with an exit code and a line like `✓ OPENAI_API_KEY injected → .env.local`, without the value, so delivering a key doesn't put it into the chat, a summary, or the conversation history. [`scripts/leak-test.sh`](scripts/leak-test.sh) runs the real binary with a canary key on every commit and fails if the canary appears on any of the surfaces it checks.
+The value goes from the page you paste it on, to your OS keychain, to the project's `.env.local` (mode `0600`, and added to `.gitignore`). `need` reports back with an exit code and a line like `✓ OPENAI_API_KEY injected → .env.local`, without the value, so delivering a key doesn't put it into the chat, a summary, or the conversation history. [`scripts/leak-test.sh`](scripts/leak-test.sh) runs the real binary with a canary key on every commit and fails if the canary appears on any of the surfaces it checks.
 
 Your app loads `.env.local` the way it already would: frameworks such as Next.js read it on their own; for anything else, use your runtime's dotenv support, or start the program with `tokenstash run --`.
 
@@ -93,7 +93,7 @@ Your app loads `.env.local` the way it already would: frameworks such as Next.js
 
 ## Using it
 
-After `tokenstash init`, the agents it set up are instructed to ask tokenstash for keys. You can also run it yourself:
+After `tokenstash init`, each agent has the tokenstash skill: it sees a one-line description of it in every session, and loads the full instructions (how to request a key, what each result means, how to debug tokenstash itself) when code needs a key. You can also run it yourself:
 
 ```bash
 tokenstash need OPENAI_API_KEY RESEND_API_KEY   # write the keys you have; ask for the rest
@@ -104,13 +104,15 @@ tokenstash doctor                               # check the setup
 
 ### Automatic, or only when you say so
 
-By default the agent asks tokenstash on its own: `init` registers the MCP server and installs a skill that tells the agent to request a key whenever code needs one. If you would rather nothing happen until you ask:
+By default the agent loads the skill on its own when code needs a key. All it carries into every session is the skill's one-line description; the instructions load only when they are used. If you would rather nothing happen until you ask:
 
 ```bash
 tokenstash init --mode explicit
 ```
 
-This takes the MCP server and everything the agent reads unprompted back out, and installs one command that only you can invoke: `/tokenstash OPENAI_API_KEY` in Claude Code and Cursor, `/prompts:tokenstash OPENAI_API_KEY` in Codex, `/tokenstash OPENAI_API_KEY` in Gemini CLI. Typed bare, it requests whatever the current task needs, and it covers the rest of that task: a key the work turns out to need later goes through it too. The command runs `tokenstash need` under the same rules, so the value still goes to `.env.local` and never into the chat. In a session where you don't type it, nothing tells the agent about tokenstash, so it will ask you for keys the way it always did. The one exception is a project where you ran `tokenstash init --project`: its `AGENTS.md` section stays, rewritten to say that keys are requested only when you invoke the command and never pasted in chat. `tokenstash init --mode auto` switches back, `doctor` shows the mode, and `init --undo` removes either.
+This installs the same skill marked for you to invoke: `/tokenstash OPENAI_API_KEY` in Claude Code and Cursor, `$tokenstash` in Codex. Gemini CLI reads the same skill as Codex and asks you before it loads any skill. Typed bare, it requests whatever the current task needs, and it covers the rest of that task: a key the work turns out to need later goes through it too. The value still goes to `.env.local` and never into the chat. In a session where you don't invoke it, Claude Code, Cursor and Codex do not see tokenstash at all, so the agent will ask you for keys the way it always did. `tokenstash init --mode auto` switches back, `doctor` shows the mode, and `init --undo` removes either.
+
+Agents that prefer MCP can have it too: `tokenstash init --mcp` also registers tokenstash as an MCP server with each agent (auto mode only), and `--no-mcp` takes it out again. Earlier versions registered the server and wrote a section into `~/.codex/AGENTS.md` by default; `init` now takes both out unless you ask for the server.
 
 ## Uninstall
 
@@ -148,14 +150,14 @@ Keys already written into projects' `.env.local` files stay there until you dele
 | `tokenstash workspaces [list\|revoke DIR\|forget DIR]` | Which folders are approved for which keys; take a folder's approvals away |
 | `tokenstash export` · `import BUNDLE` | Move your stash to another machine in a passphrase-encrypted bundle |
 | `tokenstash run -- COMMAND` | Run a program with `.env.local` loaded; see below |
-| `tokenstash init [--mode auto\|explicit] [--undo]` · `doctor` · `audit` · `registry` | Set up or remove the agent connections, automatic or on your command only; check the setup; see every delivery; list known providers |
-| `tokenstash mcp` · `inbox` | The MCP server and the inbox (started for you) |
+| `tokenstash init [--mode auto\|explicit] [--mcp] [--undo]` · `doctor` · `audit` · `registry` | Install or remove the agent skill, automatic or on your command only, and optionally the MCP server; check the setup; see every delivery; list known providers |
+| `tokenstash mcp` · `inbox` | The MCP server (after `init --mcp`) and the inbox (started for you) |
 
 `tokenstash run` loads `.env.local` into the program's environment. If the program exits with an error and its output names a registry-known variable that isn't set, tokenstash asks for it and restarts the program once it arrives. A key requested this way needs your approval each time, even in an approved folder, since the program's output chose it.
 
 Commands that widen what an agent can reach (approving, opening the full inbox, listing or exporting keys, and others) only run for a person at a terminal; the full list is in [SECURITY.md](SECURITY.md).
 
-Agents that speak MCP get six tools: `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check` and `task_list`. The MCP server only acts for the folder your agent opened.
+With `init --mcp`, agents that speak MCP also get six tools: `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check` and `task_list`. The MCP server only acts for the folder your agent opened.
 
 </details>
 
@@ -172,6 +174,8 @@ Agents that speak MCP get six tools: `secrets_request`, `secrets_list`, `secrets
 | `stash_backend` | `auto` | `keyring` (OS keychain), `keyutils` (Linux kernel keyring; cleared on reboot), `insecure-file` (plaintext, for CI only) |
 | `notifications` | `true` | desktop notifications |
 | `verify_every` | `24h` | how often a key is re-checked with its provider: `<n>h`, `<n>m`, `always` or `never` |
+| `agent_mode` | `auto` | `auto`: agents load the skill when code needs a key; `explicit`: only when you invoke it. Set with `init --mode` |
+| `mcp` | `false` | whether `init` registers the MCP server. Set with `init --mcp` / `--no-mcp` |
 
 The project is the git checkout you're in, so in a monorepo `apps/web` and `apps/api` share one `.env.local` at the repo root. A folder that isn't a checkout is its own project.
 

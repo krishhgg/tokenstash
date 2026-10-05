@@ -74,50 +74,47 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     }
 
     // Only probed when something is pending: a hit never needs the inbox.
-    let state = if outcomes.iter().any(|o| o.is_pending()) { notify::inbox_state(&app.cfg) } else { notify::Inbox::Down };
-    if a.json {
-        // Each pending result carries its own card link, as the MCP tool does; the
-        // top-level `inbox` is the bare index URL, and carries nothing.
-        let results: Vec<serde_json::Value> = outcomes.iter().map(|o| {
-            let mut v = serde_json::to_value(o).unwrap_or(serde_json::Value::Null);
-            if let Outcome::Pending { task_id, .. } = o {
-                v["inbox"] = serde_json::json!(util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state));
+    let pending = outcomes.iter().any(|o| o.is_pending());
+    let state = if pending { notify::inbox_state(&app.cfg) } else { notify::Inbox::Down };
+    let env_file = project.join(&app.cfg.env_file);
+    // Each result carries its own card link and its own `next`, the same text the MCP tool
+    // returns; the top-level `inbox` is the bare index URL, and carries nothing.
+    let mut results: Vec<(serde_json::Value, String)> = Vec::with_capacity(outcomes.len());
+    for o in &outcomes {
+        let mut v = serde_json::to_value(o)?;
+        let (task, card) = match o {
+            Outcome::Pending { task_id, .. } => {
+                let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state);
+                v["inbox"] = serde_json::json!(card);
+                (app.db.get_task(task_id)?, card)
             }
-            v
-        }).collect();
+            _ => (None, String::new()),
+        };
+        let next = crate::guide::next(o, &env_file, task.as_ref(), &card, crate::guide::Recheck::Cli, "");
+        v["next"] = serde_json::json!(next);
+        results.push((v, next));
+    }
+    if a.json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "project": project,
             "env_file": app.cfg.env_file,
             "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
-            "results": results,
+            "results": results.iter().map(|(v, _)| v).collect::<Vec<_>>(),
+            "next": crate::guide::summary(pending, crate::guide::Recheck::Cli),
         }))?);
     } else {
-        for o in &outcomes {
+        for (o, (_, next)) in outcomes.iter().zip(&results) {
             match o {
-                Outcome::Injected { name, written_to, generated, unverified, .. } => {
+                Outcome::Injected { name, written_to, generated, .. } => {
                     let p = std::path::Path::new(written_to);
                     let rel = p.strip_prefix(&project).map(|r| r.display().to_string()).unwrap_or(written_to.clone());
                     println!("✓ {name} {} → {rel}", if *generated { "generated and injected" } else { "injected" });
-                    if *unverified {
-                        eprintln!("  {name}: delivered without re-checking it (provider unreachable or rate-limited, or checked moments ago by another process)");
-                    }
                 }
-                Outcome::Pending { name, task_id, .. } => {
-                    println!("⏳ {name} pending — task {task_id} → {}", util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state));
-                }
-                Outcome::Denied { name, .. } => println!("✗ {name} denied by the user — do not ask again, and do not supply a stand-in value by any route; make the feature optional or report it blocked"),
+                Outcome::Pending { name, task_id, .. } => println!("⏳ {name} pending (card {task_id})"),
+                Outcome::Denied { name, .. } => println!("✗ {name} denied by the user"),
                 Outcome::Expired { name, .. } => println!("✗ {name} expired unanswered"),
             }
-        }
-        if outcomes.iter().any(|o| o.is_pending()) {
-            // Only claim there is a link when there is one; with the inbox down or squatted
-            // the line above is an explanation, and an agent following "open the link above"
-            // would hand the user an error string as a URL.
-            if matches!(state, notify::Inbox::Ours) {
-                eprintln!("\nTell the user to open the link above: it works as-is for pasting a missing key. If the card is an approval (a stored key waiting for this directory's yes), the user approves it from the desktop notification or by running `tokenstash open` in a terminal. Continue with other work; `tokenstash tasks` shows the status.");
-            } else {
-                eprintln!("\nThere is no inbox link yet (see the message above). Tell the user to run `tokenstash open` in a terminal; that starts the inbox and opens it. Continue with other work; re-run this command or `tokenstash tasks` to check.");
-            }
+            println!("  next: {next}");
         }
     }
     Ok(code_for(&outcomes))

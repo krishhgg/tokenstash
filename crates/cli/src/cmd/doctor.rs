@@ -54,15 +54,20 @@ pub fn doctor() -> Result<i32> {
     );
 
     check("agent mode", true, crate::cmd::init::describe_mode(cfg.agent_mode).into());
+    check("mcp server", true, if cfg.mcp { "registered with each agent (`init --mcp`)".into() } else { "off: agents use the CLI (`init --mcp` to register it)".to_string() });
     let home = dirs::home_dir().unwrap_or_default();
     let agents = crate::cmd::init::installed(&home);
-    // Auto mode's hooks left behind in explicit mode (or the other way round) mean the agent
-    // is not in the mode config says: a registration made by hand after the switch, say.
-    let stray = match cfg.agent_mode {
-        tokenstash_core::config::AgentMode::Explicit => agents.iter().any(|a| crate::cmd::init::is_auto_wiring(a)),
-        tokenstash_core::config::AgentMode::Auto => agents.iter().any(|a| crate::cmd::init::is_explicit_wiring(a)),
-    };
-    ok &= check("agents", !stray, if agents.is_empty() { "none configured (run `tokenstash init`)".into() } else if stray { format!("{}  (not all in {} mode: re-run `tokenstash init`)", agents.join(", "), cfg.agent_mode) } else { agents.join(", ") });
+    // Wiring that disagrees with config.toml means the agent is not in the mode chosen: a
+    // registration made by hand after the switch, or what an earlier version installed.
+    let problems: Vec<String> = agents.iter().flat_map(|a| a.problems(cfg.agent_mode, cfg.mcp)).collect();
+    let list = agents.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+    ok &= check("agents", problems.is_empty(), if agents.is_empty() {
+        "none configured (run `tokenstash init`)".into()
+    } else if problems.is_empty() {
+        list
+    } else {
+        format!("{list}  ({}; re-run `tokenstash init`)", problems.join("; "))
+    });
 
     let project = tokenstash_core::project::current();
     let standing = match Db::open_default() {

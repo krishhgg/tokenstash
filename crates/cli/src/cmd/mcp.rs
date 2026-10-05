@@ -14,8 +14,6 @@ use crate::cmd::need::notify_pending;
 
 /// The one rule every surface (instructions, results, skill file, AGENTS snippet) states the
 /// same way: a value the user has not supplied is not to be invented by any route.
-pub const NO_STAND_IN: &str = "do not supply a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code).";
-pub const INSTEAD: &str = "Make the feature optional or report the work blocked on it.";
 use crate::util::{self, App};
 use anyhow::Result;
 use serde::Deserialize;
@@ -440,46 +438,20 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             // The rule that matters is the one attached to the result the agent is looking
             // at. Every outcome carries its own `next`; the top-level one summarises.
             let mut out_results = Vec::with_capacity(results.len());
+            let waited_note = if blocking { format!(" Still pending after waiting {waited} s (calls are capped at {MAX_BLOCK} s).") } else { String::new() };
             for o in &results {
                 let mut v = serde_json::to_value(o)?;
-                let next = match o {
-                    need::Outcome::Injected { name, unverified, .. } => format!(
-                        "{name} is in {}. Load it with your runtime (dotenv, process.env, os.environ); never read, print or quote that file.{}",
-                        env_file.display(), if *unverified { " (Could not re-check it with the provider just now.)" } else { "" }),
-                    need::Outcome::Pending { name, task_id, .. } => {
-                        // `url` on the outcome is where the key is created (the card shows
-                        // it); the link the user needs is the card itself.
+                let (task, card) = match o {
+                    // `url` on the outcome is where the key is created (the card shows it);
+                    // the link the user needs is the card itself.
+                    need::Outcome::Pending { task_id, .. } => {
                         let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state);
                         v["inbox"] = json!(card);
-                        // Why it is pending: a missing key, a stored key waiting for the
-                        // user's approval for this project, or a stored key the provider
-                        // rejected on re-check (Replace card). The agent must not send the
-                        // user to acquire a key they already have.
-                        let task = app.db.get_task(task_id)?;
-                        let needs_full = task.as_ref().map(|t| t.kind == tokenstash_core::db::TaskKind::Approval || t.expects == tokenstash_core::tasks::EXPECTS_REPLACE).unwrap_or(false);
-                        // The agent's link is the paste session: it can take a missing key,
-                        // and it cannot approve. Saying "it works as-is" for an approval card
-                        // sends the user to an error box.
-                        let link = if !card.starts_with("http") {
-                            format!("The inbox is unavailable ({card}); tell the user to run `tokenstash open`.")
-                        } else if needs_full {
-                            format!("The user answers it from the desktop notification, or by running `tokenstash open` in a terminal (this link shows the card but cannot approve it: {card}).")
-                        } else {
-                            format!("Show the user this link: {card}.")
-                        };
-                        let why = match task.as_ref() {
-                            Some(t) if t.kind == tokenstash_core::db::TaskKind::Approval => format!("{name} is stored, but this project needs the user's approval to receive it"),
-                            Some(t) if t.expects == tokenstash_core::tasks::EXPECTS_REPLACE => format!("the stored {name} was rejected by its provider on re-check; the user has been asked for a replacement"),
-                            _ => format!("{name} is not in the stash; the user has been asked to add it"),
-                        };
-                        let waited_note = if blocking { format!(" Still pending after waiting {waited} s (calls are capped at {MAX_BLOCK} s).") } else { String::new() };
-                        format!("{why} ({task_id}).{waited_note} {link} Keep working on everything that does not need it and call task_check(\"{task_id}\") later. Do not wait in a loop, and {NO_STAND_IN}")
+                        (app.db.get_task(task_id)?, card)
                     }
-                    need::Outcome::Denied { name, .. } => format!(
-                        "The user declined {name} for this project. Do not ask again, and {NO_STAND_IN} {INSTEAD}"),
-                    need::Outcome::Expired { name, .. } => format!("The request for {name} expired unanswered. Summarise what is blocked and stop; {NO_STAND_IN}"),
+                    _ => (None, String::new()),
                 };
-                v["next"] = json!(next);
+                v["next"] = json!(crate::guide::next(o, &env_file, task.as_ref(), &card, crate::guide::Recheck::Mcp, &waited_note));
                 out_results.push(v);
             }
             let results = out_results;
@@ -487,7 +459,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                 "results": results,
                 "env_file": env_file,
                 "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
-                "next": if pending { "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, call task_check later." } else { "Done — follow each result's `next`." }
+                "next": crate::guide::summary(pending, crate::guide::Recheck::Mcp)
             });
             if blocking { top["waited_s"] = json!(waited); top["timed_out"] = json!(pending); }
             Ok((top, false))

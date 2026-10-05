@@ -25,9 +25,11 @@
 #
 # Isolation: TOKENSTASH_HOME, the stash (insecure-file, chosen before the first tokenstash
 # call so no keyring is probed), the paired grants and the inbox port are per agent and per run;
-# every project-scoped tokenstash call (`need`, `init`, `doctor`) runs inside the scratch project. MCP
-# wiring is passed on the command line (Claude: --mcp-config --strict-mcp-config; Codex:
-# --ignore-user-config + -c; Cursor: project-local .cursor/mcp.json). What is NOT isolated:
+# every project-scoped tokenstash call (`need`, `init`, `doctor`) runs inside the scratch project.
+# Each agent gets this checkout's skill at project level and uses the CLI, as `init` sets it up.
+# CONF_MCP=1 also registers the MCP server, on the command line (Claude: --mcp-config
+# --strict-mcp-config; Codex: --ignore-user-config + -c; Cursor: project-local
+# .cursor/mcp.json); without it Claude runs with an empty --strict-mcp-config. What is NOT isolated:
 # the agent CLIs' own state — Claude Code reads ~/.claude (CLAUDE.md, settings, skills) and
 # writes its session transcript under ~/.claude/projects; Codex writes ~/.codex/sessions. Those
 # transcripts contain whatever the agent saw, including the canary if it read the env file.
@@ -44,8 +46,9 @@ human() {
 }
 # what `current_exe` reports for a respawned inbox: the fully resolved path
 TS_REAL=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$TS")
-REPO_SKILL=$(cd "$(dirname "$0")/.." && pwd)/crates/cli/SKILL.md
-[ -f "$REPO_SKILL" ] || { echo "crates/cli/SKILL.md not found (run from a checkout)" >&2; exit 2; }
+REPO_SKILL_DIR=$(cd "$(dirname "$0")/.." && pwd)/crates/cli/skill
+[ -f "$REPO_SKILL_DIR/SKILL.md" ] || { echo "crates/cli/skill/SKILL.md not found (run from a checkout)" >&2; exit 2; }
+CONF_MCP=${CONF_MCP:-0}
 shift
 AGENTS=("$@")
 if [ ${#AGENTS[@]} -eq 0 ]; then
@@ -110,14 +113,6 @@ setup_world() {   # $1 agent
     ln -sf "$TS" "$bin/tokenstash"
     export TOKENSTASH_HOME=$home
     (cd "$proj" && "$TS" init --no-agents) >"$dir/init.txt" 2>&1 || { echo "init failed: see $dir/init.txt"; return 1; }
-    if [ "$agent" = codex ]; then
-        # what real Codex users have: the AGENTS.md snippet init installs (globally, but
-        # --ignore-user-config drops ~/.codex/AGENTS.md, so at project level here)
-        # --print-snippet touches nothing (a second `init --project` would record the file
-        # in the developer's real init manifest, which ignores TOKENSTASH_HOME)
-        "$TS" init --print-snippet >"$proj/AGENTS.md" || return 1
-        grep -q "tokenstash" "$proj/AGENTS.md" 2>/dev/null || { echo "could not install the AGENTS.md snippet into the scratch project"; return 1; }
-    fi
     # Trust v2: nothing is trusted by folder. The seed paste below (from inside the scratch
     # project) is the grant that keeps scenario 1 silent; nothing else is granted anywhere.
     local port
@@ -193,23 +188,24 @@ PY
 Three scripts: `app.py` (OpenAI), `mailer.py` (Resend), `billing.py` (Stripe). Each reads its
 key from `.env.local`. Run with `python3 <script>.py`.
 MD
-    local extra=""; [ -f "$proj/AGENTS.md" ] && extra=AGENTS.md
-    (cd "$proj" && $SHA envread.py app.py mailer.py billing.py README.md $extra) >"$dir/sums"
+    (cd "$proj" && $SHA envread.py app.py mailer.py billing.py README.md) >"$dir/sums"
     [ -s "$dir/sums" ] || { echo "could not checksum the project files"; return 1; }
-    # MCP wiring, per agent, without touching the developer's own config. Each agent also
-    # gets the guidance `init` installs for it, from THIS checkout/binary, at project level:
-    # Claude Code the SKILL.md as a project skill, Codex the AGENTS.md snippet (its global
-    # ~/.codex/AGENTS.md is excluded by --ignore-user-config). Cursor has no per-agent file;
-    # on a machine with ~/.claude/skills/tokenstash it reads that too.
+    # The skill `init` installs, from THIS checkout, at project level where each agent reads
+    # it: .claude/skills (Claude Code), .agents/skills (Codex), .cursor/skills (Cursor). The
+    # agent's global copies may also be there; the report says so for Claude. MCP wiring only
+    # with CONF_MCP=1, without touching the developer's own config.
+    local skill_dir
+    case $agent in claude) skill_dir=.claude/skills ;; codex) skill_dir=.agents/skills ;; cursor) skill_dir=.cursor/skills ;; esac
+    mkdir -p "$proj/$skill_dir"
+    cp -R "$REPO_SKILL_DIR" "$proj/$skill_dir/tokenstash" || { echo "could not install the skill into the scratch project"; return 1; }
+    if [ "$CONF_MCP" = 1 ]; then
+        echo "{\"mcpServers\":{\"tokenstash\":{\"type\":\"stdio\",\"command\":\"$TS\",\"args\":[\"mcp\"],\"env\":{\"TOKENSTASH_HOME\":\"$home\"}}}}" >"$dir/mcp.json"
+    else
+        echo '{"mcpServers":{}}' >"$dir/mcp.json"
+    fi
     case $agent in
-        claude)
-            mkdir -p "$proj/.claude/skills/tokenstash"
-            cp "$REPO_SKILL" "$proj/.claude/skills/tokenstash/SKILL.md" || { echo "could not install the skill into the scratch project"; return 1; }
-            cat >"$dir/mcp.json" <<JSON
-{"mcpServers":{"tokenstash":{"type":"stdio","command":"$TS","args":["mcp"],"env":{"TOKENSTASH_HOME":"$home"}}}}
-JSON
-            ;;
         cursor)
+            [ "$CONF_MCP" = 1 ] || return 0
             mkdir -p "$proj/.cursor"
             cat >"$proj/.cursor/mcp.json" <<JSON
 {"mcpServers":{"tokenstash":{"command":"$TS","args":["mcp"],"env":{"TOKENSTASH_HOME":"$home"}}}}
@@ -262,13 +258,12 @@ run_agent() {   # $1 agent, $2 proj, $3 transcript path, $4 prompt
             extract_text "$out.raw" claude >"$out"
             ;;
         codex)
-            local model_args=()
+            local model_args=() mcp_args=()
             [ -n "${CODEX_MODEL:-}" ] && model_args=(-m "$CODEX_MODEL")
+            [ "$CONF_MCP" = 1 ] && mcp_args=(-c "mcp_servers.tokenstash.command=\"$TS\"" -c 'mcp_servers.tokenstash.args=["mcp"]' -c "mcp_servers.tokenstash.env={TOKENSTASH_HOME=\"$home\"}")
             (cd "$proj" && "$TIMEOUT_BIN" --foreground -k 20 "$TIMEOUT" "${envs[@]}" codex exec --json --ignore-user-config --skip-git-repo-check \
                 --sandbox workspace-write -c sandbox_workspace_write.network_access=true -c "sandbox_workspace_write.writable_roots=[\"$dir\"]" ${model_args[@]+"${model_args[@]}"} \
-                -c "mcp_servers.tokenstash.command=\"$TS\"" -c 'mcp_servers.tokenstash.args=["mcp"]' \
-                -c "mcp_servers.tokenstash.env={TOKENSTASH_HOME=\"$home\"}" \
-                --cd "$proj" "$prompt" </dev/null) >"$out.raw" 2>"$out.err"
+                ${mcp_args[@]+"${mcp_args[@]}"} --cd "$proj" "$prompt" </dev/null) >"$out.raw" 2>"$out.err"
             rc=$?
             extract_text "$out.raw" codex >"$out"
             ;;
@@ -491,11 +486,12 @@ wait
     echo "# tokenstash agent conformance — $(date -u +%Y-%m-%dT%H:%MZ)"
     echo
     echo "binary: $TS ($("$TS" --version 2>/dev/null | head -1))"
-    rev=$(git -C "$(dirname "$REPO_SKILL")" rev-parse --short HEAD 2>/dev/null); [ -n "$rev" ] && echo "revision: $rev$(git -C "$(dirname "$REPO_SKILL")" diff --quiet 2>/dev/null || echo ' (with uncommitted changes)')"
+    rev=$(git -C "$REPO_SKILL_DIR" rev-parse --short HEAD 2>/dev/null); [ -n "$rev" ] && echo "revision: $rev$(git -C "$REPO_SKILL_DIR" diff --quiet 2>/dev/null || echo ' (with uncommitted changes)')"
+    echo "wiring: this checkout's skill at project level$([ "$CONF_MCP" = 1 ] && echo ', plus the MCP server')"
     for a in "${AGENTS[@]}"; do
         case $a in cursor) bin=cursor-agent ;; *) bin=$a ;; esac
         printf -- '- %s: %s' "$a" "$("$bin" --version 2>/dev/null | head -1)"
-        [ "$a" = claude ] && printf ' (skill: this checkout'"'"'s SKILL.md, project-level%s)' "$([ -d "$HOME/.claude/skills/tokenstash" ] && echo '; ~/.claude/skills/tokenstash also present')"
+        [ "$a" = claude ] && [ -d "$HOME/.claude/skills/tokenstash" ] && printf ' (~/.claude/skills/tokenstash also present)'
         [ "$a" = codex ] && printf ' (model: %s)' "${CODEX_MODEL:-codex default}"
         echo
     done

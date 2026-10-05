@@ -1,6 +1,7 @@
 //! tokenstash — Paste a key once. Approve each directory. Keep secrets out of status output.
 
 mod cmd;
+mod guide;
 mod inbox_auth;
 mod notify;
 mod util;
