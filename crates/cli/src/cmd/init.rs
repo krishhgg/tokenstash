@@ -437,30 +437,27 @@ fn write_file(p: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
 /// deleted since init must not come back readable by everyone under the umask).
 fn write_file_as(p: &Path, contents: impl AsRef<[u8]>, perms: Option<fs::Permissions>) -> Result<()> {
     use std::io::Write;
-    // A config that is a link (dotfiles kept in a repository) is updated where it points, and
-    // stays a link. A link whose file is gone gets that file back where the link points.
-    let target = match fs::symlink_metadata(p) {
-        Ok(md) if md.file_type().is_symlink() => match fs::canonicalize(p) {
-            Ok(t) => t,
-            Err(_) => {
-                let to = fs::read_link(p)?;
-                if to.is_absolute() { to } else { p.parent().unwrap_or(Path::new(".")).join(to) }
-            }
-        },
-        _ => p.to_path_buf(),
-    };
+    let target = landing(p)?;
     let p = target.as_path();
     let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     // A name nobody can guess, created only if nothing is there: a link planted at a
     // predictable temporary path in a shared directory would otherwise redirect the write.
     let tmp = dir.join(format!(".{}.tokenstash-{}-{:016x}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), std::process::id(), rand::random::<u64>()));
+    let perms = fs::metadata(p).ok().map(|md| md.permissions()).or(perms);
     let written = (|| -> Result<()> {
-        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        match (fs::metadata(p), &perms) {
-            (Ok(md), _) => f.set_permissions(md.permissions())?,
-            (Err(_), Some(perms)) => f.set_permissions(perms.clone())?,
-            (Err(_), None) => {}
+        let mut open = fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        // Created with the final file's mode, never wider: a private config's copy is
+        // private before anyone else could open it.
+        #[cfg(unix)]
+        if let Some(perms) = &perms {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            open.mode(perms.mode() & 0o777);
+        }
+        let mut f = open.open(&tmp)?;
+        if let Some(perms) = &perms {
+            f.set_permissions(perms.clone())?;
         }
         f.write_all(contents.as_ref())?;
         f.sync_all()?;
@@ -471,6 +468,24 @@ fn write_file_as(p: &Path, contents: impl AsRef<[u8]>, perms: Option<fs::Permiss
         let _ = fs::remove_file(&tmp);
     }
     written.map_err(|e| e.context(format!("writing {}", p.display())))
+}
+
+/// Where a write to `p` lands. A config that is a link (dotfiles kept in a repository) is
+/// written at the end of its chain of links, which then stays as it was; that file need
+/// not exist (a link whose file is gone gets the file back where the chain points).
+fn landing(p: &Path) -> Result<PathBuf> {
+    let mut at = p.to_path_buf();
+    // The same limit as the kernel's for following links.
+    for _ in 0..40 {
+        match fs::symlink_metadata(&at) {
+            Ok(md) if md.file_type().is_symlink() => {
+                let to = fs::read_link(&at)?;
+                at = if to.is_absolute() { to } else { at.parent().unwrap_or(Path::new(".")).join(to) };
+            }
+            _ => return Ok(at),
+        }
+    }
+    anyhow::bail!("{} is a loop of links; nothing was written", p.display())
 }
 
 /// Put a backup back in place, atomically and byte for byte: what init replaced need not be
@@ -2181,5 +2196,34 @@ mod tests {
         write(&p, compact);
         assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert_eq!(read(&p), compact);
+    }
+
+    /// Greptile on #70: a config linked through a second link to a deleted file is restored
+    /// at the end of the chain, and both links stay links.
+    #[test]
+    fn a_chain_of_links_is_followed_to_its_end() {
+        let d = scratch("chain");
+        let real = d.join("dotfiles/config.toml");
+        let middle = d.join("middle/config.toml");
+        let link = d.join("codex/config.toml");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::create_dir_all(middle.parent().unwrap()).unwrap();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../dotfiles/config.toml", &middle).unwrap();
+        std::os::unix::fs::symlink(&middle, &link).unwrap();
+        write_file(&link, "model = \"o4\"\n").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&middle).unwrap().file_type().is_symlink());
+        assert_eq!(read(&real), "model = \"o4\"\n");
+    }
+
+    /// A loop of links is reported, and nothing is written.
+    #[test]
+    fn a_loop_of_links_writes_nothing() {
+        let d = scratch("loop");
+        std::os::unix::fs::symlink(d.join("b"), d.join("a")).unwrap();
+        std::os::unix::fs::symlink(d.join("a"), d.join("b")).unwrap();
+        assert!(write_file(&d.join("a"), "x").is_err());
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 2, "no file or temporary file left");
     }
 }
