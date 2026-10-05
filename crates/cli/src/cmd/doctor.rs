@@ -31,23 +31,33 @@ pub fn doctor() -> Result<i32> {
                 .and_then(|db| db.list_secrets())
                 .map(|v| v.iter().map(|m| tokenstash_core::stash::stash_key(&m.name, &m.identity)).collect())
                 .unwrap_or_default();
-            let strays = s.stray_copies(&keys);
-            // Two keyrings that disagree are a fault, because a read can return the old key now.
-            let differ: Vec<&str> = strays.iter().filter(|c| c.differs).map(|c| c.key.as_str()).collect();
-            if !differ.is_empty() {
-                ok &= check("older copies", false, format!(
-                    "the user keyring and the persistent keyring hold different values for {}, so a read can return the old key. tokenstash 0.3.0 or earlier, still running in another login session (an inbox or `tokenstash mcp` started before the upgrade), put the other value there. Stop it, then replace the key with `tokenstash rotate NAME` if the old one is in use",
-                    differ.join(", ")
-                ));
-            }
-            // A copy only another session holds is a note. It does nothing until an older
-            // tokenstash runs there, and an upgrade leaves idle sessions holding them.
-            let held: Vec<&str> = strays.iter().filter(|c| c.elsewhere > 0).map(|c| c.key.as_str()).collect();
-            if !held.is_empty() {
-                check("older copies", true, format!(
-                    "other login sessions hold their own copy of {}, left by tokenstash 0.3.0 or earlier. It matters only while an older tokenstash still runs in one of them (an inbox or `tokenstash mcp` started before the upgrade), because it could put the old key back. Stop it, or end that session",
-                    held.join(", ")
-                ));
+            // One line whenever the backend has copies to look for, so a missing line never
+            // stands for a check that found nothing.
+            if let Some(found) = s.stray_copies(&keys) {
+                let mut detail = vec![];
+                // Two keyrings that disagree are a fault, because a read can return the old
+                // key now.
+                let differ: Vec<&str> = found.copies.iter().filter(|c| c.differs).map(|c| c.key.as_str()).collect();
+                if !differ.is_empty() {
+                    detail.push(format!(
+                        "The user keyring and the persistent keyring hold different values for {}, so a read can return the old key. tokenstash 0.3.0 or earlier, still running in another login session (an inbox or `tokenstash mcp` started before the upgrade), put the other value there. Stop it, then replace the key with `tokenstash rotate NAME` if the old one is in use.",
+                        differ.join(", ")
+                    ));
+                }
+                // A copy only another session holds is a note. It does nothing until an older
+                // tokenstash runs there, and an upgrade leaves idle sessions holding them.
+                let held: Vec<&str> = found.copies.iter().filter(|c| c.elsewhere > 0).map(|c| c.key.as_str()).collect();
+                if !held.is_empty() {
+                    detail.push(format!(
+                        "Other login sessions hold their own copy of {}, left by tokenstash 0.3.0 or earlier. It matters only while an older tokenstash still runs in one of them (an inbox or `tokenstash mcp` started before the upgrade), because it could put the old key back. Stop it, or end that session.",
+                        held.join(", ")
+                    ));
+                }
+                if detail.is_empty() {
+                    detail.push(format!("None among the {} key(s) checked.", found.checked));
+                }
+                detail.extend(found.limited);
+                ok &= check("older copies", differ.is_empty(), detail.join(" "));
             }
         }
         Err(e) => { ok &= check("stash backend", false, e.to_string()); }

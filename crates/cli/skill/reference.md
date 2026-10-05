@@ -95,7 +95,9 @@ Runs COMMAND with the env file loaded into its environment. Its output reaches y
 
 ### `tokenstash doctor`
 
-Checks the setup, one line each: config file, stash backend (and how long keys last in it), keys an older tokenstash keeps its own copy of (Linux kernel keyring only), database, provider registry, inbox, agent mode, the skill and any MCP registration per agent, this directory (refused, paired, or not yet), and the binary path. Exit 0 when nothing is wrong, 1 otherwise. Safe to run at any time.
+Checks the setup, one line each: config file, stash backend (and how long keys last in it), older copies (Linux kernel keyring only), database, provider registry, inbox, agent mode, the skill and any MCP registration per agent, this directory (refused, paired, or not yet), and the binary path. Exit 0 when nothing is wrong, 1 otherwise. Safe to run at any time.
+
+The older copies line looks at every key this home's index lists and every key the kernel keyring holds for this home, for copies a tokenstash older than 0.4 keeps. It fails when a key's user keyring and persistent keyring hold different values, because a read can then return the old key. It passes with a note when only another login session holds a copy, which matters only while an older tokenstash runs in that session. When `/proc/keys` cannot be read, it says so and looks only at the keys the index lists.
 
 ### `tokenstash remote [tailscale [--login LOGIN] | off]`
 

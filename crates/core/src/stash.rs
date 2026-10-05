@@ -62,11 +62,21 @@ pub trait Stash {
     fn get(&self, key: &str) -> Result<Option<SecretString>>;
     fn set(&self, key: &str, value: &SecretString) -> Result<()>;
     fn delete(&self, key: &str) -> Result<bool>;
-    /// Among `keys`, the ones with a copy this backend cannot keep up to date. `doctor` shows
-    /// them.
-    fn stray_copies(&self, _keys: &[String]) -> Vec<StrayCopy> {
-        vec![]
+    /// Keys with a copy this backend cannot keep up to date, among `keys` and any other key it
+    /// holds for this home. `None` when the backend keeps no such copies. `doctor` shows it.
+    fn stray_copies(&self, _keys: &[String]) -> Option<StrayCheck> {
+        None
     }
+}
+
+/// What [`Stash::stray_copies`] found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StrayCheck {
+    /// How many keys it looked at.
+    pub checked: usize,
+    pub copies: Vec<StrayCopy>,
+    /// What it could not look at, and why, when part of the check could not run.
+    pub limited: Option<String>,
 }
 
 /// A key with a copy its backend cannot keep up to date (see [`Stash::stray_copies`]).
@@ -307,11 +317,46 @@ mod kernel {
         Ok(out)
     }
 
-    /// For `doctor`, whether the user keyring and the persistent keyring link different
-    /// objects under `desc` that hold different values, and how many live copies only other
-    /// login sessions link. `/proc/keys` lists every key this user may view, in any session;
-    /// a copy there is visible but, made by older code, not writable from here.
-    pub(super) fn strays(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str) -> Result<(bool, usize)> {
+    /// [`super::Stash::stray_copies`] for the kernel keyring, given what reading `/proc/keys`
+    /// returned. That file lists every key this user may view, in any session. It adds the
+    /// keys stored under this home's service name that this home's index does not list (a
+    /// lost index, another home with the same service name), which `need` can still read
+    /// and adopt. A copy another session holds is visible there but, made by older code,
+    /// not writable from here.
+    pub(super) fn stray_check(keys: &[String], listing: std::io::Result<String>) -> super::StrayCheck {
+        let mut check = super::StrayCheck::default();
+        let user = match user() {
+            Ok(u) => u,
+            Err(e) => {
+                check.limited = Some(format!("Nothing was checked ({e:#})."));
+                return check;
+            }
+        };
+        let persistent = persistent();
+        let mut names = keys.to_vec();
+        match &listing {
+            Ok(l) => names.extend(stored_keys(l)),
+            Err(e) => {
+                check.limited = Some(format!("Could not read /proc/keys ({e}), so only the keys this home's index lists were checked, and not for copies other login sessions hold."));
+            }
+        }
+        names.sort();
+        names.dedup();
+        check.checked = names.len();
+        for key in names {
+            if let Ok((differs, elsewhere)) = strays(&user, persistent.as_ref(), &description(&key), listing.as_deref().ok()) {
+                if differs || elsewhere > 0 {
+                    check.copies.push(super::StrayCopy { key, differs, elsewhere });
+                }
+            }
+        }
+        check
+    }
+
+    /// Whether the user keyring and the persistent keyring link different objects under
+    /// `desc` that hold different values, and how many live copies in `listing` (the text
+    /// of `/proc/keys`) only other login sessions link.
+    fn strays(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str, listing: Option<&str>) -> Result<(bool, usize)> {
         let u = find(user, desc)?;
         let p = persistent.map(|p| find(p, desc)).transpose()?.flatten();
         let differs = match (u, p) {
@@ -322,24 +367,35 @@ mod kernel {
             _ => false,
         };
         let own = session().map(|s| find(&s, desc)).transpose()?.flatten();
-        let listed = std::fs::read_to_string("/proc/keys").unwrap_or_default();
-        let elsewhere = listed.lines().filter_map(|l| listed_key(l, desc)).filter(|k| ![u, p, own].contains(&Some(*k))).count();
+        let elsewhere = listing.map_or(0, |l| listed(l).filter(|(k, d)| *d == desc && ![u, p, own].contains(&Some(*k))).count());
         Ok((differs, elsewhere))
     }
 
-    /// The key a `/proc/keys` line describes, if it is a live `user` key named `desc`. A
-    /// line reads `serial flags usage timeout perm uid gid type description: length`.
-    fn listed_key(line: &str, desc: &str) -> Option<Key> {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        let [serial, flags, usage, timeout, _perm, _uid, _gid, kind, name, ..] = f.as_slice() else { return None };
-        // Instantiated, and not revoked, dead, negative or invalidated; still referenced
-        // (a key waiting for the collector has a usage of 0); not expired.
-        let live = flags.starts_with('I') && !flags.contains(['R', 'D', 'N', 'i']) && usage.parse::<u32>().is_ok_and(|n| n > 0) && *timeout != "expd";
-        if !live || *kind != "user" || name.strip_suffix(':').unwrap_or(name) != desc {
-            return None;
-        }
-        let serial = u32::from_str_radix(serial, 16).ok()?;
-        Some(Key::from_id(linux_keyutils::KeySerialId(serial as i32)))
+    /// The `NAME@identity` of every key in `listing` stored under this home's service name,
+    /// leaving out the backend probe's.
+    fn stored_keys(listing: &str) -> Vec<String> {
+        let suffix = format!("@{}", super::service());
+        listed(listing)
+            .filter_map(|(_, d)| d.strip_prefix("keyring-rs:")?.strip_suffix(suffix.as_str()).map(str::to_string))
+            .filter(|k| k != "__tokenstash_probe__")
+            .collect()
+    }
+
+    /// The live `user` keys in `listing`, the text of `/proc/keys`, with their descriptions.
+    /// A line reads `serial flags usage timeout perm uid gid type description: length`.
+    fn listed(listing: &str) -> impl Iterator<Item = (Key, &str)> {
+        listing.lines().filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [serial, flags, usage, timeout, _perm, _uid, _gid, kind, name, ..] = f.as_slice() else { return None };
+            // Instantiated, and not revoked, dead, negative or invalidated; still referenced
+            // (a key waiting for the collector has a usage of 0); not expired.
+            let live = flags.starts_with('I') && !flags.contains(['R', 'D', 'N', 'i']) && usage.parse::<u32>().is_ok_and(|n| n > 0) && *timeout != "expd";
+            if !live || *kind != "user" {
+                return None;
+            }
+            let serial = u32::from_str_radix(serial, 16).ok()?;
+            Some((Key::from_id(linux_keyutils::KeySerialId(serial as i32)), name.strip_suffix(':').unwrap_or(name)))
+        })
     }
 
     /// This user may use the key from any session. The kernel checks possession again on
@@ -493,15 +549,8 @@ impl Stash for KernelKeyring {
             Ok(!copies.is_empty())
         })
     }
-    fn stray_copies(&self, keys: &[String]) -> Vec<StrayCopy> {
-        let Ok(user) = kernel::user() else { return vec![] };
-        let persistent = kernel::persistent();
-        keys.iter()
-            .filter_map(|key| {
-                let (differs, elsewhere) = kernel::strays(&user, persistent.as_ref(), &kernel::description(key)).ok()?;
-                (differs || elsewhere > 0).then(|| StrayCopy { key: key.clone(), differs, elsewhere })
-            })
-            .collect()
+    fn stray_copies(&self, keys: &[String]) -> Option<StrayCheck> {
+        Some(kernel::stray_check(keys, std::fs::read_to_string("/proc/keys")))
     }
 }
 
@@ -779,6 +828,20 @@ mod kernel_tests {
         println!("{RAN}");
     }
 
+    /// What `doctor`'s check finds for `keys` (the keys the index lists), with `/proc/keys`
+    /// read as usual.
+    fn found(keys: &[&str]) -> Vec<StrayCopy> {
+        let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        let check = KernelKeyring.stray_copies(&keys).expect("the kernel keyring checks for copies");
+        assert_eq!(check.limited, None, "/proc/keys is readable here");
+        check.copies
+    }
+
+    /// `/proc/keys` could not be read.
+    fn unreadable() -> std::io::Result<String> {
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no /proc here"))
+    }
+
     /// Greptile on #60 and #67: an older tokenstash still running in another login session
     /// reads its own old copy of a key and links it into the persistent keyring, so the user
     /// keyring and the persistent keyring hold different values. `doctor`'s check names the
@@ -786,6 +849,10 @@ mod kernel_tests {
     /// into the persistent keyring again. A write from that old process leaves the same state
     /// with the newer value in the persistent keyring; the kernel cannot tell the two apart,
     /// so that case is reported, not repaired.
+    ///
+    /// Greptile on #77: the check also covers a key this home's index does not list, which
+    /// `need` can still read and adopt, and still compares the two keyrings when `/proc/keys`
+    /// cannot be read, saying what it could not check.
     #[test]
     fn an_old_copy_linked_into_the_persistent_keyring_is_reported_and_not_read() {
         const NAME: &str = "stash::kernel_tests::an_old_copy_linked_into_the_persistent_keyring_is_reported_and_not_read";
@@ -806,18 +873,26 @@ mod kernel_tests {
         probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
         let _cleanup = Cleanup(key);
         KernelKeyring.set(key, &SecretString::from("sk-current-value")).unwrap();
-        assert!(KernelKeyring.stray_copies(&[key.to_string()]).is_empty(), "one object, linked into both keyrings");
+        assert!(found(&[key]).is_empty(), "one object, linked into both keyrings");
         assert!(spawn_session(NAME, &[(ROLE, std::ffi::OsStr::new("old-reader"))]), "the second session must run");
         let user = KeyRing::from_special_id(KeyRingIdentifier::User, false).unwrap();
         let persistent = KeyRing::get_persistent(KeyRingIdentifier::Session).unwrap();
         assert_ne!(user.search(&desc).unwrap(), persistent.search(&desc).unwrap(), "the setup must reproduce the old process's link");
 
-        assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![StrayCopy { key: key.into(), differs: true, elsewhere: 0 }]);
+        let differs = vec![StrayCopy { key: key.into(), differs: true, elsewhere: 0 }];
+        assert_eq!(found(&[key]), differs);
+        assert_eq!(found(&[]), differs, "a key the index does not list is found in the keyrings");
+        let blind = kernel::stray_check(&[key.to_string()], unreadable());
+        assert_eq!(blind.copies, differs, "the two keyrings are compared without /proc/keys");
+        assert!(blind.limited.as_deref().is_some_and(|w| w.starts_with("Could not read /proc/keys (no /proc here)")), "{blind:?}");
+        let blind = kernel::stray_check(&[], unreadable());
+        assert!(blind.copies.is_empty() && blind.limited.is_some(), "without /proc/keys only indexed keys are checked, and the check says so: {blind:?}");
+
         assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-current-value"));
         assert_eq!(persistent.search(&desc).unwrap(), user.search(&desc).unwrap(), "the read linked the user keyring's key into the persistent keyring again");
         // The old copy may still count as held elsewhere until the kernel collects the dead
         // session keyring that linked it, but the two keyrings agree again.
-        assert!(KernelKeyring.stray_copies(&[key.to_string()]).iter().all(|c| !c.differs));
+        assert!(found(&[key]).iter().all(|c| !c.differs));
         println!("{RAN}");
     }
 
@@ -844,9 +919,12 @@ mod kernel_tests {
         probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
         let _cleanup = Cleanup(key);
         KernelKeyring.set(key, &SecretString::from("sk-current-value")).unwrap();
-        assert!(KernelKeyring.stray_copies(&[key.to_string()]).is_empty(), "one object, linked into both keyrings");
+        assert!(found(&[key]).is_empty(), "one object, linked into both keyrings");
         while_another_session_holds(NAME, || {
-            assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![StrayCopy { key: key.into(), differs: false, elsewhere: 1 }]);
+            assert_eq!(found(&[key]), vec![StrayCopy { key: key.into(), differs: false, elsewhere: 1 }]);
+            // Without /proc/keys the copy cannot be seen, and the check says so.
+            let blind = kernel::stray_check(&[key.to_string()], unreadable());
+            assert!(blind.copies.is_empty() && blind.limited.is_some(), "{blind:?}");
             // It is not the key read here.
             assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-current-value"));
         });
