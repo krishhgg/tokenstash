@@ -25,6 +25,19 @@ pub fn doctor() -> Result<i32> {
                 (Ok(()), None) => String::new(),
             };
             ok &= check("stash backend", probe.is_ok(), format!("{}{note}", s.backend()));
+            // With the kernel keyring, an older tokenstash keeps its own copy of a key in each
+            // login session it ran in, and while it runs it can put an old value back.
+            let keys: Vec<String> = Db::open_default()
+                .and_then(|db| db.list_secrets())
+                .map(|v| v.iter().map(|m| tokenstash_core::stash::stash_key(&m.name, &m.identity)).collect())
+                .unwrap_or_default();
+            let strays = s.stray_copies(&keys);
+            if !strays.is_empty() {
+                ok &= check("older copies", false, format!(
+                    "{}. tokenstash 0.3.0 and earlier keep a copy of a key in each login session they ran in, and one still running there (an inbox or `tokenstash mcp` started before the upgrade) can put an old value back. Stop it; its copies go when that session ends. If the old key is the one in use, replace it with `tokenstash rotate NAME`",
+                    strays.join("; ")
+                ));
+            }
         }
         Err(e) => { ok &= check("stash backend", false, e.to_string()); }
     }

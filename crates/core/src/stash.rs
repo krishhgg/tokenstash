@@ -62,6 +62,11 @@ pub trait Stash {
     fn get(&self, key: &str) -> Result<Option<SecretString>>;
     fn set(&self, key: &str, value: &SecretString) -> Result<()>;
     fn delete(&self, key: &str) -> Result<bool>;
+    /// Among `keys`, the ones with a copy this backend cannot keep up to date, each with what
+    /// was found. `doctor` shows them.
+    fn stray_copies(&self, _keys: &[String]) -> Vec<String> {
+        vec![]
+    }
 }
 
 /// Stash key format: `NAME@identity`. Decided day one so identities never need a migration.
@@ -189,6 +194,21 @@ impl Stash for KeyringStash {
 /// keep keyring-rs's description, `keyring-rs:<NAME@identity>@<service>`, so keys stored by
 /// older versions are found where they are.
 ///
+/// A read that finds the key linked into both rings changes nothing. Any other read moves
+/// links (it adopts a key older code left in one ring or in the session keyring, or puts the
+/// user keyring's key back into the persistent keyring), and it does so under the writers'
+/// lock from a fresh look, so it never links an older object over one a writer in another
+/// session stored meanwhile.
+///
+/// One case this cannot fix. An older tokenstash still running in another login session
+/// reads and writes its own session copy, which no other session may write. Its read links
+/// that copy into the persistent keyring, and so does its write, after giving the copy the
+/// new value. Both leave the user keyring holding one value and the persistent keyring
+/// another, and the kernel keeps no time of write to tell which is newer. A read here keeps
+/// the user keyring's value, which is right after the old process read and wrong after it
+/// wrote. Taking the persistent keyring's value instead would let any old process's read
+/// bring an old key back. [`Stash::stray_copies`] finds both states for `doctor`.
+///
 /// The user keyring lives while any process of this user runs; the persistent keyring
 /// survives a logout but is dropped after `/proc/sys/kernel/keys/persistent_keyring_expiry`
 /// seconds (three days by default) without use. Neither survives a reboot.
@@ -239,6 +259,16 @@ mod kernel {
         }
     }
 
+    /// The user keyring's key, when the persistent keyring links the same object or the
+    /// kernel has no persistent keyring. Reading that key changes no links.
+    pub(super) fn settled(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str) -> Result<Option<Key>> {
+        let Some(k) = find(user, desc)? else { return Ok(None) };
+        match persistent {
+            None => Ok(Some(k)),
+            Some(p) => Ok((find(p, desc)? == Some(k)).then_some(k)),
+        }
+    }
+
     /// The key to read: the user keyring's, else the persistent keyring's, else (keys only
     /// older code stored) whatever the session keyring holds.
     pub(super) fn current(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str) -> Result<Option<Key>> {
@@ -263,6 +293,41 @@ mod kernel {
             }
         }
         Ok(out)
+    }
+
+    /// For `doctor`, whether the user keyring and the persistent keyring link different
+    /// objects under `desc` that hold different values, and how many live copies only other
+    /// login sessions link. `/proc/keys` lists every key this user may view, in any session;
+    /// a copy there is visible but, made by older code, not writable from here.
+    pub(super) fn strays(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str) -> Result<(bool, usize)> {
+        let u = find(user, desc)?;
+        let p = persistent.map(|p| find(p, desc)).transpose()?.flatten();
+        let differs = match (u, p) {
+            (Some(u), Some(p)) if u != p => {
+                let (a, b) = (read(u).ok().flatten().map(zeroize::Zeroizing::new), read(p).ok().flatten().map(zeroize::Zeroizing::new));
+                matches!((a, b), (Some(a), Some(b)) if a != b)
+            }
+            _ => false,
+        };
+        let own = session().map(|s| find(&s, desc)).transpose()?.flatten();
+        let listed = std::fs::read_to_string("/proc/keys").unwrap_or_default();
+        let elsewhere = listed.lines().filter_map(|l| listed_key(l, desc)).filter(|k| ![u, p, own].contains(&Some(*k))).count();
+        Ok((differs, elsewhere))
+    }
+
+    /// The key a `/proc/keys` line describes, if it is a live `user` key named `desc`. A
+    /// line reads `serial flags usage timeout perm uid gid type description: length`.
+    fn listed_key(line: &str, desc: &str) -> Option<Key> {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let [serial, flags, usage, timeout, _perm, _uid, _gid, kind, name, ..] = f.as_slice() else { return None };
+        // Instantiated, and not revoked, dead, negative or invalidated; still referenced
+        // (a key waiting for the collector has a usage of 0); not expired.
+        let live = flags.starts_with('I') && !flags.contains(['R', 'D', 'N', 'i']) && usage.parse::<u32>().is_ok_and(|n| n > 0) && *timeout != "expd";
+        if !live || *kind != "user" || name.strip_suffix(':').unwrap_or(name) != desc {
+            return None;
+        }
+        let serial = u32::from_str_radix(serial, 16).ok()?;
+        Some(Key::from_id(linux_keyutils::KeySerialId(serial as i32)))
     }
 
     /// This user may use the key from any session. The kernel checks possession again on
@@ -351,11 +416,33 @@ impl Stash for KernelKeyring {
     fn get(&self, key: &str) -> Result<Option<SecretString>> {
         let desc = kernel::description(key);
         let (user, persistent) = (kernel::user()?, kernel::persistent());
-        let Some(k) = kernel::current(&user, persistent.as_ref(), &desc)? else { return Ok(None) };
-        // Adopt a key older code left only in the persistent or the session keyring, and
-        // re-pin it so the persistent link outlives the next logout. The read does not
-        // depend on it.
-        let _ = kernel::pin(&user, persistent.as_ref(), k);
+        let k = match kernel::settled(&user, persistent.as_ref(), &desc)? {
+            Some(k) => k,
+            None => {
+                if kernel::current(&user, persistent.as_ref(), &desc)?.is_none() {
+                    return Ok(None);
+                }
+                #[cfg(test)]
+                if let Some(hook) = BEFORE_RELINK.with(|h| h.borrow_mut().take()) {
+                    hook();
+                }
+                // Adopt a key older code left only in the persistent or the session keyring,
+                // or pin the user keyring's key into the persistent keyring again, so it
+                // outlives the next logout. A writer in another session may store the key
+                // after the look above. Under its lock, a fresh look finds what it stored,
+                // and the old object is not linked over it. The read does not depend on
+                // the links.
+                let found = Self::locked(|| {
+                    let k = kernel::current(&user, persistent.as_ref(), &desc)?;
+                    if let Some(k) = k {
+                        let _ = kernel::pin(&user, persistent.as_ref(), k);
+                    }
+                    Ok(k)
+                })?;
+                let Some(k) = found else { return Ok(None) };
+                k
+            }
+        };
         let Some(bytes) = kernel::read(k)? else { return Ok(None) };
         let v = String::from_utf8(bytes).map_err(|_| anyhow!("the kernel keyring entry for {key} is not UTF-8"))?;
         Ok(Some(SecretString::from(v)))
@@ -394,6 +481,33 @@ impl Stash for KernelKeyring {
             Ok(!copies.is_empty())
         })
     }
+    fn stray_copies(&self, keys: &[String]) -> Vec<String> {
+        let Ok(user) = kernel::user() else { return vec![] };
+        let persistent = kernel::persistent();
+        keys.iter()
+            .filter_map(|key| {
+                let (differs, elsewhere) = kernel::strays(&user, persistent.as_ref(), &kernel::description(key)).ok()?;
+                let mut found = vec![];
+                if differs {
+                    found.push("the user keyring and the persistent keyring hold different values".to_string());
+                }
+                match elsewhere {
+                    0 => {}
+                    1 => found.push("1 copy in another login session".into()),
+                    n => found.push(format!("{n} copies in other login sessions")),
+                }
+                (!found.is_empty()).then(|| format!("{key}: {}", found.join(", ")))
+            })
+            .collect()
+    }
+}
+
+// Test-only: runs once, on this thread, in a kernel keyring read that is about to move
+// links, after its first look and before it takes the lock. Tests use it to make another
+// session store the key in that gap.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static BEFORE_RELINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 // ---------------- insecure file (tests/CI only) ----------------
@@ -472,15 +586,14 @@ mod kernel_tests {
         false
     }
 
-    /// Run the test `name` in a new process with a session keyring of its own and `env`
-    /// added; assert it ran its body to the end. False if keyctl is refused here.
-    fn spawn_session(name: &str, env: &[(&str, &std::ffi::OsStr)]) -> bool {
+    /// What the second process in a test does, for tests that start one.
+    const ROLE: &str = "TOKENSTASH_KERNEL_TEST_ROLE";
+
+    /// The test `name` again, in a process that will join a session keyring of its own.
+    fn session_command(name: &str) -> std::process::Command {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args([name, "--exact", "--nocapture", "--test-threads=1"]).env(CHILD, "1");
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
         // SAFETY: only an async-signal-safe syscall runs between fork and exec.
         unsafe {
             cmd.pre_exec(|| {
@@ -490,6 +603,16 @@ mod kernel_tests {
                 }
                 Ok(())
             });
+        }
+        cmd
+    }
+
+    /// Run the test `name` in a new process with a session keyring of its own and `env`
+    /// added; assert it ran its body to the end. False if keyctl is refused here.
+    fn spawn_session(name: &str, env: &[(&str, &std::ffi::OsStr)]) -> bool {
+        let mut cmd = session_command(name);
+        for (k, v) in env {
+            cmd.env(k, v);
         }
         let out = match cmd.output() {
             Ok(o) => o,
@@ -507,6 +630,27 @@ mod kernel_tests {
     /// Printed by a child that ran the body to the end, so a silent early return cannot
     /// pass as a pass.
     const RAN: &str = "kernel keyring test body completed";
+
+    /// Printed by a holder (see [`while_another_session_holds`]) once its copy is in place.
+    const HELD: &str = "kernel keyring test copy held";
+
+    /// Run the test `name` as a holder (`ROLE=holder`) in a new process with a session
+    /// keyring of its own, and call `f` while that process, and so its session keyring and
+    /// whatever it linked there, is still alive. The holder prints [`HELD`], then waits for
+    /// its stdin to close.
+    fn while_another_session_holds(name: &str, f: impl FnOnce()) {
+        use std::io::{BufRead, Read};
+        let mut child = session_command(name).env(ROLE, "holder").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut text = String::new();
+        while !text.contains(HELD) {
+            assert_ne!(out.read_line(&mut text).unwrap(), 0, "the holder exited before it held a copy:\n{text}");
+        }
+        f();
+        drop(child.stdin.take());
+        out.read_to_string(&mut text).unwrap();
+        assert!(child.wait().unwrap().success() && text.contains(RAN), "the holder did not run its body to the end:\n{text}");
+    }
 
     fn value(s: &dyn Stash, key: &str) -> Option<String> {
         s.get(key).unwrap().map(|v| v.expose_secret().to_string())
@@ -576,7 +720,7 @@ mod kernel_tests {
             return;
         }
         let key = "OPENAI_API_KEY@default";
-        if std::env::var_os("TOKENSTASH_KERNEL_TEST_ROLE").is_some() {
+        if std::env::var_os(ROLE).is_some() {
             // The second session: a paste, nothing else.
             KernelKeyring.set(key, &SecretString::from("sk-pasted-in-the-other-session")).unwrap();
             println!("{RAN}");
@@ -590,8 +734,117 @@ mod kernel_tests {
         let session = KeyRing::from_special_id(KeyRingIdentifier::Session, false).unwrap();
         let shadow = session.add_key(&kernel::description(key), b"sk-old-session-copy").unwrap();
         assert_eq!(session.search(&kernel::description(key)).unwrap(), shadow, "the setup must reproduce the shadowing");
-        assert!(spawn_session(NAME, &[("TOKENSTASH_KERNEL_TEST_ROLE", std::ffi::OsStr::new("writer"))]), "the second session must run");
+        assert!(spawn_session(NAME, &[(ROLE, std::ffi::OsStr::new("writer"))]), "the second session must run");
         assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-pasted-in-the-other-session"));
+        println!("{RAN}");
+    }
+
+    /// Greptile on #61, #63 and #64: a read that finds a key only in this session's keyring (a
+    /// copy older code left) links it into the user and persistent keyrings. Another session
+    /// can store the key between that read's search and its links. The read must then return
+    /// the stored key and leave the old copy out of both keyrings, not link it over the new one.
+    #[test]
+    fn a_read_does_not_link_a_session_copy_over_a_key_stored_meanwhile() {
+        const NAME: &str = "stash::kernel_tests::a_read_does_not_link_a_session_copy_over_a_key_stored_meanwhile";
+        if !in_own_session(NAME) {
+            return;
+        }
+        let key = "OPENAI_API_KEY@default";
+        if std::env::var_os(ROLE).is_some() {
+            // The second session: a paste, nothing else.
+            KernelKeyring.set(key, &SecretString::from("sk-stored-from-another-session")).unwrap();
+            println!("{RAN}");
+            return;
+        }
+        probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
+        let _cleanup = Cleanup(key);
+        let desc = kernel::description(key);
+        // What older tokenstash left in this session, and nowhere else.
+        let session = KeyRing::from_special_id(KeyRingIdentifier::Session, false).unwrap();
+        let old = session.add_key(&desc, b"sk-old-copy-only-in-this-session").unwrap();
+        // The read has found that copy; before it links it, the other session stores the key.
+        BEFORE_RELINK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|| assert!(spawn_session(NAME, &[(ROLE, std::ffi::OsStr::new("writer"))]), "the second session must run")))
+        });
+        assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-stored-from-another-session"));
+        assert!(BEFORE_RELINK.with(|h| h.borrow().is_none()), "the read went through the gap");
+        let user = KeyRing::from_special_id(KeyRingIdentifier::User, false).unwrap();
+        let persistent = KeyRing::get_persistent(KeyRingIdentifier::Session).unwrap();
+        let stored = user.search(&desc).unwrap();
+        assert_ne!(stored, old, "the old copy is not linked into the user keyring");
+        assert_eq!(persistent.search(&desc).unwrap(), stored, "nor into the persistent keyring");
+        println!("{RAN}");
+    }
+
+    /// Greptile on #60 and #67: an older tokenstash still running in another login session
+    /// reads its own old copy of a key and links it into the persistent keyring, so the user
+    /// keyring and the persistent keyring hold different values. `doctor`'s check names the
+    /// key while they differ. A read here keeps the user keyring's value and links that key
+    /// into the persistent keyring again. A write from that old process leaves the same state
+    /// with the newer value in the persistent keyring; the kernel cannot tell the two apart,
+    /// so that case is reported, not repaired.
+    #[test]
+    fn an_old_copy_linked_into_the_persistent_keyring_is_reported_and_not_read() {
+        const NAME: &str = "stash::kernel_tests::an_old_copy_linked_into_the_persistent_keyring_is_reported_and_not_read";
+        if !in_own_session(NAME) {
+            return;
+        }
+        let key = "OPENAI_API_KEY@default";
+        let desc = kernel::description(key);
+        if std::env::var_os(ROLE).is_some() {
+            // What keyring-rs's keyutils store does when it reads in a session that holds
+            // its own copy. It links that copy into the persistent keyring.
+            let session = KeyRing::from_special_id(KeyRingIdentifier::Session, false).unwrap();
+            let old = session.add_key(&desc, b"sk-old-copy-of-that-session").unwrap();
+            KeyRing::get_persistent(KeyRingIdentifier::Session).unwrap().link_key(old).unwrap();
+            println!("{RAN}");
+            return;
+        }
+        probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
+        let _cleanup = Cleanup(key);
+        KernelKeyring.set(key, &SecretString::from("sk-current-value")).unwrap();
+        assert!(KernelKeyring.stray_copies(&[key.to_string()]).is_empty(), "one object, linked into both keyrings");
+        assert!(spawn_session(NAME, &[(ROLE, std::ffi::OsStr::new("old-reader"))]), "the second session must run");
+        let user = KeyRing::from_special_id(KeyRingIdentifier::User, false).unwrap();
+        let persistent = KeyRing::get_persistent(KeyRingIdentifier::Session).unwrap();
+        assert_ne!(user.search(&desc).unwrap(), persistent.search(&desc).unwrap(), "the setup must reproduce the old process's link");
+
+        assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![format!("{key}: the user keyring and the persistent keyring hold different values")]);
+        assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-current-value"));
+        assert_eq!(persistent.search(&desc).unwrap(), user.search(&desc).unwrap(), "the read linked the user keyring's key into the persistent keyring again");
+        assert!(KernelKeyring.stray_copies(&[key.to_string()]).iter().all(|s| !s.contains("different values")));
+        println!("{RAN}");
+    }
+
+    /// Greptile on #67: a copy that only another login session links cannot be written from
+    /// here, so a replacement stored here does not reach it, and an older tokenstash in that
+    /// session keeps reading it. `doctor`'s check counts it.
+    #[test]
+    fn a_copy_only_another_live_session_holds_is_counted() {
+        const NAME: &str = "stash::kernel_tests::a_copy_only_another_live_session_holds_is_counted";
+        if !in_own_session(NAME) {
+            return;
+        }
+        let key = "OPENAI_API_KEY@default";
+        let desc = kernel::description(key);
+        if std::env::var_os(ROLE).is_some() {
+            // An older tokenstash's session copy, held while the other process checks.
+            let session = KeyRing::from_special_id(KeyRingIdentifier::Session, false).unwrap();
+            session.add_key(&desc, b"sk-old-copy-of-that-session").unwrap();
+            println!("{HELD}");
+            let _ = std::io::stdin().read_line(&mut String::new());
+            println!("{RAN}");
+            return;
+        }
+        probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
+        let _cleanup = Cleanup(key);
+        KernelKeyring.set(key, &SecretString::from("sk-current-value")).unwrap();
+        assert!(KernelKeyring.stray_copies(&[key.to_string()]).is_empty(), "one object, linked into both keyrings");
+        while_another_session_holds(NAME, || {
+            assert_eq!(KernelKeyring.stray_copies(&[key.to_string()]), vec![format!("{key}: 1 copy in another login session")]);
+            // It is not the key read here.
+            assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-current-value"));
+        });
         println!("{RAN}");
     }
 

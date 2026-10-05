@@ -95,7 +95,7 @@ Runs COMMAND with the env file loaded into its environment. Its output reaches y
 
 ### `tokenstash doctor`
 
-Checks the setup, one line each: config file, stash backend (and how long keys last in it), database, provider registry, inbox, agent mode, the skill and any MCP registration per agent, this directory (refused, paired, or not yet), and the binary path. Exit 0 when nothing is wrong, 1 otherwise. Safe to run at any time.
+Checks the setup, one line each: config file, stash backend (and how long keys last in it), keys an older tokenstash keeps its own copy of (Linux kernel keyring only), database, provider registry, inbox, agent mode, the skill and any MCP registration per agent, this directory (refused, paired, or not yet), and the binary path. Exit 0 when nothing is wrong, 1 otherwise. Safe to run at any time.
 
 ### `tokenstash remote [tailscale [--login LOGIN] | off]`
 
