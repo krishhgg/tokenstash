@@ -328,6 +328,31 @@ fn redactor_masks_each_line_of_a_multiline_value() {
     assert_eq!(r.redact("x runHook preBuild\nreturn 0; y"), "x [redacted] y");
 }
 
+/// Greptile on #64: a compact service-account JSON holds its private key on one line, with
+/// the key's line breaks written as the two characters `\n` (or `\r\n`). A child that
+/// decodes the JSON prints the key one line at a time, and each of those lines is masked,
+/// by the same length rules as a real line.
+#[test]
+fn redactor_masks_the_lines_of_a_key_held_with_escaped_line_breaks() {
+    let body: Vec<String> = (0..3).map(|i| format!("MIIfake{i}").repeat(8)).collect();
+    for sep in ["\\n", "\\r\\n"] {
+        let json = format!(r#"{{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----{sep}{}{sep}-----END PRIVATE KEY-----{sep}","client_email":"ci@example.iam.gserviceaccount.com"}}"#, body.join(sep));
+        assert!(!json.contains(['\n', '\r']), "the value is one line");
+        let r = redact::Redactor::new().with(&SecretString::from(json.clone()));
+        for line in &body {
+            assert_eq!(r.redact(line), "[redacted]", "{sep}");
+        }
+        // the armor is not secret and stays readable
+        assert_eq!(r.redact("-----END PRIVATE KEY-----"), "-----END PRIVATE KEY-----", "{sep}");
+        // the whole value is still one match
+        assert_eq!(r.redact(&format!("sa: {json}")), "sa: [redacted]", "{sep}");
+    }
+    // A part shorter than a stored secret can be is masked only where it stands alone.
+    let r = redact::Redactor::new().with(&SecretString::from("apple\\nberry".to_string()));
+    assert_eq!(r.redact("apple"), "[redacted]");
+    assert_eq!(r.redact("pineapple blueberry"), "pineapple blueberry");
+}
+
 #[test]
 fn a_pem_block_is_found_raw_or_inside_other_text() {
     let body = "MIIfake0MIIfake0\nMIIfake1MIIfake1";

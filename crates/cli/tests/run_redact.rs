@@ -112,6 +112,32 @@ fn run_masks_lines_of_an_inherited_pem_block_whatever_its_name() {
     }
 }
 
+/// Greptile on #64: a compact service-account JSON holds its private key on one line, with
+/// the key's line breaks written as the two characters `\n`. A child that decodes it prints
+/// the key one line at a time. None of those lines reaches the agent, whether the JSON came
+/// from the env file or was inherited.
+#[test]
+fn run_masks_the_lines_of_a_key_a_child_decodes_from_a_compact_json() {
+    let home = home("home-json");
+    let proj = tmp("proj-json");
+    let body = fake_pem_body();
+    let json = format!(r#"{{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n","client_email":"ci@example.iam.gserviceaccount.com"}}"#, body.join("\\n"));
+    // Single quotes keep the backslashes as written.
+    std::fs::write(proj.join(".env.local"), format!("GCP_SA_JSON='{json}'\n")).unwrap();
+    // `printf %b` decodes `\n` the way a JSON parser does.
+    let out = run_sh(&home, &proj, r#"printf '%b\n' "$GCP_SA_JSON"; printf '%b\n' "$GCP_SA_INHERITED" >&2"#, &[("GCP_SA_INHERITED", json.as_str())]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "run failed: {stderr}");
+    // The child did print the decoded key, and its END line shows where.
+    assert!(stdout.contains("-----END PRIVATE KEY-----"), "stdout: {stdout}");
+    assert!(stderr.contains("-----END PRIVATE KEY-----"), "stderr: {stderr}");
+    for line in &body {
+        assert!(!stdout.contains(line.as_str()), "a line of the env file's key reached stdout: {stdout}");
+        assert!(!stderr.contains(line.as_str()), "a line of the inherited key reached stderr: {stderr}");
+    }
+}
+
 /// An exported shell function is a multi-line inherited value made of code. Its lines are not
 /// secrets, even when the function's name has TOKEN in it, and `return 0;` in a compiler error
 /// must reach the agent as written.

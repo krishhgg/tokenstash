@@ -32,21 +32,34 @@ impl Redactor {
     /// shows the whole value to a single `redact` call. Lines are trimmed, and PEM armor is
     /// skipped. A line shorter than the shortest secret the stash accepts is masked only where
     /// it stands alone, so the `apple` of `apple\nberry` does not mask `pineapple`.
+    ///
+    /// Line breaks written as the two characters `\n` or `\r` split lines too. A compact
+    /// service-account JSON holds its private key that way, on one line, and a child that
+    /// decodes the JSON and prints the key prints it one line at a time.
     pub fn add(&mut self, v: &SecretString) {
         self.add_whole_value(v);
         let s = v.expose_secret();
-        if !s.contains(['\n', '\r']) {
+        for line in s.split(['\n', '\r']) {
+            // A value with no line break is one line, registered whole above.
+            if line.len() < s.len() {
+                self.add_line(line);
+            }
+            if line.contains("\\n") || line.contains("\\r") {
+                for part in line.split("\\n").flat_map(|p| p.split("\\r")) {
+                    self.add_line(part);
+                }
+            }
+        }
+    }
+    fn add_line(&mut self, line: &str) {
+        let line = line.trim();
+        let short = line.chars().count() < crate::tasks::MIN_SECRET_CHARS;
+        // A short line with no letter or digit (`{`, `},`) is structure, and as a whole
+        // token it would match wherever it appears.
+        if is_pem_armor(line) || (short && !line.chars().any(char::is_alphanumeric)) {
             return;
         }
-        for line in s.split(['\n', '\r']).map(str::trim) {
-            let short = line.chars().count() < crate::tasks::MIN_SECRET_CHARS;
-            // A short line with no letter or digit (`{`, `},`) is structure, and as a whole
-            // token it would match wherever it appears.
-            if is_pem_armor(line) || (short && !line.chars().any(char::is_alphanumeric)) {
-                continue;
-            }
-            self.patterns.push(Pattern { text: line.to_string(), whole_token: short });
-        }
+        self.patterns.push(Pattern { text: line.to_string(), whole_token: short });
     }
     /// Register `v` as one string only. For a value that is only suspected to be a secret,
     /// whose lines on their own may be ordinary text.
