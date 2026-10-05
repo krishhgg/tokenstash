@@ -54,6 +54,8 @@ pub fn next(o: &Outcome, env_file: &Path, task: Option<&Task>, card: &str, reche
             // error box.
             let link = if !card.starts_with("http") {
                 format!("The inbox is unavailable ({card}); tell the user to run `tokenstash open`.")
+            } else if needs_full_session(task) && !is_loopback_link(card) {
+                format!("On any device signed in to the user's Tailscale account this link opens the card as them, so they can decide there: {card}")
             } else if needs_full_session(task) {
                 // The link ends its sentence with no punctuation after it, so whoever copies
                 // it (the agent, a test) gets the URL and nothing else.
@@ -86,6 +88,8 @@ pub fn summary(outcomes: &[Outcome], recheck: Recheck) -> &'static str {
 pub fn confirm_next(task: &Task, card: &str, cfg: &tokenstash_core::Config) -> String {
     let link = if !card.starts_with("http") {
         format!("The inbox is unavailable ({card}).")
+    } else if !is_loopback_link(card) {
+        format!("On any device signed in to the user's Tailscale account this link opens the card as them, so they can confirm there: {card}")
     } else {
         format!("Confirming takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg))
     };
@@ -98,7 +102,9 @@ pub fn confirm_next(task: &Task, card: &str, cfg: &tokenstash_core::Config) -> S
 /// A replacement the agent asked for (`rotate`): the key still works, so nothing is wrong
 /// with it as far as the agent can tell the person.
 pub fn rotation_next(name: &str, task: &Task, card: &str, cfg: &tokenstash_core::Config) -> String {
-    let link = if card.starts_with("http") {
+    let link = if card.starts_with("http") && !is_loopback_link(card) {
+        format!("On any device signed in to the user's Tailscale account this link opens the card as them, so they can paste it there: {card}")
+    } else if card.starts_with("http") {
         format!("Pasting it takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}{}", crate::remote::hint(cfg))
     } else {
         format!("The inbox is unavailable ({card}).")
@@ -107,4 +113,9 @@ pub fn rotation_next(name: &str, task: &Task, card: &str, cfg: &tokenstash_core:
         "The user has been asked for a new {name} ({}). The current key keeps working until they paste the new one, and every folder that had it gets the new one then. {link} Keep working, and check on card {} later with `tokenstash tasks --history`.",
         task.id, task.id
     )
+}
+
+/// A link to the inbox on this machine's loopback, as opposed to its Tailscale address.
+fn is_loopback_link(card: &str) -> bool {
+    card.starts_with("http://127.0.0.1:")
 }

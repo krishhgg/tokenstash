@@ -83,7 +83,7 @@ pub fn agent_from(arg: &Option<String>) -> String {
 /// Only ever shown when nothing better is available; every link a person is expected to
 /// click carries a credential (see `inbox_url_agent`, `inbox_url_human`).
 pub fn inbox_url(cfg: &Config, task_id: Option<&str>) -> String {
-    let base = crate::remote::base_url(cfg);
+    let base = crate::remote::link_base(cfg);
     match task_id {
         Some(id) => format!("{base}/t/{id}"),
         None => format!("{base}/"),
@@ -92,7 +92,7 @@ pub fn inbox_url(cfg: &Config, task_id: Option<&str>) -> String {
 
 /// One card on the scoped route `/p/<id>`, which is served only to that card's capability.
 fn inbox_url_scoped(cfg: &Config, task_id: &str) -> String {
-    format!("{}/p/{task_id}", crate::remote::base_url(cfg))
+    format!("{}/p/{task_id}", crate::remote::link_base(cfg))
 }
 
 /// Which stream a URL is about to be written to. A TTY check is only meaningful for the

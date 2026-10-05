@@ -160,9 +160,9 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     // fresh nonce with HMAC(proof key, nonce); a process squatting the port cannot, and
     // neither can anyone holding a session or card link captured from a URL — the proof key
     // never travels.
-    // Loopback only: the CLI asks over 127.0.0.1, and a tailnet peer is owed nothing before
-    // the checks below.
-    if path == "/verify" && !req.tailnet {
+    // On loopback, and on the tailnet from this machine itself: the CLI proves the listener
+    // there is ours before it hands out tailnet links. Another device is owed nothing.
+    if path == "/verify" && (!req.tailnet || from_this_machine(&req)) {
         return match q.get("c") {
             Some(c) if !c.is_empty() && c.len() <= inbox_auth::MAX_CHALLENGE => {
                 respond(req, 200, "text/plain", inbox_auth::verify_response(tokens.proof(), c))
@@ -185,7 +185,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
             return not_found(req);
         }
         let peer = req.peer.map(|p| p.ip());
-        let own_machine = peer.is_some() && peer == cfg.remote_ip.as_deref().and_then(|i| i.parse().ok());
+        let own_machine = from_this_machine(&req);
         if !own_machine {
             match (peer.and_then(crate::remote::whois), cfg.remote_login.as_deref()) {
                 (Some(login), Some(owner)) if login == owner => person_device = true,
@@ -492,6 +492,15 @@ fn cookie(req: &Request, name: &'static str) -> Option<String> {
         let (k, v) = kv.split_once('=')?;
         (k.trim() == name).then(|| v.trim().to_string())
     })
+}
+
+/// A tailnet request that comes from this machine: from its own Tailscale address, or from
+/// 127.0.0.1 or ::1 (a local connection to that address leaves from one or the other). No
+/// other device's traffic arrives with any of these sources.
+fn from_this_machine(req: &Request) -> bool {
+    let Some(peer) = req.peer.map(|p| p.ip()) else { return false };
+    let loopback: [std::net::IpAddr; 2] = [std::net::Ipv4Addr::LOCALHOST.into(), std::net::Ipv6Addr::LOCALHOST.into()];
+    loopback.contains(&peer) || tokenstash_core::Config::load().ok().and_then(|c| c.remote_ip).and_then(|i| i.parse().ok()) == Some(peer)
 }
 
 /// The Host header names one of `hosts` (any port).

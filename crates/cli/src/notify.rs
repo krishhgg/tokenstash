@@ -41,6 +41,18 @@ pub fn inbox_state(cfg: &Config) -> Inbox {
     probe(&addr(cfg), &proof)
 }
 
+/// What answers on this machine's Tailscale address and the inbox port, proved the same way.
+/// `Down` when remote access is off. Links name that address only once it is `Ours`: a
+/// process that took the address and port first would otherwise receive the person's paste.
+pub fn tailnet_state(cfg: &Config) -> Inbox {
+    if cfg.remote != tokenstash_core::config::Remote::Tailscale {
+        return Inbox::Down;
+    }
+    let Some(ip) = cfg.remote_ip.as_deref().and_then(|i| i.parse::<std::net::IpAddr>().ok()) else { return Inbox::Down };
+    let Ok(proof) = inbox_auth::ensure_proof_key() else { return Inbox::Down };
+    probe(&(ip, cfg.inbox_port).into(), &proof)
+}
+
 fn probe(addr: &SocketAddr, proof: &str) -> Inbox {
     let Ok(mut s) = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) else { return Inbox::Down };
     let nonce = inbox_auth::challenge();

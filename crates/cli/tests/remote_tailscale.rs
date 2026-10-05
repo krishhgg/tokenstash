@@ -127,6 +127,30 @@ fn the_owners_other_devices_are_the_person_and_nobody_else_is() {
     // An agent may not name another login as the person on a machine that has an owner.
     let other = w.run(&["remote", "tailscale", "--login", "someone@else.example"]);
     assert!(!other.status.success() && String::from_utf8_lossy(&other.stderr).contains("for a person at a terminal"), "{}", String::from_utf8_lossy(&other.stderr));
+    // Something else holds the Tailscale address and port first: turning remote access on
+    // says so, and links stay on loopback rather than send the person to it.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let impostor = {
+        let l = TcpListener::bind(("127.0.0.2", port)).unwrap();
+        l.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            use std::io::Write;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((mut s, _)) = l.accept() {
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nnot the inbox");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    let held = w.run(&["remote", "tailscale"]);
+    assert!(!held.status.success() && String::from_utf8_lossy(&held.stderr).contains("another process holds"), "{}", String::from_utf8_lossy(&held.stderr));
+    let need = w.run(&["need", "OPENAI_API_KEY"]);
+    assert!(String::from_utf8_lossy(&need.stdout).contains(&format!("http://127.0.0.1:{port}/p/")), "links stay on loopback: {}", String::from_utf8_lossy(&need.stdout));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    impostor.join().unwrap();
+
     // On, from an agent's shell: the person it is for cannot reach the inbox until it is.
     let on = w.run(&["remote", "tailscale"]);
     assert!(on.status.success(), "{}", String::from_utf8_lossy(&on.stderr));

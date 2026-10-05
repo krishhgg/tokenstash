@@ -132,13 +132,32 @@ pub fn whois(ip: IpAddr) -> Option<String> {
     login
 }
 
-/// The address links and notifications use: this machine's Tailscale name when remote access
-/// is on, loopback otherwise.
+/// The address remote access advertises: this machine's Tailscale name when it is on,
+/// loopback otherwise. Not proof that our inbox answers there; links use [`link_base`].
 pub fn base_url(cfg: &Config) -> String {
     match (cfg.remote, cfg.remote_host.as_deref().or(cfg.remote_ip.as_deref())) {
         (Remote::Tailscale, Some(host)) => format!("http://{host}:{}", cfg.inbox_port),
         _ => format!("http://127.0.0.1:{}", cfg.inbox_port),
     }
+}
+
+/// The address links and notifications use: the Tailscale one only once our inbox has proved
+/// it answers there (checked at most every 30 s per process), loopback otherwise.
+pub fn link_base(cfg: &Config) -> String {
+    static PROVED: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+    let remote = base_url(cfg);
+    if cfg.remote != Remote::Tailscale {
+        return remote;
+    }
+    let mut proved = PROVED.lock().unwrap_or_else(|p| p.into_inner());
+    if proved.as_ref().is_some_and(|(base, at)| *base == remote && at.elapsed() < Duration::from_secs(30)) {
+        return remote;
+    }
+    if crate::notify::tailnet_state(cfg) == crate::notify::Inbox::Ours {
+        *proved = Some((remote.clone(), Instant::now()));
+        return remote;
+    }
+    format!("http://127.0.0.1:{}", cfg.inbox_port)
 }
 
 /// Why the person may be on another computer, if anything here says so: an SSH login, or a
@@ -215,8 +234,22 @@ pub fn remote(a: RemoteArgs) -> Result<i32> {
             cfg.remote_host = Some(net.dns_name.clone().unwrap_or_else(|| net.ip.to_string()));
             cfg.remote_login = Some(login.clone());
             cfg.save()?;
-            // A running inbox picks the setting up within a second; start one if none runs.
+            // A running inbox picks the setting up within a second; start one if none runs. Then
+            // prove it answers on the Tailscale address before saying so: something else
+            // holding that address and port would get the links.
             let _ = crate::notify::ensure_inbox(&cfg);
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut state = crate::notify::tailnet_state(&cfg);
+            while state != crate::notify::Inbox::Ours && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(200));
+                state = crate::notify::tailnet_state(&cfg);
+            }
+            if state != crate::notify::Inbox::Ours {
+                bail!("remote access is on, but the inbox is not answering at {}/ ({}); links stay on 127.0.0.1 until it does. `tokenstash doctor` shows more", base_url(&cfg), match state {
+                    crate::notify::Inbox::Foreign => "another process holds that address and port",
+                    _ => "nothing answers there yet",
+                });
+            }
             println!("✓ remote access on: the inbox also answers at {}/", base_url(&cfg));
             println!("  a link opened on any device signed in to Tailscale as {login} opens as you, and can approve");
             println!("  links printed before this point at 127.0.0.1: run the same `tokenstash need` again for a new one");
