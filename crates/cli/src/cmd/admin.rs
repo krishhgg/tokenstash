@@ -4,6 +4,8 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use tokenstash_core::stash::stash_key;
+use tokenstash_core::tasks::{Ctx, Probe};
+use tokenstash_core::validate::Liveness;
 use tokenstash_core::Config;
 
 #[derive(Args)]
@@ -456,17 +458,17 @@ pub fn check(a: CheckArgs) -> Result<i32> {
 /// only `names`), probed sequentially with polite pacing. Rejected → stale, Ok → verified,
 /// Unknown → untouched. Never prints a value.
 pub fn sweep(app: &App, names: &[String], stale_only: bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
-    sweep_where(app, &|m| (names.is_empty() || names.contains(&m.name)) && (!stale_only || m.stale), print)
+    sweep_where(app, Probe::Network, &|m| (names.is_empty() || names.contains(&m.name)) && (!stale_only || m.stale), print)
 }
 
 /// The sweep over exactly the (name, identity) pairs given — what `import` and
 /// `--from-env` touched, and nothing else of the same name.
 pub fn sweep_pairs(app: &App, pairs: &[(String, String)], print: bool) -> Result<Vec<(String, String, String, bool)>> {
-    sweep_where(app, &|m| pairs.iter().any(|(n, i)| n == &m.name && i == &m.identity), print)
+    sweep_where(app, Probe::Network, &|m| pairs.iter().any(|(n, i)| n == &m.name && i == &m.identity), print)
 }
 
-fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
-    let ctx = app.ctx();
+fn sweep_where(app: &App, probe: Probe, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
+    let ctx = Ctx { probe, ..app.ctx() };
     let mut rows = vec![];
     for m in app.db.list_secrets()? {
         if !select(&m) { continue; }
@@ -478,19 +480,23 @@ fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> b
             rows.push((m.name.clone(), m.identity.clone(), "not in stash".to_string(), m.stale));
             continue;
         };
-        let verdict = tokenstash_core::validate::liveness(&check, &v, tokenstash_core::validate::TIMEOUT_HUMAN);
-        // Recorded only if the stash still holds the value just probed. A key pasted while
-        // the request was out is not judged by its predecessor's answer.
-        let status = tokenstash_core::tasks::if_still_stored(&ctx, &m.name, &m.identity, Some(&v), || Ok(match verdict {
-            tokenstash_core::validate::Liveness::Ok => { app.db.set_verified(&m.name, &m.identity)?; "ok".to_string() }
-            tokenstash_core::validate::Liveness::Rejected(code) => {
+        let verdict = ctx.probe.run(&check, &v, tokenstash_core::validate::TIMEOUT_HUMAN).unwrap_or_else(|| Liveness::Unknown("probing is off".into()));
+        // A verdict is recorded only if the stash still holds the value just probed, under
+        // the index write lock. A key pasted while the request was out is not judged by its
+        // predecessor's answer. An Unknown records nothing, so it does not wait for the lock.
+        let judge = |record: &dyn Fn() -> Result<String>| -> Result<String> {
+            Ok(tokenstash_core::tasks::if_still_stored(&ctx, &m.name, &m.identity, Some(&v), record)?.unwrap_or_else(|| "replaced during the check; not judged".to_string()))
+        };
+        let status = match verdict {
+            Liveness::Ok => judge(&|| { app.db.set_verified(&m.name, &m.identity)?; Ok("ok".to_string()) })?,
+            Liveness::Rejected(code) => judge(&|| {
                 let reason = format!("rejected by the provider (HTTP {code}) on {} during a check", tokenstash_core::now());
                 app.db.mark_stale(&m.name, &m.identity, true, Some(&reason), Some(tokenstash_core::db::STALE_PROBE))?;
                 app.db.audit(None, None, "check.rejected", Some(&m.name), Some(&m.identity), Some(&format!("HTTP {code}")))?;
-                format!("REJECTED (HTTP {code}) → stale")
-            }
-            tokenstash_core::validate::Liveness::Unknown(e) => format!("unknown ({})", e.chars().take(40).collect::<String>()),
-        }))?.unwrap_or_else(|| "replaced during the check; not judged".to_string());
+                Ok(format!("REJECTED (HTTP {code}) → stale"))
+            })?,
+            Liveness::Unknown(e) => format!("unknown ({})", e.chars().take(40).collect::<String>()),
+        };
         let stale_now = app.db.get_secret(&m.name, &m.identity)?.map(|x| x.stale).unwrap_or(false);
         rows.push((m.name.clone(), m.identity.clone(), status, stale_now));
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -503,4 +509,78 @@ fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> b
         if stale > 0 { println!("\n{stale} stale — the next `tokenstash need` for each asks for a replacement (or run `tokenstash rotate NAME`)"); }
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+    use std::time::Duration;
+    use tokenstash_core::stash::{FileStash, Stash};
+    use tokenstash_core::{db, registry, Db};
+
+    /// An App on a scratch home with the file stash, holding one OpenAI key.
+    fn app_with_key(tag: &str, value: &str) -> (App, PathBuf) {
+        let home = std::env::temp_dir().join(format!("tokenstash-admin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("TOKENSTASH_HOME", &home);
+        let app = App { cfg: Config::default(), db: Db::open(&home.join("t.db")).unwrap(), stash: Box::new(FileStash::new().unwrap()) };
+        app.stash.set(&stash_key("OPENAI_API_KEY", "default"), &SecretString::from(value.to_string())).unwrap();
+        app.db.upsert_secret(&db::SecretMeta { name: "OPENAI_API_KEY".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+        (app, home)
+    }
+
+    fn done(home: &std::path::Path) {
+        std::env::remove_var("TOKENSTASH_HOME");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// An Unknown verdict records nothing, so `check` reports it without waiting for the
+    /// index write lock. A store holding that lock past the busy timeout must not turn
+    /// "unknown" into a failed `check`.
+    #[test]
+    fn an_unknown_check_does_not_wait_for_the_index_lock() {
+        let _g = crate::inbox_auth::env_lock();
+        let (app, home) = app_with_key("unknown", "sk-live-aaaaaaaaaaaaaaaaaaaa");
+        // Another process holds the index write lock until the sweep has returned.
+        let db_path = home.join("t.db");
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let other = Db::open(&db_path).unwrap();
+            other.locked(|| { held.send(()).unwrap(); let _ = wait_release.recv_timeout(Duration::from_secs(20)); Ok(()) }).unwrap();
+        });
+        wait_held.recv().unwrap();
+        let unknown = |_: &registry::Check| Liveness::Unknown("HTTP 503".into());
+        let started = std::time::Instant::now();
+        let rows = sweep_where(&app, Probe::Stub(&unknown), &|_| true, false);
+        let waited = started.elapsed();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let rows = rows.unwrap();
+        assert!(rows[0].2.starts_with("unknown"), "{rows:?}");
+        assert!(waited < Duration::from_secs(2), "the sweep waited {waited:?} for a lock it had no use for");
+        done(&home);
+    }
+
+    /// The sweep records a verdict only if the stash still holds the value it sent. A key
+    /// stored while the request was out is reported as not judged and stays as stored.
+    #[test]
+    fn a_check_verdict_for_a_replaced_key_is_not_recorded() {
+        let _g = crate::inbox_auth::env_lock();
+        let (app, home) = app_with_key("replaced", "sk-old-aaaaaaaaaaaaaaaaaaaaa");
+        let human = FileStash::new().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let rejecting = |_: &registry::Check| {
+            calls.set(calls.get() + 1);
+            human.set(&stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-new-bbbbbbbbbbbbbbbbbbbbb".to_string())).unwrap();
+            Liveness::Rejected(401)
+        };
+        let rows = sweep_where(&app, Probe::Stub(&rejecting), &|_| true, false).unwrap();
+        assert_eq!(calls.get(), 1, "one request per key");
+        assert_eq!(rows[0].2, "replaced during the check; not judged", "{rows:?}");
+        assert!(!app.db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale, "the old key's 401 is not recorded against the new one");
+        done(&home);
+    }
 }
