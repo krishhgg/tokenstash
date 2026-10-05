@@ -433,5 +433,28 @@ fn an_action_card_runs_only_on_the_persons_confirm() {
     assert!(loc.unwrap_or_default().contains("Forgot"));
     assert_eq!(status_of(&home, &proj, &id), "answered");
     assert_eq!(run(&home, &proj, &["need", "OPENAI_API_KEY"]).status.code(), Some(10), "forgotten: the next request asks for it again");
+    // Greptile on #68: confirming the same card again runs nothing. Store the key again,
+    // then confirm the old forget card a second time: the new key stays.
+    let again = task_id(&home, &proj, "OPENAI_API_KEY");
+    let (st, _, _, page) = http(port, "POST", &format!("/t/{again}"), &full, Some(&format!("value=sk-proj-storedagain0123456789abc&skip_check=1&t={session}")));
+    assert_eq!(st, 303, "{page}");
+    let (st, _, _, page) = http(port, "POST", &format!("/t/{id}"), &full, Some(&format!("action=done&t={session}")));
+    assert!(st == 200 && page.contains("already answered"), "{page}");
+    assert_eq!(run(&home, &proj, &["need", "OPENAI_API_KEY"]).status.code(), Some(0), "the key stored after the first confirm is still there");
+
+    // Greptile on #68: an MCP card filed while agents are in explicit mode says, and does,
+    // what it takes: back to automatic mode, with the server.
+    std::fs::write(home.join("config.toml"), format!("{}agent_mode = \"explicit\"\n", std::fs::read_to_string(home.join("config.toml")).unwrap())).unwrap();
+    std::fs::create_dir_all(home.join("user-home/.codex")).unwrap();
+    assert_eq!(run(&home, &proj, &["init", "--mcp"]).status.code(), Some(10));
+    let tasks: serde_json::Value = serde_json::from_slice(&run(&home, &proj, &["tasks", "--json"]).stdout).unwrap();
+    let mcp = tasks.as_array().unwrap().iter().find(|t| t["expects"] == "action:mcp").unwrap()["id"].as_str().unwrap().to_string();
+    let (st, _, _, page) = http(port, "GET", &format!("/t/{mcp}"), &full, None);
+    assert!(st == 200 && page.contains("switches back to loading it on their own"), "{page}");
+    let (st, _, _, page) = http(port, "POST", &format!("/t/{mcp}"), &full, Some(&format!("action=done&t={session}")));
+    assert_eq!(st, 303, "{page}");
+    let cfg = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(cfg.contains("mcp = true") && !cfg.contains("agent_mode = \"explicit\""), "{cfg}");
+    assert!(std::fs::read_to_string(home.join("user-home/.codex/config.toml")).unwrap().contains("[mcp_servers.tokenstash]"));
     inbox.stop();
 }

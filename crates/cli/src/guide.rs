@@ -92,3 +92,17 @@ pub fn confirm_next(task: &Task, card: &str) -> String {
         task.title, task.id, task.id
     )
 }
+
+/// A replacement the agent asked for (`rotate`): the key still works, so nothing is wrong
+/// with it as far as the agent can tell the person.
+pub fn rotation_next(name: &str, task: &Task, card: &str) -> String {
+    let link = if card.starts_with("http") {
+        format!("Pasting it takes the link in the desktop notification. This link shows the card, and the card can send that notification again: {card}")
+    } else {
+        format!("The inbox is unavailable ({card}).")
+    };
+    format!(
+        "The user has been asked for a new {name} ({}). The current key keeps working until they paste the new one, and every folder that had it gets the new one then. {link} Keep working, and check on card {} later with `tokenstash tasks --history`.",
+        task.id, task.id
+    )
+}

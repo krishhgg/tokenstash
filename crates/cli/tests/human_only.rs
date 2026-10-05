@@ -103,11 +103,23 @@ fn an_agent_asks_on_a_card_and_nothing_changes_until_the_person_answers() {
     assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), cfg_before, "the mode changes only on the person's confirm");
     assert!(tasks_json(&home, &proj).iter().any(|t| t["expects"] == "action:mode" && t["names"][0] == "explicit"));
 
-    // Asking again after a no: once.
+    let out = run(&home, &proj, &["init", "--mode", "auto", "--why", "the user wants it back", "--no-agents"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("--no-agents"), "a card cannot carry --no-agents");
+    assert_eq!(run(&home, &proj, &["init", "--mode", "auto", "--why", "the user wants it back"]).status.code(), Some(10));
+    assert!(tasks_json(&home, &proj).iter().any(|t| t["expects"] == "action:mode" && t["names"][0] == "auto" && t["why"] == "the user wants it back"));
+
+    // A replacement the agent asked for is not a rejected key.
+    let out = run(&home, &proj, &["rotate", "OPENAI_API_KEY", "--why", "the user thinks it leaked"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(10), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("keeps working") && !stdout.contains("rejected"), "{stdout}");
+
+    // Asking again after a no: once, and a request that fails does not spend it.
     assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY"]).status.code(), Some(10));
     let resend = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "RESEND_API_KEY").unwrap();
     assert!(run(&home, &proj, &["answer", resend["id"].as_str().unwrap(), "--deny"]).status.success());
     assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY"]).status.code(), Some(20));
+    assert!(!run(&home, &proj, &["need", "RESEND_API_KEY", "--identity", "not an identity!", "--force"]).status.success());
     assert_eq!(run(&home, &proj, &["need", "RESEND_API_KEY", "--force"]).status.code(), Some(10));
     let again = tasks_json(&home, &proj).into_iter().find(|t| t["name"] == "RESEND_API_KEY" && t["status"] == "pending").unwrap();
     assert!(again["why"].as_str().unwrap().starts_with("Asked again after you declined"), "{again}");

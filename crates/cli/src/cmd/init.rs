@@ -62,6 +62,9 @@ pub struct InitArgs {
     /// For a person at a terminal.
     #[arg(long)]
     pub undo: bool,
+    /// Why (shown on the card when an agent asks for --mode, --mcp, --no-mcp or --undo).
+    #[arg(long)]
+    pub why: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -834,6 +837,11 @@ pub fn init(a: InitArgs) -> Result<i32> {
 /// to confirm in their inbox. Nothing changes until they do.
 fn request_choice(a: &InitArgs) -> Result<i32> {
     use tokenstash_core::actions::Action;
+    if a.no_agents {
+        // A confirmed card re-wires the agents; "remember the choice but leave the agents
+        // alone" is not something a card can carry, so it stays a person's command.
+        anyhow::bail!("`--no-agents` with --mode, --mcp or --undo is for a person at a terminal; leave it out to file the card");
+    }
     let app = crate::util::App::open()?;
     let project = tokenstash_core::project::current();
     let agent = crate::util::agent_from(&None);
@@ -852,7 +860,7 @@ fn request_choice(a: &InitArgs) -> Result<i32> {
     }
     let mut code = 0;
     for action in &asked {
-        code = crate::cmd::actions::request(&app, &project, &agent, action, None)?;
+        code = crate::cmd::actions::request(&app, &project, &agent, action, a.why.clone())?;
     }
     Ok(code)
 }

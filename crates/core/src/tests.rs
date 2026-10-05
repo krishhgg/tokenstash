@@ -3465,3 +3465,54 @@ fn action_cards_round_trip_and_refuse_what_they_do_not_know() {
         assert_eq!(Action::of(&t), None, "{expects}");
     }
 }
+
+/// Greptile on #68: an agent asking again after a no (`need --force` from an agent) must get
+/// a card, not the key, even where a broad grant made before the no would deliver it. A
+/// person's own `--force` still delivers.
+#[test]
+fn asking_again_after_a_no_files_a_card_even_under_a_broad_grant() {
+    let _env = env_lock();
+    let home = tmp("ask-again-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("ask-again-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_askagain_0123456789".to_string())).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: Some("Groq".into()), sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+    let ws = db.workspace_for(&proj).unwrap();
+    db.grant(&ws.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    // The person declined a card for this key here.
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "GROQ_API_KEY", "default", &tasks::SecretRequest::default()).unwrap();
+    tasks::deny(&ctx, &t, None).unwrap();
+    let name = ["GROQ_API_KEY".to_string()];
+    let plain = need::need(&ctx, &proj, "agent", &name, &need::NeedOpts::default()).unwrap();
+    assert!(matches!(plain[0], need::Outcome::Denied { .. }), "{plain:?}");
+    let again = need::need(&ctx, &proj, "agent", &name, &need::NeedOpts { force: true, ask_again: true, ..Default::default() }).unwrap();
+    assert!(matches!(again[0], need::Outcome::Pending { .. }), "a card, not the key: {again:?}");
+    assert!(!crate::envfile::has(&proj, ".env.local", "GROQ_API_KEY"), "nothing written");
+    let person = need::need(&ctx, &proj, "human", &name, &need::NeedOpts { force: true, ..Default::default() }).unwrap();
+    assert!(matches!(person[0], need::Outcome::Injected { .. }), "{person:?}");
+}
+
+/// Greptile on #68: a card past its deadline is not handed out again.
+#[test]
+fn an_expired_action_card_is_not_reused() {
+    use crate::actions::Action;
+    let _env = env_lock();
+    let home = tmp("expired-action-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("expired-action-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let first = crate::actions::request(&ctx, &proj, "agent", &Action::Undo, None).unwrap();
+    db.conn.execute("UPDATE tasks SET deadline='2000-01-01T00:00:00Z' WHERE id=?1", rusqlite::params![first.id]).unwrap();
+    let second = crate::actions::request(&ctx, &proj, "agent", &Action::Undo, None).unwrap();
+    assert_ne!(first.id, second.id);
+    assert_eq!(db.get_task(&first.id).unwrap().unwrap().status, db::TaskStatus::Expired);
+}

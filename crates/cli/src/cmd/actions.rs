@@ -30,8 +30,28 @@ pub fn print_pending(app: &App, project: &Path, agent: &str, t: &Task) -> Result
     Ok(tokenstash_core::exit::PENDING)
 }
 
-/// Person side, from the inbox's full session: do what the card says and say what happened.
-pub fn perform(app: &App, task: &Task, action: &Action) -> Result<String> {
+/// Person side, from the inbox's full session or the person's terminal: claim the card, then
+/// do what it says. Claiming first means a second confirm (another tab, a double click) finds
+/// the card answered and runs nothing: an old forget card confirmed again would delete a key
+/// stored since. If the action fails, the card is put back for another try or a decline.
+pub fn confirm(app: &App, task: &Task, action: &Action) -> Result<String> {
+    if !app.db.close_task_if_open(&task.id, tokenstash_core::db::TaskStatus::Answered, None)? {
+        bail!("this card was already answered");
+    }
+    match perform(app, task, action) {
+        Ok(done) => {
+            app.db.set_task_note(&task.id, &done)?;
+            app.db.audit(Some(&task.project), Some(&task.agent), "action.confirmed", None, None, Some(&task.expects))?;
+            Ok(done)
+        }
+        Err(e) => {
+            app.db.reopen_task(&task.id)?;
+            Err(e)
+        }
+    }
+}
+
+fn perform(app: &App, task: &Task, action: &Action) -> Result<String> {
     match action {
         Action::Forget { name, identity } => Ok(if forget_key(app, name, identity)? {
             format!("Forgot {name}@{identity}")
@@ -53,7 +73,12 @@ pub fn perform(app: &App, task: &Task, action: &Action) -> Result<String> {
             Ok(format!("Agent mode is now {mode}; agent sessions started from now on see it"))
         }
         Action::Mcp(on) => {
-            crate::cmd::init::apply_choice(None, Some(*on))?;
+            // An MCP server is always available to the agent, so registering one ends explicit
+            // mode; the card said so.
+            // The setting as it is now, not as the inbox read it when it started.
+            let explicit = tokenstash_core::Config::load()?.agent_mode == AgentMode::Explicit;
+            let mode = (*on && explicit).then_some(AgentMode::Auto);
+            crate::cmd::init::apply_choice(mode, Some(*on))?;
             Ok(if *on { "Registered the tokenstash MCP server with your agents".into() } else { "Took the tokenstash MCP server out of your agents".into() })
         }
         Action::Undo => {

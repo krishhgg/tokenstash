@@ -339,9 +339,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                         if scope != Scope::Full {
                             anyhow::bail!("confirming needs your own inbox link: use the one in the desktop notification (the button below sends it again) and confirm this card there");
                         }
-                        let done = crate::cmd::actions::perform(app, &task, &act)?;
-                        tasks::answer_human(&ctx, &task, Some(&done))?;
-                        Ok(done)
+                        crate::cmd::actions::confirm(app, &task, &act)
                     }
                     None => { tasks::answer_human(&ctx, &task, form.get("note").map(|s| s.as_str()).filter(|s| !s.is_empty()))?; Ok(format!("Done: {}", task.title)) }
                 },

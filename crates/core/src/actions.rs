@@ -86,7 +86,7 @@ impl Action {
             Action::Bind { name, identity } => format!("From now on this project receives the `{identity}` copy of {name} instead of its current one. If you have not stored a `{identity}` copy yet, its next request asks you for it."),
             Action::Mode(m) if m == "explicit" => "Agents stop loading the tokenstash skill on their own; you invoke it with /tokenstash (or $tokenstash in Codex). Takes effect in agent sessions started after this.".into(),
             Action::Mode(_) => "Agents load the tokenstash skill when code needs a key. Takes effect in agent sessions started after this.".into(),
-            Action::Mcp(true) => "Every agent on this machine gets the tokenstash MCP server, pointing at the tokenstash binary that runs this inbox. Takes effect in agent sessions started after this.".into(),
+            Action::Mcp(true) => "Every agent on this machine gets the tokenstash MCP server, pointing at the tokenstash binary that runs this inbox; if agents load the skill only when you invoke it, that switches back to loading it on their own, since an MCP server is always available to them. Takes effect in agent sessions started after this.".into(),
             Action::Mcp(false) => "The tokenstash MCP server is taken out of every agent's config; agents keep using the CLI through the skill.".into(),
             Action::Undo => "Every agent config file `tokenstash init` changed is put back as it found them, and the skill is removed. Your stored keys stay.".into(),
         }
@@ -107,6 +107,9 @@ fn shown(name: &str, identity: &str) -> String {
 /// file one card.
 pub fn request(ctx: &Ctx, project: &Path, agent: &str, action: &Action, why: Option<String>) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
+    // A card past its deadline is not one to hand out again: the agent would relay a link
+    // that opens onto "expired", with no new notification.
+    ctx.db.expire_overdue()?;
     let expects = format!("{PREFIX}{}", action.verb());
     let title = action.title();
     let names = action.targets();

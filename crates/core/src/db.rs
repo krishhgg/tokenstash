@@ -757,6 +757,12 @@ impl Db {
         Ok(n == 1)
     }
 
+    /// The answer's note, set after the card was claimed (what a confirmed action did).
+    pub fn set_task_note(&self, id: &str, note: &str) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET note=?2 WHERE id=?1", params![id, note])?;
+        Ok(())
+    }
+
     /// Claim the one desktop notification a card gets: true the first time, false after. A
     /// polling agent re-runs `need` every few seconds and the card is reused; the human's
     /// attention is not.
@@ -1049,13 +1055,14 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// The most recent audit rows for one project, newest first: what an agent may see of the
-    /// log, since every row in it is about its own directory.
-    pub fn recent_audit_for(&self, project: &str, limit: usize) -> Result<Vec<AuditRow>> {
+    /// The most recent audit rows for one project since `since`, newest first: what an agent
+    /// may see of the log. `since` is when the directory now at that path was paired, so a
+    /// checkout re-created at the same path does not read the old one's history.
+    pub fn recent_audit_for(&self, project: &str, since: &str, limit: usize) -> Result<Vec<AuditRow>> {
         let mut st = self.conn.prepare(
-            "SELECT ts, project, agent, action, name, identity, detail, grant_source FROM audit WHERE project=?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT ts, project, agent, action, name, identity, detail, grant_source FROM audit WHERE project=?1 AND ts >= ?2 ORDER BY id DESC LIMIT ?3",
         )?;
-        let rows = st.query_map(params![project, limit as i64], |r| {
+        let rows = st.query_map(params![project, since, limit as i64], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

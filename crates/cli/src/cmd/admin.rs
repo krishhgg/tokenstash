@@ -284,10 +284,16 @@ pub struct AuditArgs {
 pub fn audit(a: AuditArgs) -> Result<i32> {
     let app = App::open()?;
     // The whole log names every directory and key; an agent sees its own directory's rows.
+    // An agent's view starts when the directory now at this path was paired: a checkout
+    // re-created at the same path does not read the old one's history.
     let rows = if util::looks_human() {
         app.db.recent_audit(a.limit)?
     } else {
-        app.db.recent_audit_for(&tokenstash_core::project::current().to_string_lossy(), a.limit)?
+        let project = tokenstash_core::project::current();
+        match app.db.find_workspace(&project)? {
+            Some(ws) => app.db.recent_audit_for(&project.to_string_lossy(), &ws.created, a.limit)?,
+            None => vec![],
+        }
     };
     if a.json {
         let v: Vec<serde_json::Value> = rows.iter().map(|(ts, project, agent, action, name, identity, detail, grant)| serde_json::json!({
@@ -359,7 +365,7 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
         let state = crate::notify::inbox_state(&app.cfg);
         let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&t.id), state);
         println!("⏳ {} replacement requested (card {})", a.name, t.id);
-        println!("  next: {}", crate::guide::next(&outcome, &project.join(&app.cfg.env_file), Some(&t), &card, crate::guide::Recheck::Cli, ""));
+        println!("  next: {}", crate::guide::rotation_next(&a.name, &t, &card));
         return Ok(tokenstash_core::exit::PENDING);
     }
     let project = util::project_from(&a.project);

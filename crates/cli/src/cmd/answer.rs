@@ -134,8 +134,7 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
                 println!("✗ declined");
                 return Ok(0);
             }
-            let done = crate::cmd::actions::perform(&app, &task, &action)?;
-            tasks::answer_human(&ctx, &task, Some(&done))?;
+            let done = crate::cmd::actions::confirm(&app, &task, &action)?;
             println!("✓ {done}");
         }
         TaskKind::Human => {

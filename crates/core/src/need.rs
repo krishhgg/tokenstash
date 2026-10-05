@@ -25,6 +25,10 @@ pub struct NeedOpts {
     /// project was approved before. Used when the request was derived from untrusted input
     /// (a program's output in `run`) — each invocation needs its own human yes.
     pub require_approval: bool,
+    /// An agent asking again after the person said no (`need --force` from an agent). With
+    /// `force`, a denied key gets a fresh card, and never arrives on the strength of a broad
+    /// grant or an on-disk match: those decided about the directory before the no.
+    pub ask_again: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +212,9 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                             outcomes.push(Outcome::Denied { name: name.clone(), task_id: tid });
                             continue;
                         }
+                        // Asked again after a no: the person answers a card again, not the
+                        // standing grant that was there before the no.
+                        Some(_) if opts.ask_again => Gate::NeedsApproval { reason: GateReason::Pairing },
                         _ => gate,
                     }
                 }
