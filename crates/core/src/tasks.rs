@@ -529,18 +529,24 @@ pub fn store_and_inject(
 
 /// Store a generated secret, unless another process stored this key first. Two `need`s
 /// that both found the key missing, or both found it stale, each generate a value. The
-/// first to take the index write lock stores its own. The second finds a value that is
-/// present and not stale, keeps it, and writes that one to the env file. Storing the second
-/// value would replace the first in the stash after the first had reached the env file,
-/// and the application's signing key would change on a later request. Returns the env file
-/// written and whether `value` is the one stored.
+/// first to take the index write lock stores its own. The second finds a finished store
+/// (a value in the stash with an index row that is not stale), keeps it, and writes that one
+/// to the env file. Storing the second value would replace the first in the stash after the
+/// first had reached the env file, and the application's signing key would change on a
+/// later request. Returns the env file written and whether `value` is the one stored.
 pub fn store_generated(ctx: &Ctx, name: &str, identity: &str, value: &SecretString, project: &Path, agent: &str) -> Result<(Option<PathBuf>, bool)> {
     let mut stored = true;
     let provider = registry::lookup(name).map(|p| p.provider.clone());
     let written = store_and_inject_gated(ctx, name, identity, value, provider, None, false, project, agent, None, Verified::Unknown, crate::db::GRANT_GENERATED, |_| {
+        // A value with no index row is not a finished store. It is left by a store whose
+        // index write or COMMIT failed after its stash write, the one step SQLite cannot
+        // roll back, and that store returned before its env file write. No application has
+        // it, so this value is stored in its place, with the index row and the grant the
+        // failed store never recorded. Keeping it would deliver it with no grant, and the
+        // next `need` would ask the human to approve this directory's own secret.
         let present = ctx.stash.get(&stash_key(name, identity))?.is_some();
-        let stale = ctx.db.get_secret(name, identity)?.is_some_and(|m| m.stale);
-        stored = !present || stale;
+        let finished = present && ctx.db.get_secret(name, identity)?.is_some_and(|m| !m.stale);
+        stored = !finished;
         Ok(stored)
     })?;
     Ok((written, stored))
