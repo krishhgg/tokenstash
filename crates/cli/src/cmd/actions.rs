@@ -44,11 +44,10 @@ pub fn confirm(app: &App, task: &Task, action: &Action) -> Result<String> {
             _ => bail!("this card was already answered"),
         }
     };
-    let ran = app.db.keep_claim(&task.id, &claim).and_then(|kept| {
-        let done = perform(app, task, action, &claim);
-        drop(kept);
-        done
-    });
+    // A keeper that cannot start gives the claim back before it returns the error.
+    let kept = app.db.keep_claim(&task.id, &claim)?;
+    let ran = perform(app, task, action, &claim);
+    drop(kept);
     match ran {
         Ok(done) => {
             if !app.db.finish_action(&task.id, &claim, &done)? {
@@ -74,6 +73,7 @@ fn perform(app: &App, task: &Task, action: &Action, claim: &str) -> Result<Strin
             Forgot::NothingStored => format!("Nothing was stored for {name}@{identity}"),
             Forgot::Gone { kept: false } => format!("Forgot {name}@{identity} (an earlier confirm of this card had deleted it)"),
             Forgot::Gone { kept: true } => format!("Kept {name}@{identity}: it was stored again after this card was first confirmed, so it is not the key this card was about"),
+            Forgot::KeptUnrecorded => format!("A value is still stored under {name}@{identity}. This card cannot tell it from one stored after the card was first confirmed, so it was kept. A new forget card removes it"),
         }),
         Action::Bind { name, identity } => {
             let project = Path::new(&task.project);

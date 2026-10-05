@@ -164,6 +164,10 @@ pub enum Forgot {
     /// replaced since the card was first confirmed. `kept` is true when the name holds a newer
     /// value, which stays.
     Gone { kept: bool },
+    /// A later confirm of a card whose first confirm found no index row found a value in the
+    /// stash with no index row again. It may be a replacement whose store stopped before its
+    /// index row, and nothing tells the two apart, so it was kept. A new forget card removes it.
+    KeptUnrecorded,
 }
 
 /// What a forget card records when nothing was stored under its name.
@@ -177,7 +181,9 @@ const NOTHING_STORED: &str = "-";
 /// anything, the first confirm records on the card which stored value it is about, and that
 /// record is committed on its own. A confirm of the card after one that stopped half way
 /// (the key deleted, the card still open) deletes only that value: a key stored since stays.
+/// A value with no index row has no id to record, so a later confirm deletes no such value.
 pub fn forget(ctx: &Ctx, name: &str, identity: &str, card: Option<(&str, &str)>) -> Result<Forgot> {
+    let key = crate::stash::stash_key(name, identity);
     let about = match card {
         Some((id, claim)) => {
             let pinned = ctx.db.locked(|| {
@@ -190,12 +196,15 @@ pub fn forget(ctx: &Ctx, name: &str, identity: &str, card: Option<(&str, &str)>)
     };
     ctx.db.locked(|| {
         let now = ctx.db.stored_value_id(name, identity)?;
-        if let Some(about) = &about {
+        if let Some((about, first)) = &about {
             if now.as_deref().unwrap_or(NOTHING_STORED) != about {
                 return Ok(Forgot::Gone { kept: now.is_some() });
             }
+            if !first && about == NOTHING_STORED {
+                return Ok(if ctx.stash.get(&key)?.is_some() { Forgot::KeptUnrecorded } else { Forgot::NothingStored });
+            }
         }
-        let had = ctx.stash.delete(&crate::stash::stash_key(name, identity))?;
+        let had = ctx.stash.delete(&key)?;
         let meta = ctx.db.delete_secret(name, identity)?;
         ctx.db.audit(None, None, "forget", Some(name), Some(identity), None)?;
         Ok(if had || meta { Forgot::Deleted } else { Forgot::NothingStored })

@@ -881,15 +881,23 @@ impl Db {
     /// until the returned keeper is dropped. An action that runs longer than
     /// [`CLAIM_HOLDS_SECS`] (`claude mcp add` on a slow machine) keeps its card: no other
     /// confirm takes it over, no decline lands, and it does not expire. A process that stops
-    /// stops renewing, and the claim runs out as before.
+    /// stops renewing, and the claim runs out as before. If the keeper cannot start, it gives
+    /// the claim back before returning the error, so the card can be confirmed again or
+    /// declined at once and does not wait for the claim to run out.
     pub fn keep_claim(&self, id: &str, claim: &str) -> Result<ClaimKeeper> {
         self.keep_claim_every(id, claim, std::time::Duration::from_secs(CLAIM_RENEW_SECS))
     }
 
     pub(crate) fn keep_claim_every(&self, id: &str, claim: &str, every: std::time::Duration) -> Result<ClaimKeeper> {
         // A connection of its own: this one stays with the caller, which runs the action.
-        let path = self.conn.path().filter(|p| !p.is_empty()).context("the index has no file to open a second connection to")?;
-        let db = Db::open(Path::new(path))?;
+        let opened = self.conn.path().filter(|p| !p.is_empty()).context("the index has no file to open a second connection to").and_then(|p| Db::open(Path::new(p)));
+        let db = match opened {
+            Ok(db) => db,
+            Err(e) => {
+                self.release_action_claim(id, claim)?;
+                return Err(e.context("starting the renewal of this card's claim; nothing was done"));
+            }
+        };
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let (id, claim) = (id.to_string(), claim.to_string());
         // Wakes every `every` until the keeper drops its sender. A renewal that fails (the
@@ -921,21 +929,22 @@ impl Db {
     }
 
     /// Record on a card that `claim` holds what its action acts on (`target`), unless an
-    /// earlier confirm of the card already did, and return what the card holds then: this
-    /// call's target or the earlier one. `None` when `claim` no longer holds the card. The
-    /// record outlives the claim, so a confirm after one that stopped half way acts on the
-    /// same thing, not on whatever is there by then.
-    pub fn pin_action_target(&self, id: &str, claim: &str, target: &str) -> Result<Option<String>> {
+    /// earlier confirm of the card already did, and return what the card holds then (this
+    /// call's target or the earlier one) and whether this call recorded it. `None` when
+    /// `claim` no longer holds the card. The record outlives the claim, so a confirm after one
+    /// that stopped half way acts on the same thing, not on whatever is there by then.
+    pub fn pin_action_target(&self, id: &str, claim: &str, target: &str) -> Result<Option<(String, bool)>> {
         let token = claim_token(claim);
-        self.conn.execute(
+        let first = self.conn.execute(
             &format!("UPDATE tasks SET acts_on=?3 WHERE id=?1 AND status='pending' AND acts_on IS NULL AND {}", held_by(2)),
             params![id, token, target],
-        )?;
+        )? == 1;
         Ok(self
             .conn
             .query_row(&format!("SELECT acts_on FROM tasks WHERE id=?1 AND status='pending' AND {}", held_by(2)), params![id, token], |r| r.get::<_, Option<String>>(0))
             .optional()?
-            .flatten())
+            .flatten()
+            .map(|pinned| (pinned, first)))
     }
 
     /// Decline a card unless an action on it is being carried out right now (a live claim):

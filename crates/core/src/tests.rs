@@ -4333,6 +4333,75 @@ fn a_forget_confirmed_again_after_a_stop_keeps_a_key_stored_since() {
     std::env::set_var("TOKENSTASH_HOME", base_home());
 }
 
+/// Greptile on #76: a value with no index row has no id for a forget card to record. A
+/// confirm after one that found such a value and stopped keeps whatever value with no index
+/// row is there by then (it may be a replacement whose store stopped before its index row),
+/// and says so; a new forget card removes it.
+#[test]
+fn a_forget_retry_keeps_a_value_with_no_index_row() {
+    use crate::actions::{Action, Forgot};
+    let _env = env_lock();
+    let home = tmp("forget-unrecorded-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("forget-unrecorded-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let forget = Action::Forget { name: "OPENAI_API_KEY".into(), identity: "default".into() };
+    let key = stash::stash_key("OPENAI_API_KEY", "default");
+    // A value in the stash with no index row here, as a store from another home leaves it.
+    stash.set(&key, &SecretString::from("sk-proj-noindexrow0123456789abc".to_string())).unwrap();
+    let t = crate::actions::request(&ctx, &proj, "agent", &forget, None).unwrap();
+    let first = db.claim_action(&t.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&t.id, &first))).unwrap(), Forgot::Deleted, "the first confirm deletes it");
+    assert_eq!(stashed(stash.as_ref(), "OPENAI_API_KEY"), None);
+    // That confirm stopped before closing the card. A store writes a replacement and stops
+    // before its index row.
+    age_claim(&db, &t.id);
+    stash.set(&key, &SecretString::from("sk-proj-replacement0123456789ab".to_string())).unwrap();
+    let second = db.claim_action(&t.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&t.id, &second))).unwrap(), Forgot::KeptUnrecorded);
+    assert_eq!(stashed(stash.as_ref(), "OPENAI_API_KEY").as_deref(), Some("sk-proj-replacement0123456789ab"), "the replacement stays");
+    assert!(db.finish_action(&t.id, &second, "kept").unwrap(), "the card closes");
+    // With nothing there by then, a later confirm has nothing to keep or delete.
+    let u = crate::actions::request(&ctx, &proj, "agent", &forget, None).unwrap();
+    let c = db.claim_action(&u.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&u.id, &c))).unwrap(), Forgot::Deleted, "a new card removes it");
+    age_claim(&db, &u.id);
+    let c = db.claim_action(&u.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&u.id, &c))).unwrap(), Forgot::NothingStored);
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
+/// Greptile on #76: a confirm whose claim keeper cannot open its own connection to the index
+/// gets the claim back with the error. Nothing ran, so the person can confirm the card again
+/// or decline it at once, not once the claim runs out.
+#[test]
+fn a_keeper_that_cannot_start_gives_the_claim_back() {
+    use crate::actions::Action;
+    let _env = env_lock();
+    let home = tmp("keeper-fails-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("keeper-fails-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let t = crate::actions::request(&ctx, &proj, "agent", &Action::Undo, None).unwrap();
+    let claim = db.claim_action(&t.id).unwrap().unwrap();
+    // A schema newer than this build: a second connection refuses to open the index.
+    db.conn.execute_batch(&format!("PRAGMA user_version = {}", db::SCHEMA_VERSION + 1)).unwrap();
+    let err = db.keep_claim(&t.id, &claim).err().expect("the keeper cannot start");
+    assert!(format!("{err:#}").contains("newer version"), "{err:#}");
+    db.conn.execute_batch(&format!("PRAGMA user_version = {}", db::SCHEMA_VERSION)).unwrap();
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().note, None, "the claim was given back");
+    assert!(tasks::deny(&ctx, &t, None).is_ok(), "the person can decline at once");
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
 /// The file stash, with a hook that runs inside `delete`, after the value is removed.
 struct DeleteHookStash<F> {
     inner: Box<dyn Stash>,
