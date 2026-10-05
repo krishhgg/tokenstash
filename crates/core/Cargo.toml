@@ -30,4 +30,8 @@ keyring = { version = "3", features = ["apple-native"] }
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["linux-native", "async-secret-service", "async-io", "crypto-rust"] }
+keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+linux-keyutils = { version = "0.2", features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

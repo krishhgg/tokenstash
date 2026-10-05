@@ -731,7 +731,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
     if cfg.stash_backend.is_none() && backend != "insecure-file" {
         cfg.stash_backend = Some(match backend { "secret-service" | "os-keychain" => "keyring".into(), b => b.into() });
     }
-    println!("✓ stash backend: {backend}{}", if backend == "keyutils" { "  (Linux kernel keyring: survives logout, not reboot; install a Secret Service like gnome-keyring for persistence)" } else { "" });
+    println!("✓ stash backend: {backend}{}", if backend == "keyutils" { "  (Linux kernel keyring: kept until the next reboot; a Secret Service such as gnome-keyring keeps keys across reboots)" } else { "" });
 
     // 2. trust: nothing is inferred and nothing is added. The first time a directory asks
     // for stored keys the human approves exactly which ones; that is the whole model.

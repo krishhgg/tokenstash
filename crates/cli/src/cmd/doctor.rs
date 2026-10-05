@@ -17,9 +17,14 @@ pub fn doctor() -> Result<i32> {
         Ok(s) => {
             let probe = match s.backend() {
                 "insecure-file" => Ok(()),
-                _ => tokenstash_core::stash::KeyringStash::auto().and_then(|k| k.probe()),
+                _ => tokenstash_core::stash::probe(s.as_ref()),
             };
-            ok &= check("stash backend", probe.is_ok(), format!("{}{}", s.backend(), probe.err().map(|e| format!("  ({e})")).unwrap_or_default()));
+            let note = match (&probe, s.backend()) {
+                (Err(e), _) => format!("  ({e})"),
+                (Ok(()), "keyutils") => "  (Linux kernel keyring: kept until the next reboot; a Secret Service such as gnome-keyring keeps keys across reboots)".into(),
+                _ => String::new(),
+            };
+            ok &= check("stash backend", probe.is_ok(), format!("{}{note}", s.backend()));
         }
         Err(e) => { ok &= check("stash backend", false, e.to_string()); }
     }

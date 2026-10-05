@@ -1094,7 +1094,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
 dependencies = [
  "dbus-secret-service",
- "linux-keyutils",
  "log",
  "secret-service",
  "security-framework 2.11.1",
@@ -2086,6 +2085,8 @@ dependencies = [
  "chrono",
  "dirs",
  "keyring",
+ "libc",
+ "linux-keyutils",
  "rand",
  "regex",
  "rusqlite",

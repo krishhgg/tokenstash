@@ -5,7 +5,7 @@
 //! - `keyring`: OS store via the `keyring` crate (macOS Keychain, Windows Credential Manager,
 //!   Linux Secret Service). Default.
 //! - `keyutils`: Linux kernel keyring (no daemon needed; survives logout, not reboot).
-//!   Auto-selected on Linux when Secret Service is unavailable.
+//!   Auto-selected on Linux when Secret Service is unavailable. See [`KernelKeyring`].
 //! - `insecure-file`: 0600 JSON file. ONLY for CI/tests. Requires explicit opt-in via
 //!   `TOKENSTASH_STASH=insecure-file` or config. Prints a warning.
 
@@ -76,9 +76,36 @@ pub fn open(cfg: &crate::Config) -> Result<Box<dyn Stash>> {
         }
         "keyring" => Ok(Box::new(KeyringStash::os_store()?)),
         #[cfg(target_os = "linux")]
-        "keyutils" => Ok(Box::new(KeyringStash::keyutils()?)),
-        "auto" => KeyringStash::auto().map(|s| Box::new(s) as Box<dyn Stash>),
+        "keyutils" => Ok(Box::new(KernelKeyring)),
+        "auto" => auto(),
         other => Err(anyhow!("unknown stash backend '{other}'")),
+    }
+}
+
+/// OS store if it works; on Linux fall back to the kernel keyring.
+pub fn auto() -> Result<Box<dyn Stash>> {
+    let s = KeyringStash::os_store()?;
+    if s.probe().is_ok() {
+        return Ok(Box::new(s));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        probe(&KernelKeyring).map_err(|e| anyhow!("no usable Linux keyring (Secret Service unavailable and the kernel keyring failed): {e}"))?;
+        return Ok(Box::new(KernelKeyring));
+    }
+    #[allow(unreachable_code)]
+    Err(anyhow!("OS keychain unavailable"))
+}
+
+/// Round-trip a throwaway entry through `stash` to confirm the backend works.
+pub fn probe(stash: &dyn Stash) -> Result<()> {
+    let key = "__tokenstash_probe__";
+    stash.set(key, &SecretString::from("ok"))?;
+    let got = stash.get(key);
+    let _ = stash.delete(key);
+    match got? {
+        Some(v) if v.expose_secret() == "ok" => Ok(()),
+        _ => Err(anyhow!("probe mismatch")),
     }
 }
 
@@ -98,28 +125,6 @@ impl KeyringStash {
         }
         #[allow(unreachable_code)]
         Ok(Self { name: "os-keychain" })
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn keyutils() -> Result<Self> {
-        keyring::set_default_credential_builder(keyring::keyutils::default_credential_builder());
-        Ok(Self { name: "keyutils" })
-    }
-
-    /// OS store if it works; on Linux fall back to the kernel keyring.
-    pub fn auto() -> Result<Self> {
-        let s = Self::os_store()?;
-        if s.probe().is_ok() {
-            return Ok(s);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let k = Self::keyutils()?;
-            k.probe().map_err(|e| anyhow!("no usable Linux keyring (Secret Service unavailable and keyutils failed): {e}"))?;
-            return Ok(k);
-        }
-        #[allow(unreachable_code)]
-        Err(anyhow!("OS keychain unavailable"))
     }
 
     /// Round-trip a throwaway entry to confirm the backend works.
@@ -159,6 +164,208 @@ impl Stash for KeyringStash {
             Err(keyring::Error::NoEntry) => Ok(false),
             Err(err) => Err(anyhow!("keyring delete failed: {err}")),
         }
+    }
+}
+
+// ---------------- Linux kernel keyring ----------------
+
+/// The Linux kernel keyring, for a machine with no Secret Service (a headless box, an SSH
+/// login). One key object per name, linked into the user keyring and the user's persistent
+/// keyring, and updated in place when the value changes.
+///
+/// tokenstash 0.3.0 and earlier used keyring-rs's keyutils store, which adds each key to the
+/// *session* keyring and reads the session copy first. Every login session (an SSH shell,
+/// the agent's process tree) ends up holding a copy of its own: a key pasted from one session
+/// is shadowed in another by the copy that session read earlier, and that read links the old
+/// copy back into the persistent keyring over the new one. So a replaced key kept coming
+/// back. Here a read never prefers the session keyring — it is consulted only for keys that
+/// older code left nowhere else — and a write updates every copy it can reach, so a process
+/// still running the old code and holding a session copy reads the new value too. Entries
+/// keep keyring-rs's description, `keyring-rs:<NAME@identity>@<service>`, so keys stored by
+/// older versions are found where they are.
+///
+/// The user keyring lives while any process of this user runs; the persistent keyring
+/// survives a logout but is dropped after `/proc/sys/kernel/keys/persistent_keyring_expiry`
+/// seconds (three days by default) without use. Neither survives a reboot.
+#[cfg(target_os = "linux")]
+pub struct KernelKeyring;
+
+#[cfg(target_os = "linux")]
+mod kernel {
+    use anyhow::{anyhow, Result};
+    use linux_keyutils::{Key, KeyError, KeyPermissions, KeyPermissionsBuilder, KeyRing, KeyRingIdentifier, Permission};
+
+    pub(super) fn description(key: &str) -> String {
+        format!("keyring-rs:{key}@{}", super::service())
+    }
+
+    fn fail(what: &str, e: KeyError) -> anyhow::Error {
+        anyhow!("kernel keyring: {what} failed: {e:?}")
+    }
+
+    /// The user keyring. Reached through its special id, so this process possesses it and
+    /// every key found through it.
+    pub(super) fn user() -> Result<KeyRing> {
+        KeyRing::from_special_id(KeyRingIdentifier::User, true).map_err(|e| fail("opening the user keyring", e))
+    }
+
+    /// The persistent keyring, linked into the session keyring (which is what lets this
+    /// process read the keys in it). Asking for it resets its expiry timer. `None` on a
+    /// kernel built without persistent keyrings.
+    pub(super) fn persistent() -> Option<KeyRing> {
+        KeyRing::get_persistent(KeyRingIdentifier::Session).ok()
+    }
+
+    fn session() -> Option<KeyRing> {
+        KeyRing::from_special_id(KeyRingIdentifier::Session, false).ok()
+    }
+
+    /// "Not there" covers the states a key passes through while it is being invalidated or
+    /// after it expired, as keyring-rs found experimentally.
+    fn absent(e: KeyError) -> bool {
+        matches!(e, KeyError::KeyDoesNotExist | KeyError::KeyExpired | KeyError::KeyRevoked | KeyError::AccessDenied)
+    }
+
+    fn find(ring: &KeyRing, desc: &str) -> Result<Option<Key>> {
+        match ring.search(desc) {
+            Ok(k) => Ok(Some(k)),
+            Err(e) if absent(e) => Ok(None),
+            Err(e) => Err(fail("search", e)),
+        }
+    }
+
+    /// The key to read: the user keyring's, else the persistent keyring's, else (keys only
+    /// older code stored) whatever the session keyring holds.
+    pub(super) fn current(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str) -> Result<Option<Key>> {
+        if let Some(k) = find(user, desc)? {
+            return Ok(Some(k));
+        }
+        if let Some(k) = persistent.map(|p| find(p, desc)).transpose()?.flatten() {
+            return Ok(Some(k));
+        }
+        session().map(|s| find(&s, desc)).transpose().map(Option::flatten)
+    }
+
+    /// Every distinct key object under `desc` this process can reach, the one [`current`]
+    /// would read first.
+    pub(super) fn copies(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str) -> Result<Vec<Key>> {
+        let mut out: Vec<Key> = vec![];
+        for ring in [Some(*user), persistent.copied(), session()].into_iter().flatten() {
+            if let Some(k) = find(&ring, desc)? {
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// This user may use the key from any session. The kernel checks possession again on
+    /// every call that names a key by id, and a session keyring that does not link the user
+    /// keyring (a systemd service's private one, `keyctl session`) does not possess what is
+    /// in it: with the default "possessor only" permissions such a process finds the key and
+    /// then cannot read, update or remove it. This grants this uid nothing it could not get
+    /// anyway, since any of its processes can link the persistent keyring into its session.
+    fn perms() -> KeyPermissions {
+        KeyPermissionsBuilder::builder().posessor(Permission::ALL).user(Permission::ALL).build()
+    }
+
+    /// Link `key` into both rings, so it outlives a logout (persistent) and the persistent
+    /// keyring's expiry (user). Linking displaces any other key with the same description
+    /// from that ring.
+    pub(super) fn pin(user: &KeyRing, persistent: Option<&KeyRing>, key: Key) -> Result<()> {
+        // A key older code stored still has possessor-only permissions; widen them while
+        // this process possesses it (through the persistent keyring), best effort.
+        let _ = key.set_perms(perms());
+        user.link_key(key).map_err(|e| fail("linking into the user keyring", e))?;
+        if let Some(p) = persistent {
+            p.link_key(key).map_err(|e| fail("linking into the persistent keyring", e))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn read(key: Key) -> Result<Option<Vec<u8>>> {
+        match key.read_to_vec() {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if absent(e) => Ok(None),
+            Err(e) => Err(fail("read", e)),
+        }
+    }
+
+    /// A new key, created in the process keyring (always possessed, so its permissions can
+    /// be set before anything else can see it), then pinned and unlinked from there. A
+    /// failure part-way removes it rather than leaving an unreachable key behind.
+    pub(super) fn create(user: &KeyRing, persistent: Option<&KeyRing>, desc: &str, value: &[u8]) -> Result<Key> {
+        let scratch = KeyRing::from_special_id(KeyRingIdentifier::Process, true).map_err(|e| fail("opening the process keyring", e))?;
+        let key = scratch.add_key(desc, value).map_err(|e| fail("add", e))?;
+        let pinned = key.set_perms(perms()).map_err(|e| fail("setting permissions", e)).and_then(|()| pin(user, persistent, key));
+        let _ = scratch.unlink_key(key);
+        if let Err(e) = pinned {
+            let _ = key.invalidate();
+            return Err(e);
+        }
+        Ok(key)
+    }
+
+    pub(super) fn update(key: Key, value: &[u8]) -> Result<()> {
+        key.update(&value).map_err(|e| fail("update", e))
+    }
+
+    pub(super) fn invalidate(key: Key) -> Result<()> {
+        match key.invalidate() {
+            Ok(()) => Ok(()),
+            Err(e) if absent(e) => Ok(()),
+            Err(e) => Err(fail("invalidate", e)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Stash for KernelKeyring {
+    fn backend(&self) -> &'static str {
+        "keyutils"
+    }
+    fn get(&self, key: &str) -> Result<Option<SecretString>> {
+        let desc = kernel::description(key);
+        let (user, persistent) = (kernel::user()?, kernel::persistent());
+        let Some(k) = kernel::current(&user, persistent.as_ref(), &desc)? else { return Ok(None) };
+        // Adopt a key older code left only in the persistent or the session keyring, and
+        // re-pin it so the persistent link outlives the next logout. The read does not
+        // depend on it.
+        let _ = kernel::pin(&user, persistent.as_ref(), k);
+        let Some(bytes) = kernel::read(k)? else { return Ok(None) };
+        let v = String::from_utf8(bytes).map_err(|_| anyhow!("the kernel keyring entry for {key} is not UTF-8"))?;
+        Ok(Some(SecretString::from(v)))
+    }
+    fn set(&self, key: &str, value: &SecretString) -> Result<()> {
+        let v = value.expose_secret().as_bytes();
+        if v.is_empty() {
+            return Err(anyhow!("the kernel keyring cannot hold an empty value"));
+        }
+        let desc = kernel::description(key);
+        let (user, persistent) = (kernel::user()?, kernel::persistent());
+        let copies = kernel::copies(&user, persistent.as_ref(), &desc)?;
+        let Some(&keep) = copies.first() else {
+            kernel::create(&user, persistent.as_ref(), &desc, v)?;
+            return Ok(());
+        };
+        // Update in place: every session that links this object sees the new value.
+        kernel::update(keep, v)?;
+        // A shadow (an older session copy) gets the value as well, best effort: this
+        // process never reads it, but an older tokenstash in that session does.
+        for &k in copies.iter().skip(1) {
+            let _ = kernel::update(k, v);
+        }
+        kernel::pin(&user, persistent.as_ref(), keep)
+    }
+    fn delete(&self, key: &str) -> Result<bool> {
+        let desc = kernel::description(key);
+        let (user, persistent) = (kernel::user()?, kernel::persistent());
+        let copies = kernel::copies(&user, persistent.as_ref(), &desc)?;
+        for &k in &copies {
+            kernel::invalidate(k)?;
+        }
+        Ok(!copies.is_empty())
     }
 }
 
@@ -213,5 +420,138 @@ impl Stash for FileStash {
             self.write(&m)?;
             Ok(had)
         })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod kernel_tests {
+    use super::*;
+    use linux_keyutils::{KeyRing, KeyRingIdentifier};
+
+    const CHILD: &str = "TOKENSTASH_KERNEL_TEST_CHILD";
+
+    /// Run the test `name` again in a child process that has a fresh session keyring of its
+    /// own, as a separate login would, and a scratch `TOKENSTASH_HOME` so its keys live under
+    /// a service name of their own. True in the child (run the body), false in the parent
+    /// once the child has passed. A kernel that refuses keyctl (a container's seccomp
+    /// profile) skips the test.
+    fn in_own_session(name: &str) -> bool {
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        use std::os::unix::process::CommandExt;
+        let home = std::env::temp_dir().join(format!("tokenstash-kernel-test-{}-{}", std::process::id(), rand::random::<u32>()));
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([name, "--exact", "--nocapture", "--test-threads=1"]).env(CHILD, "1").env("TOKENSTASH_HOME", &home);
+        // SAFETY: only an async-signal-safe syscall runs between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                // KEYCTL_JOIN_SESSION_KEYRING with no name: a new anonymous session keyring.
+                if libc::syscall(libc::SYS_keyctl, 1, std::ptr::null::<libc::c_char>()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("skipped: no kernel keyring here ({e})");
+                return false;
+            }
+        };
+        let _ = std::fs::remove_dir_all(&home);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("1 passed"), "child run failed:\n{text}");
+        assert!(text.contains(RAN), "the child did not run the test body:\n{text}");
+        false
+    }
+
+    /// Printed by a child that ran the body to the end, so a silent early return cannot
+    /// pass as a pass.
+    const RAN: &str = "kernel keyring test body completed";
+
+    fn value(s: &dyn Stash, key: &str) -> Option<String> {
+        s.get(key).unwrap().map(|v| v.expose_secret().to_string())
+    }
+
+    /// Removes everything the test left under its name, even when an assertion fails
+    /// halfway: the persistent keyring is shared by every session of this user.
+    struct Cleanup(&'static str);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = KernelKeyring.delete(self.0);
+        }
+    }
+
+    /// The state an agent's session was left in by keyring-rs's keyutils store: an old copy
+    /// linked straight into the session keyring, while the key pasted from another session
+    /// (an SSH shell) is a different object in the persistent keyring. A read must return
+    /// the pasted value, and the next write must reach the old copy too.
+    #[test]
+    fn a_session_copy_does_not_shadow_the_stored_value() {
+        if !in_own_session("stash::kernel_tests::a_session_copy_does_not_shadow_the_stored_value") {
+            return;
+        }
+        probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
+        let key = "OPENAI_API_KEY@default";
+        let _cleanup = Cleanup(key);
+        let desc = kernel::description(key);
+        let session = KeyRing::from_special_id(KeyRingIdentifier::Session, false).unwrap();
+        let persistent = KeyRing::get_persistent(KeyRingIdentifier::Session).expect("persistent keyring");
+
+        // Older tokenstash stored and read the old value in this session.
+        let old = session.add_key(&desc, b"sk-old-value-from-this-session").unwrap();
+        persistent.link_key(old).unwrap();
+        // The paste from the other session: a separate object, linked into the persistent
+        // keyring (displacing the old link there) and nowhere in this session.
+        let process = KeyRing::from_special_id(KeyRingIdentifier::Process, true).unwrap();
+        let new = process.add_key(&desc, b"sk-new-value-from-another-session").unwrap();
+        persistent.link_key(new).unwrap();
+        process.unlink_key(new).unwrap();
+        assert_ne!(old, new);
+        // keyring-rs read the session first and got the old value back.
+        assert_eq!(session.search(&desc).unwrap(), old, "the setup must reproduce the shadowing");
+
+        assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-new-value-from-another-session"));
+
+        // A replacement written from this session reaches both objects: an older tokenstash
+        // still running here reads the session copy, and it now holds the new value.
+        KernelKeyring.set(key, &SecretString::from("sk-replacement-value")).unwrap();
+        assert_eq!(value(&KernelKeyring, key).as_deref(), Some("sk-replacement-value"));
+        let legacy = session.search(&desc).unwrap().read_to_vec().unwrap();
+        assert_eq!(legacy, b"sk-replacement-value");
+
+        assert!(KernelKeyring.delete(key).unwrap());
+        assert_eq!(value(&KernelKeyring, key), None);
+        assert!(!KernelKeyring.delete(key).unwrap());
+        println!("{RAN}");
+    }
+
+    /// A value written in one session is the value every later session reads, and a
+    /// replacement updates the same object instead of adding a second one.
+    #[test]
+    fn one_object_per_name_updated_in_place() {
+        if !in_own_session("stash::kernel_tests::one_object_per_name_updated_in_place") {
+            return;
+        }
+        probe(&KernelKeyring).expect("the kernel keyring works in a session that does not link the user keyring");
+        let key = "RESEND_API_KEY@work";
+        let _cleanup = Cleanup(key);
+        let desc = kernel::description(key);
+        KernelKeyring.set(key, &SecretString::from("re_first_value_123")).unwrap();
+        let user = KeyRing::from_special_id(KeyRingIdentifier::User, false).unwrap();
+        let first = user.search(&desc).unwrap();
+        KernelKeyring.set(key, &SecretString::from("re_second_value_456")).unwrap();
+        assert_eq!(user.search(&desc).unwrap(), first, "a replacement keeps the same key object");
+        let persistent = KeyRing::get_persistent(KeyRingIdentifier::Session).unwrap();
+        assert_eq!(persistent.search(&desc).unwrap(), first, "and it is pinned in the persistent keyring too");
+        assert_eq!(value(&KernelKeyring, key).as_deref(), Some("re_second_value_456"));
+        // Nothing went into the session keyring, so no later session copy can exist.
+        let session = KeyRing::from_special_id(KeyRingIdentifier::Session, false).unwrap();
+        assert!(!session.get_links(64).unwrap().contains(&first), "the key is not linked into the session keyring");
+        assert!(KernelKeyring.delete(key).unwrap());
+        assert_eq!(value(&KernelKeyring, key), None);
+        println!("{RAN}");
     }
 }
