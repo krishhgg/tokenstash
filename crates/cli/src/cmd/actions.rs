@@ -36,6 +36,8 @@ pub fn print_pending(app: &App, project: &Path, agent: &str, t: &Task) -> Result
 /// is renewed while the action runs, so a slow one keeps its card however long it takes. The
 /// card stays pending until the action has run, so if this process stops half way the claim
 /// runs out and the person can confirm it again; if the action fails, the claim is given back.
+/// A mode or MCP card that fails puts its setting back first (`init::apply_choice`), so the
+/// person can decline it without the change standing.
 pub fn confirm(app: &App, task: &Task, action: &Action) -> Result<String> {
     use tokenstash_core::db::TaskStatus;
     let Some(claim) = app.db.claim_action(&task.id)? else {
