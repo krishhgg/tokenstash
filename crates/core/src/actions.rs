@@ -153,6 +153,55 @@ pub fn request(ctx: &Ctx, project: &Path, agent: &str, action: &Action, why: Opt
     Ok(t)
 }
 
+/// What [`forget`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forgot {
+    /// The value, its index row, or both were deleted.
+    Deleted,
+    /// Nothing was stored under that name.
+    NothingStored,
+    /// The card's value is gone already: an earlier confirm of the card deleted it, or it was
+    /// replaced since the card was first confirmed. `kept` is true when the name holds a newer
+    /// value, which stays.
+    Gone { kept: bool },
+}
+
+/// What a forget card records when nothing was stored under its name.
+const NOTHING_STORED: &str = "-";
+
+/// Delete a stored key and its index row. Both deletions run under the index write lock,
+/// which a store holds around its stash write and its index row: a store lands wholly before
+/// or wholly after, never between them, so no value is left without its row.
+///
+/// `card` is the forget card being confirmed and the confirm's claim on it. Before deleting
+/// anything, the first confirm records on the card which stored value it is about, and that
+/// record is committed on its own. A confirm of the card after one that stopped half way
+/// (the key deleted, the card still open) deletes only that value: a key stored since stays.
+pub fn forget(ctx: &Ctx, name: &str, identity: &str, card: Option<(&str, &str)>) -> Result<Forgot> {
+    let about = match card {
+        Some((id, claim)) => {
+            let pinned = ctx.db.locked(|| {
+                let now = ctx.db.stored_value_id(name, identity)?;
+                ctx.db.pin_action_target(id, claim, now.as_deref().unwrap_or(NOTHING_STORED))
+            })?;
+            Some(pinned.context("another confirm took this card over; reload it")?)
+        }
+        None => None,
+    };
+    ctx.db.locked(|| {
+        let now = ctx.db.stored_value_id(name, identity)?;
+        if let Some(about) = &about {
+            if now.as_deref().unwrap_or(NOTHING_STORED) != about {
+                return Ok(Forgot::Gone { kept: now.is_some() });
+            }
+        }
+        let had = ctx.stash.delete(&crate::stash::stash_key(name, identity))?;
+        let meta = ctx.db.delete_secret(name, identity)?;
+        ctx.db.audit(None, None, "forget", Some(name), Some(identity), None)?;
+        Ok(if had || meta { Forgot::Deleted } else { Forgot::NothingStored })
+    })
+}
+
 /// An agent asks to replace a key, usually because the user told it to. Unlike a person's
 /// `rotate`, the stored key is not marked stale: it keeps working until the person pastes the
 /// new one on the Replace card, and declining the card changes nothing.

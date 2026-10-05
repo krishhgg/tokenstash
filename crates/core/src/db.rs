@@ -3,18 +3,52 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// (ts, project, agent, action, name, identity, detail) — never a value.
-/// (ts, project, agent, action, name, identity, detail, grant_source)
-/// The note an action card carries while it is being carried out, before the time.
+/// The note an action card carries while it is being carried out: this, the time the claim
+/// was last renewed, a space, and the claim's own 16-character token.
 pub const CONFIRMING: &str = "confirming since ";
-/// How long a claim on an action card holds before it counts as left behind by a process that
-/// stopped mid-action. Every action finishes in seconds.
+/// How long a claim on an action card holds without being renewed. The process carrying the
+/// action out renews it every [`CLAIM_RENEW_SECS`] while the action runs ([`Db::keep_claim`]),
+/// so a claim runs out only once that process has stopped.
 pub const CLAIM_HOLDS_SECS: i64 = 120;
+/// How often a running action renews its claim.
+pub const CLAIM_RENEW_SECS: u64 = 20;
 
 fn claim_cutoff() -> String {
     (chrono::Utc::now() - chrono::Duration::seconds(CLAIM_HOLDS_SECS)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// The token at the end of a claim: what stays the same when the claim is renewed.
+fn claim_token(claim: &str) -> &str {
+    claim.rsplit(' ').next().unwrap_or(claim)
+}
+
+/// SQL: the card holds no live claim (none, or one not renewed since the cutoff bound to `?p`).
+fn no_live_claim(p: u8) -> String {
+    format!("(note IS NULL OR note NOT LIKE 'confirming since %' OR substr(note, 18, 20) < ?{p})")
+}
+
+/// SQL: the card's claim is the one whose token is bound to `?p`.
+fn held_by(p: u8) -> String {
+    format!("(note LIKE 'confirming since %' AND substr(note, -16) = ?{p})")
+}
+
+/// Renews a claim on an action card from a thread of its own until dropped. See
+/// [`Db::keep_claim`].
+pub struct ClaimKeeper {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ClaimKeeper {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+/// (ts, project, agent, action, name, identity, detail, grant_source). Never a value.
 pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
 
 pub struct Db {
@@ -306,6 +340,8 @@ impl Db {
             ("stale_source", "ALTER TABLE secrets ADD COLUMN stale_source TEXT"),
             ("next_probe", "ALTER TABLE secrets ADD COLUMN next_probe TEXT"),
             ("verify_off", "ALTER TABLE secrets ADD COLUMN verify_off INTEGER NOT NULL DEFAULT 0"),
+            // A random id each store gives the value it writes (`stored_value_id`).
+            ("value_id", "ALTER TABLE secrets ADD COLUMN value_id TEXT"),
         ] {
             let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('secrets') WHERE name=?1")?.exists([col])?;
             if !has {
@@ -318,11 +354,16 @@ impl Db {
                 }
             }
         }
-        // Cards remember whether their one desktop notification went out (0.2.1+).
-        {
-            let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name=?1")?.exists(["notified"])?;
+        for (table, col, ddl) in [
+            // Cards remember whether their one desktop notification went out (0.2.1+).
+            ("tasks", "notified", "ALTER TABLE tasks ADD COLUMN notified TEXT"),
+            // What a confirmed action card acts on, recorded by its first confirm
+            // (`pin_action_target`).
+            ("tasks", "acts_on", "ALTER TABLE tasks ADD COLUMN acts_on TEXT"),
+        ] {
+            let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"))?.exists([col])?;
             if !has {
-                if let Err(e) = conn.execute_batch("ALTER TABLE tasks ADD COLUMN notified TEXT") {
+                if let Err(e) = conn.execute_batch(ddl) {
                     if !e.to_string().contains("duplicate column") {
                         return Err(e.into());
                     }
@@ -442,14 +483,16 @@ impl Db {
 
     // ---------- secrets index (metadata only; values live in the stash) ----------
 
+    /// Record a value just put in the stash. Every call is a new value (a store, an adoption,
+    /// an import), so it gets a new value id.
     pub fn upsert_secret(&self, m: &SecretMeta) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO secrets (name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason, stale_source, next_probe, verify_off)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+            "INSERT INTO secrets (name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason, stale_source, next_probe, verify_off, value_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13, lower(hex(randomblob(8))))
              ON CONFLICT(name, identity) DO UPDATE SET provider=excluded.provider, sensitive=excluded.sensitive,
                source_url=excluded.source_url, stale=excluded.stale, last_verified=excluded.last_verified, stale_reason=excluded.stale_reason,
                stale_source=excluded.stale_source, next_probe=excluded.next_probe, verify_off=excluded.verify_off,
-               created=excluded.created, last_used=COALESCE(excluded.last_used, secrets.last_used)",
+               created=excluded.created, last_used=COALESCE(excluded.last_used, secrets.last_used), value_id=excluded.value_id",
             params![m.name, m.identity, m.provider, m.sensitive as i32, m.source_url, m.created, m.last_used, m.stale as i32, m.last_verified, m.stale_reason, m.stale_source, m.next_probe, m.verify_off as i32],
         )?;
         Ok(())
@@ -621,6 +664,17 @@ impl Db {
         Ok(self.conn.execute("DELETE FROM secrets WHERE name=?1 AND identity=?2", params![name, identity])? > 0)
     }
 
+    /// What tells the value stored under (name, identity) apart from any stored before or
+    /// after it: its value id and when it was stored. A row from before value ids existed,
+    /// or one an older version rewrote, still differs by its time. `None` when the index
+    /// holds nothing under that name.
+    pub fn stored_value_id(&self, name: &str, identity: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(value_id, '') || ' ' || created FROM secrets WHERE name=?1 AND identity=?2", params![name, identity], |r| r.get(0))
+            .optional()?)
+    }
+
     // ---------- tasks ----------
 
     pub fn insert_task(&self, t: &Task) -> Result<()> {
@@ -790,38 +844,95 @@ impl Db {
 
     /// Mark a pending action card as being carried out, so a second confirm does not run it
     /// again. Returns the claim (its note, unique to this caller) when this caller holds it now.
-    /// A claim older than [`CLAIM_HOLDS_SECS`] was left by a process that stopped mid-action
-    /// and is taken over: the card stays pending until the action has run, so an interrupted
-    /// one can be confirmed again.
+    /// The caller keeps it renewed while the action runs ([`Self::keep_claim`]). A claim not
+    /// renewed for [`CLAIM_HOLDS_SECS`] was left by a process that stopped mid-action and is
+    /// taken over: the card stays pending until the action has run, so an interrupted one can
+    /// be confirmed again.
     pub fn claim_action(&self, id: &str) -> Result<Option<String>> {
         let claim = format!("{CONFIRMING}{} {:016x}", crate::now(), rand::random::<u64>());
         let n = self.conn.execute(
-            "UPDATE tasks SET note=?2 WHERE id=?1 AND status='pending' AND (note IS NULL OR note NOT LIKE 'confirming since %' OR substr(note, 18, 20) < ?3)",
+            &format!("UPDATE tasks SET note=?2 WHERE id=?1 AND status='pending' AND {}", no_live_claim(3)),
             params![id, claim, claim_cutoff()],
         )?;
         Ok((n == 1).then_some(claim))
+    }
+
+    /// Move `claim`'s time to now, if it still holds the card. False once the card is closed,
+    /// the claim given back, or taken over.
+    pub fn renew_action_claim(&self, id: &str, claim: &str) -> Result<bool> {
+        let token = claim_token(claim);
+        Ok(self.conn.execute(
+            &format!("UPDATE tasks SET note=?3 WHERE id=?1 AND status='pending' AND {}", held_by(2)),
+            params![id, token, format!("{CONFIRMING}{} {token}", crate::now())],
+        )? == 1)
+    }
+
+    /// Keep `claim` on card `id` renewed from a thread of its own, every [`CLAIM_RENEW_SECS`],
+    /// until the returned keeper is dropped. An action that runs longer than
+    /// [`CLAIM_HOLDS_SECS`] (`claude mcp add` on a slow machine) keeps its card: no other
+    /// confirm takes it over, no decline lands, and it does not expire. A process that stops
+    /// stops renewing, and the claim runs out as before.
+    pub fn keep_claim(&self, id: &str, claim: &str) -> Result<ClaimKeeper> {
+        self.keep_claim_every(id, claim, std::time::Duration::from_secs(CLAIM_RENEW_SECS))
+    }
+
+    pub(crate) fn keep_claim_every(&self, id: &str, claim: &str, every: std::time::Duration) -> Result<ClaimKeeper> {
+        // A connection of its own: this one stays with the caller, which runs the action.
+        let path = self.conn.path().filter(|p| !p.is_empty()).context("the index has no file to open a second connection to")?;
+        let db = Db::open(Path::new(path))?;
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let (id, claim) = (id.to_string(), claim.to_string());
+        // Wakes every `every` until the keeper drops its sender. A renewal that fails (the
+        // index busy past its timeout) is tried again next time; one that finds the claim gone
+        // ends the loop.
+        let worker = std::thread::spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                if let Ok(false) = db.renew_action_claim(&id, &claim) {
+                    break;
+                }
+            }
+        });
+        Ok(ClaimKeeper { stop: Some(stop), worker: Some(worker) })
     }
 
     /// Close a card whose action ran, if `claim` still holds it: a worker that was taken over
     /// after its claim ran out must not close the card under the one that took it.
     pub fn finish_action(&self, id: &str, claim: &str, done: &str) -> Result<bool> {
         Ok(self.conn.execute(
-            "UPDATE tasks SET status='answered', answered_at=?3, note=?4 WHERE id=?1 AND status='pending' AND note=?2",
-            params![id, claim, crate::now(), done],
+            &format!("UPDATE tasks SET status='answered', answered_at=?3, note=?4 WHERE id=?1 AND status='pending' AND {}", held_by(2)),
+            params![id, claim_token(claim), crate::now(), done],
         )? == 1)
     }
 
     /// Give `claim` back after the action failed, so the person can try again or decline.
     pub fn release_action_claim(&self, id: &str, claim: &str) -> Result<()> {
-        self.conn.execute("UPDATE tasks SET note=NULL WHERE id=?1 AND status='pending' AND note=?2", params![id, claim])?;
+        self.conn.execute(&format!("UPDATE tasks SET note=NULL WHERE id=?1 AND status='pending' AND {}", held_by(2)), params![id, claim_token(claim)])?;
         Ok(())
     }
 
-    /// Decline a card unless an action on it is being carried out right now (a fresh claim):
+    /// Record on a card that `claim` holds what its action acts on (`target`), unless an
+    /// earlier confirm of the card already did, and return what the card holds then: this
+    /// call's target or the earlier one. `None` when `claim` no longer holds the card. The
+    /// record outlives the claim, so a confirm after one that stopped half way acts on the
+    /// same thing, not on whatever is there by then.
+    pub fn pin_action_target(&self, id: &str, claim: &str, target: &str) -> Result<Option<String>> {
+        let token = claim_token(claim);
+        self.conn.execute(
+            &format!("UPDATE tasks SET acts_on=?3 WHERE id=?1 AND status='pending' AND acts_on IS NULL AND {}", held_by(2)),
+            params![id, token, target],
+        )?;
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT acts_on FROM tasks WHERE id=?1 AND status='pending' AND {}", held_by(2)), params![id, token], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten())
+    }
+
+    /// Decline a card unless an action on it is being carried out right now (a live claim):
     /// a decline must not land while the change it declines is half made.
     pub fn deny_unless_claimed(&self, id: &str, note: Option<&str>) -> Result<bool> {
         Ok(self.conn.execute(
-            "UPDATE tasks SET status='denied', answered_at=?2, note=COALESCE(?3, note) WHERE id=?1 AND status='pending' AND (note IS NULL OR note NOT LIKE 'confirming since %' OR substr(note, 18, 20) < ?4)",
+            &format!("UPDATE tasks SET status='denied', answered_at=?2, note=COALESCE(?3, note) WHERE id=?1 AND status='pending' AND {}", no_live_claim(4)),
             params![id, crate::now(), note, claim_cutoff()],
         )? == 1)
     }
@@ -938,11 +1049,14 @@ impl Db {
         Ok(self.conn.execute("UPDATE tasks SET why=?2 WHERE id=?1 AND status='pending'", params![id, why])? == 1)
     }
 
-    /// Mark pending tasks past their deadline as expired. Returns count.
+    /// Mark pending tasks past their deadline as expired. Returns count. A card whose action
+    /// is being carried out (a live claim) is left to the confirm that runs it: the change is
+    /// being made, and that confirm closes the card with what it did. Once the claim runs out
+    /// (the process stopped) or is given back, the card expires on the next call.
     pub fn expire_overdue(&self) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE tasks SET status='expired' WHERE status='pending' AND deadline < ?1",
-            params![crate::now()],
+            &format!("UPDATE tasks SET status='expired' WHERE status='pending' AND deadline < ?1 AND {}", no_live_claim(2)),
+            params![crate::now(), claim_cutoff()],
         )?)
     }
 

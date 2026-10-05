@@ -7,7 +7,7 @@ use crate::notify;
 use crate::util::{self, App};
 use anyhow::{bail, Result};
 use std::path::Path;
-use tokenstash_core::actions::{self, Action};
+use tokenstash_core::actions::{self, Action, Forgot};
 use tokenstash_core::config::AgentMode;
 use tokenstash_core::db::Task;
 
@@ -32,9 +32,10 @@ pub fn print_pending(app: &App, project: &Path, agent: &str, t: &Task) -> Result
 
 /// Person side, from the inbox's full session or the person's terminal: claim the card, do
 /// what it says, then close it. The claim means a second confirm (another tab, a double click)
-/// runs nothing: an old forget card confirmed again would delete a key stored since. The card
-/// stays pending until the action has run, so if this process stops half way the claim runs
-/// out and the person can confirm it again; if the action fails, the claim is given back.
+/// runs nothing: an old forget card confirmed again would delete a key stored since. The claim
+/// is renewed while the action runs, so a slow one keeps its card however long it takes. The
+/// card stays pending until the action has run, so if this process stops half way the claim
+/// runs out and the person can confirm it again; if the action fails, the claim is given back.
 pub fn confirm(app: &App, task: &Task, action: &Action) -> Result<String> {
     use tokenstash_core::db::TaskStatus;
     let Some(claim) = app.db.claim_action(&task.id)? else {
@@ -43,11 +44,17 @@ pub fn confirm(app: &App, task: &Task, action: &Action) -> Result<String> {
             _ => bail!("this card was already answered"),
         }
     };
-    match perform(app, task, action) {
+    let ran = app.db.keep_claim(&task.id, &claim).and_then(|kept| {
+        let done = perform(app, task, action, &claim);
+        drop(kept);
+        done
+    });
+    match ran {
         Ok(done) => {
             if !app.db.finish_action(&task.id, &claim, &done)? {
-                // Ran past the claim's time and another confirm took over: the change is made,
-                // and the card is the other confirm's to close.
+                // The claim went unrenewed for its whole time while this ran (the machine
+                // slept, or the index stayed locked) and another confirm took over: the change
+                // is made, and the card is the other confirm's to close.
                 return Ok(format!("{done} (another confirm took this card over meanwhile)"));
             }
             app.db.audit(Some(&task.project), Some(&task.agent), "action.confirmed", None, None, Some(&task.expects))?;
@@ -60,12 +67,13 @@ pub fn confirm(app: &App, task: &Task, action: &Action) -> Result<String> {
     }
 }
 
-fn perform(app: &App, task: &Task, action: &Action) -> Result<String> {
+fn perform(app: &App, task: &Task, action: &Action, claim: &str) -> Result<String> {
     match action {
-        Action::Forget { name, identity } => Ok(if forget_key(app, name, identity)? {
-            format!("Forgot {name}@{identity}")
-        } else {
-            format!("Nothing was stored for {name}@{identity}")
+        Action::Forget { name, identity } => Ok(match actions::forget(&app.ctx(), name, identity, Some((&task.id, claim)))? {
+            Forgot::Deleted => format!("Forgot {name}@{identity}"),
+            Forgot::NothingStored => format!("Nothing was stored for {name}@{identity}"),
+            Forgot::Gone { kept: false } => format!("Forgot {name}@{identity} (an earlier confirm of this card had deleted it)"),
+            Forgot::Gone { kept: true } => format!("Kept {name}@{identity}: it was stored again after this card was first confirmed, so it is not the key this card was about"),
         }),
         Action::Bind { name, identity } => {
             let project = Path::new(&task.project);
@@ -99,10 +107,7 @@ fn perform(app: &App, task: &Task, action: &Action) -> Result<String> {
     }
 }
 
-/// Delete a stored key and its index row. True if either existed.
+/// Delete a stored key and its index row, for a person at a terminal. True if either existed.
 pub fn forget_key(app: &App, name: &str, identity: &str) -> Result<bool> {
-    let had = app.stash.delete(&tokenstash_core::stash::stash_key(name, identity))?;
-    let meta = app.db.delete_secret(name, identity)?;
-    app.db.audit(None, None, "forget", Some(name), Some(identity), None)?;
-    Ok(had || meta)
+    Ok(actions::forget(&app.ctx(), name, identity, None)? == Forgot::Deleted)
 }

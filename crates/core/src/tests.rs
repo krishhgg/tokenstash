@@ -4155,6 +4155,243 @@ fn an_action_claim_belongs_to_its_worker_and_runs_out() {
     assert!(tasks::deny(&ctx, &u, None).is_ok());
 }
 
+/// Set a claim's time back to 2000, as if it had gone unrenewed past its hold time. The
+/// claim's token stays, so the claim is still the same one.
+fn age_claim(db: &Db, id: &str) {
+    db.conn.execute("UPDATE tasks SET note=?2 || substr(note, -17) WHERE id=?1", rusqlite::params![id, format!("{}2000-01-01T00:00:00Z", db::CONFIRMING)]).unwrap();
+}
+
+/// Store `value` the way a store does: the stash, then a new index row.
+fn store_default(db: &Db, stash: &dyn Stash, name: &str, value: &str) {
+    stash.set(&stash::stash_key(name, "default"), &SecretString::from(value.to_string())).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: name.into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+}
+
+fn stashed(stash: &dyn Stash, name: &str) -> Option<String> {
+    stash.get(&stash::stash_key(name, "default")).unwrap().map(|v| secrecy::ExposeSecret::expose_secret(&v).to_string())
+}
+
+/// Greptile on #65: an action that runs longer than a claim holds (`claude mcp add` on a slow
+/// machine) keeps its card while it runs: its claim is renewed, so no other confirm takes it
+/// over and no decline lands. Once nothing renews it (the process stopped), it runs out and
+/// the card is free again.
+#[test]
+fn a_running_action_keeps_its_claim_past_the_hold_time() {
+    use crate::actions::Action;
+    use std::time::{Duration, Instant};
+    let _env = env_lock();
+    let home = tmp("keep-claim-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("keep-claim-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let t = crate::actions::request(&ctx, &proj, "agent", &Action::Mcp(true), None).unwrap();
+    let claim = db.claim_action(&t.id).unwrap().unwrap();
+    let kept = db.keep_claim_every(&t.id, &claim, Duration::from_millis(20)).unwrap();
+    // The action has been running for longer than a claim holds; the next renewal brings its
+    // time back to now.
+    age_claim(&db, &t.id);
+    let started = Instant::now();
+    while db.get_task(&t.id).unwrap().unwrap().note.unwrap_or_default().contains("2000-01-01") {
+        assert!(started.elapsed() < Duration::from_secs(10), "the claim was not renewed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(db.claim_action(&t.id).unwrap().is_none(), "no other confirm takes a running action's card");
+    let err = tasks::deny(&ctx, &t, None).unwrap_err();
+    assert!(format!("{err:#}").contains("being carried out"), "{err:#}");
+    // The process stops: nothing renews the claim, and once it runs out the card is free.
+    drop(kept);
+    age_claim(&db, &t.id);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(db.get_task(&t.id).unwrap().unwrap().note.unwrap_or_default().contains("2000-01-01"), "a stopped keeper renews nothing");
+    assert!(tasks::deny(&ctx, &t, None).is_ok());
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
+/// Greptile on #60: a card whose action is being carried out does not expire under it, even
+/// past its deadline, so the confirm closes it with what it did. A claim left by a stopped
+/// process, or given back after a failure, holds nothing up: the card expires.
+#[test]
+fn a_card_being_carried_out_does_not_expire() {
+    use crate::actions::Action;
+    let _env = env_lock();
+    let home = tmp("claim-expiry-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("claim-expiry-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let running = crate::actions::request(&ctx, &proj, "agent", &Action::Undo, None).unwrap();
+    let stopped = crate::actions::request(&ctx, &proj, "agent", &Action::Mode("explicit".into()), None).unwrap();
+    let failed = crate::actions::request(&ctx, &proj, "agent", &Action::Mcp(false), None).unwrap();
+    let claim = db.claim_action(&running.id).unwrap().unwrap();
+    db.claim_action(&stopped.id).unwrap().unwrap();
+    age_claim(&db, &stopped.id);
+    let gave_back = db.claim_action(&failed.id).unwrap().unwrap();
+    db.release_action_claim(&failed.id, &gave_back).unwrap();
+    // The person confirmed near the deadline, and it passes while the actions run.
+    db.conn.execute("UPDATE tasks SET deadline='2000-01-01T00:00:00Z'", []).unwrap();
+    assert_eq!(db.expire_overdue().unwrap(), 2);
+    let status = |id: &str| db.get_task(id).unwrap().unwrap().status;
+    assert_eq!(status(&running.id), db::TaskStatus::Pending, "a card being carried out does not expire");
+    assert_eq!(status(&stopped.id), db::TaskStatus::Expired);
+    assert_eq!(status(&failed.id), db::TaskStatus::Expired);
+    assert!(db.renew_action_claim(&running.id, &claim).unwrap());
+    assert!(db.finish_action(&running.id, &claim, "Took tokenstash out of your agents").unwrap(), "a renewed claim still closes its card");
+    let done = db.get_task(&running.id).unwrap().unwrap();
+    assert_eq!((done.status, done.note.as_deref()), (db::TaskStatus::Answered, Some("Took tokenstash out of your agents")));
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
+/// The file stash, but `delete` stops right after removing the value: the process carrying out
+/// a forget stopped between the stash and the index.
+struct StopsAfterDelete(Box<dyn Stash>);
+
+impl Stash for StopsAfterDelete {
+    fn backend(&self) -> &'static str { "stops-after-delete" }
+    fn get(&self, key: &str) -> anyhow::Result<Option<SecretString>> { self.0.get(key) }
+    fn set(&self, key: &str, value: &SecretString) -> anyhow::Result<()> { self.0.set(key, value) }
+    fn delete(&self, key: &str) -> anyhow::Result<bool> {
+        self.0.delete(key)?;
+        anyhow::bail!("stopped after deleting the value")
+    }
+}
+
+/// Greptile on #66, #67 and #71: a forget card confirmed again after a confirm that stopped
+/// half way (the key deleted, the card still open) does not delete a key the person stored
+/// since. The first confirm records which value the card is about before deleting anything;
+/// a later confirm deletes only that value.
+#[test]
+fn a_forget_confirmed_again_after_a_stop_keeps_a_key_stored_since() {
+    use crate::actions::{Action, Forgot};
+    let _env = env_lock();
+    let home = tmp("forget-retry-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("forget-retry-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let forget = Action::Forget { name: "OPENAI_API_KEY".into(), identity: "default".into() };
+
+    // The first confirm deletes the key, then stops before closing the card.
+    store_default(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-proj-first0123456789abcdef");
+    let t = crate::actions::request(&ctx, &proj, "agent", &forget, None).unwrap();
+    let first = db.claim_action(&t.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&t.id, &first))).unwrap(), Forgot::Deleted);
+    assert_eq!(stashed(stash.as_ref(), "OPENAI_API_KEY"), None);
+    age_claim(&db, &t.id);
+    // The person stores the key again, then confirms the card that is still open.
+    store_default(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-proj-storedsince0123456789ab");
+    let second = db.claim_action(&t.id).unwrap().expect("a claim that ran out is taken over");
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&t.id, &second))).unwrap(), Forgot::Gone { kept: true });
+    assert_eq!(stashed(stash.as_ref(), "OPENAI_API_KEY").as_deref(), Some("sk-proj-storedsince0123456789ab"), "the key stored since stays");
+    assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().is_some(), "with its index row");
+    assert!(db.finish_action(&t.id, &second, "kept").unwrap());
+
+    // Stopped between the stash and the index: the value is gone, its index row rolled back.
+    // The claim is given back, as `confirm` does after a failure, and the key stored again.
+    let u = crate::actions::request(&ctx, &proj, "agent", &forget, None).unwrap();
+    assert_ne!(u.id, t.id);
+    let stops = StopsAfterDelete(stash::open(&cfg).unwrap());
+    let ctx_stops = tasks::Ctx { cfg: &cfg, db: &db, stash: &stops, probe: tasks::Probe::Off };
+    let c = db.claim_action(&u.id).unwrap().unwrap();
+    assert!(crate::actions::forget(&ctx_stops, "OPENAI_API_KEY", "default", Some((&u.id, &c))).is_err());
+    db.release_action_claim(&u.id, &c).unwrap();
+    assert_eq!(stashed(stash.as_ref(), "OPENAI_API_KEY"), None);
+    assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().is_some(), "the index deletion rolled back");
+    store_default(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-proj-storedagain0123456789ab");
+    let c = db.claim_action(&u.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&u.id, &c))).unwrap(), Forgot::Gone { kept: true });
+    assert_eq!(stashed(stash.as_ref(), "OPENAI_API_KEY").as_deref(), Some("sk-proj-storedagain0123456789ab"));
+    db.finish_action(&u.id, &c, "kept").unwrap();
+
+    // Stopped the same way, nothing stored since: confirming again finishes the job.
+    let v = crate::actions::request(&ctx, &proj, "agent", &forget, None).unwrap();
+    let c = db.claim_action(&v.id).unwrap().unwrap();
+    assert!(crate::actions::forget(&ctx_stops, "OPENAI_API_KEY", "default", Some((&v.id, &c))).is_err());
+    db.release_action_claim(&v.id, &c).unwrap();
+    let c = db.claim_action(&v.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&v.id, &c))).unwrap(), Forgot::Deleted);
+    assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().is_none());
+    // ...and a confirm after one that finished deleting, nothing stored since, deletes nothing.
+    age_claim(&db, &v.id);
+    let c = db.claim_action(&v.id).unwrap().unwrap();
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&v.id, &c))).unwrap(), Forgot::Gone { kept: false });
+    assert!(db.finish_action(&v.id, &c, "done").unwrap());
+    // A confirm that lost its claim records nothing and deletes nothing.
+    store_default(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-proj-lastone0123456789abcdef");
+    let w = crate::actions::request(&ctx, &proj, "agent", &forget, None).unwrap();
+    assert!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", Some((&w.id, "confirming since 2026-01-01T00:00:00Z 0123456789abcdef"))).is_err());
+    assert!(stashed(stash.as_ref(), "OPENAI_API_KEY").is_some());
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
+/// The file stash, with a hook that runs inside `delete`, after the value is removed.
+struct DeleteHookStash<F> {
+    inner: Box<dyn Stash>,
+    hook: F,
+}
+
+impl<F: Fn()> Stash for DeleteHookStash<F> {
+    fn backend(&self) -> &'static str { "delete-hook" }
+    fn get(&self, key: &str) -> anyhow::Result<Option<SecretString>> { self.inner.get(key) }
+    fn set(&self, key: &str, value: &SecretString) -> anyhow::Result<()> { self.inner.set(key, value) }
+    fn delete(&self, key: &str) -> anyhow::Result<bool> {
+        let had = self.inner.delete(key)?;
+        (self.hook)();
+        Ok(had)
+    }
+}
+
+/// Greptile on #65: forget holds the index write lock across both deletions. A store that
+/// starts between the stash deletion and the index deletion waits for forget to finish, so
+/// it never loses its index row to forget and leaves a stored value with no record.
+#[test]
+fn forget_and_a_concurrent_store_do_not_interleave() {
+    use std::time::Duration;
+    let _env = env_lock();
+    let home = tmp("forget-lock-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let cfg = Config::default();
+    let db_path = home.join("t.db");
+    let db = Db::open(&db_path).unwrap();
+    let plain = stash::open(&cfg).unwrap();
+    store_default(&db, plain.as_ref(), "OPENAI_API_KEY", "sk-proj-old0123456789abcdefgh");
+    let store = std::cell::RefCell::new(None);
+    let hooked = DeleteHookStash {
+        inner: stash::open(&cfg).unwrap(),
+        hook: || {
+            // Another process stores a new value while forget is between its two deletions,
+            // under the index write lock, as a store does.
+            let db_path = db_path.clone();
+            *store.borrow_mut() = Some(std::thread::spawn(move || {
+                let other = Db::open(&db_path).unwrap();
+                let stash = stash::open(&Config::default()).unwrap();
+                other.locked(|| {
+                    store_default(&other, stash.as_ref(), "OPENAI_API_KEY", "sk-proj-new0123456789abcdefgh");
+                    Ok(())
+                }).unwrap();
+            }));
+            // Without the lock the store commits in this time, and forget then deletes its row.
+            std::thread::sleep(Duration::from_millis(300));
+        },
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &hooked, probe: tasks::Probe::Off };
+    assert_eq!(crate::actions::forget(&ctx, "OPENAI_API_KEY", "default", None).unwrap(), crate::actions::Forgot::Deleted);
+    store.borrow_mut().take().unwrap().join().unwrap();
+    assert_eq!(stashed(plain.as_ref(), "OPENAI_API_KEY").as_deref(), Some("sk-proj-new0123456789abcdefgh"));
+    assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().is_some(), "the value stored meanwhile keeps its index row");
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
 /// Greptile on #68: an exact grant from before a no does not deliver the key to an agent that
 /// asks again; the person gets a card.
 #[test]
