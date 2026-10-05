@@ -545,7 +545,8 @@ pub fn store_and_inject(
 /// already answered and the value already stored, so a re-run of `need` hits and injects
 /// rather than asking the human again. It writes what the stash holds when the env file's
 /// lock is taken, which is a newer store's value if one committed in the meantime. If the
-/// key was removed by then, it writes nothing and returns an error saying so.
+/// key was removed by then, or replaced by a value now marked stale, it writes nothing and
+/// returns an error saying so.
 #[allow(clippy::too_many_arguments)]
 fn store_and_inject_gated(
     ctx: &Ctx,
@@ -600,11 +601,25 @@ fn store_and_inject_gated(
     // here already. Reading the stash under the env file's lock, as `need::deliver` does,
     // keeps this write from putting the older value back.
     let injected_to = if project.is_dir() {
-        let written = crate::envfile::write_with(project, &ctx.cfg.env_file, name, || ctx.stash.get(&stash_key(name, identity)))?;
-        // An empty stash here means the key was forgotten since the COMMIT. The caller
-        // must not report a delivery that did not happen.
+        let mut stale_replacement = false;
+        let written = crate::envfile::write_with(project, &ctx.cfg.env_file, name, || {
+            let Some(now) = ctx.stash.get(&stash_key(name, identity))? else { return Ok(None) };
+            // A newer store's value may have been marked stale since. `need::deliver`
+            // refuses a changed value that is stale, and so does this write.
+            if now.expose_secret() != value.expose_secret() && ctx.db.get_secret(name, identity)?.is_some_and(|m| m.stale) {
+                stale_replacement = true;
+                return Ok(None);
+            }
+            Ok(Some(now))
+        })?;
+        // Nothing written: the key was forgotten since the COMMIT, or replaced by a value
+        // now marked stale. The caller must not report a delivery that did not happen.
         let Some(p) = written else {
-            bail!("{name}@{identity} was stored, then removed from the stash before it was written to {}; nothing was written there", project.join(&ctx.cfg.env_file).display());
+            let env = project.join(&ctx.cfg.env_file);
+            if stale_replacement {
+                bail!("{name}@{identity} was replaced in the stash before it was written to {}, and the replacement is marked stale; nothing was written there", env.display());
+            }
+            bail!("{name}@{identity} was stored, then removed from the stash before it was written to {}; nothing was written there", env.display());
         };
         ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
         Some(p)

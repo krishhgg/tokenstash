@@ -1703,6 +1703,33 @@ fn a_store_paused_after_its_commit_does_not_write_over_a_newer_store() {
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
+/// After this store commits A, another store puts B in the stash, and B is marked stale.
+/// This store's env file write re-reads the stash, finds B, and refuses it the way
+/// `need::deliver` refuses a changed value that is stale. It says nothing was written.
+#[test]
+fn a_store_does_not_write_a_stale_replacement_it_finds_in_the_stash() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("store-stale-replacement");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let (db_path, other_dir) = (home.join("t.db"), tmp("verify-store-stale-replacement-other").canonicalize().unwrap());
+    tasks::AFTER_STORE_COMMIT.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+        let cfg = Config::default();
+        let db = Db::open(&db_path).unwrap();
+        let stash = stash::open(&cfg).unwrap();
+        let other = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+        tasks::store_and_inject(&other, "OPENAI_API_KEY", "default", &SecretString::from("sk-second-bbbbbbbbbbbbbbbbbbbb".to_string()), None, None, false, &other_dir, "human", None, tasks::Verified::Unknown, db::GRANT_PASTE).unwrap();
+        db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected by OpenAI (HTTP 401)"), Some(db::STALE_PROBE)).unwrap();
+    })));
+    let err = tasks::store_and_inject(&ctx, "OPENAI_API_KEY", "default", &SecretString::from("sk-first-aaaaaaaaaaaaaaaaaaaaa".to_string()), None, None, false, &proj, "human", None, tasks::Verified::Unknown, db::GRANT_PASTE)
+        .expect_err("a stale value is not written");
+    assert!(format!("{err:#}").contains("marked stale"), "{err:#}");
+    assert!(!proj.join(".env.local").exists(), "nothing written here");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
 /// `forget` removes the key after the answer's store commits and before its env file write.
 /// The answer reports that nothing was written instead of reporting a delivery.
 #[test]
