@@ -1060,6 +1060,24 @@ fn a_gitignore_as_env_file_is_refused() {
     assert!(!dir.join("config").exists());
 }
 
+/// On a case-insensitive filesystem (the macOS default) `.GITIGNORE` opens `.gitignore`, so
+/// an exact-case check let the secret replace the ignore file. Refused on every platform.
+#[test]
+fn a_gitignore_in_any_case_is_refused_as_env_file() {
+    let dir = tmp("envfile-gitignore-case");
+    init_git(&dir);
+    for env_file in [".GITIGNORE", ".GitIgnore", "./.gitIGNORE", "sub/.GITIGNORE"] {
+        let err = envfile::normalize(env_file).unwrap_err().to_string();
+        assert!(err.contains("must not be a .gitignore"), "{env_file} must be refused: {err}");
+        let err = envfile::write(&dir, env_file, "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err().to_string();
+        assert!(err.contains("must not be a .gitignore"), "{env_file} must be refused: {err}");
+    }
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n != ".git").collect();
+    assert!(left.is_empty(), "nothing may be written: {left:?}");
+    // only the whole name counts
+    assert_eq!(envfile::normalize(".gitignore.env").unwrap(), ".gitignore.env");
+}
+
 #[test]
 fn env_file_with_leading_dot_slash_is_accepted() {
     let dir = tmp("envfile-curdir");

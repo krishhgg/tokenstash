@@ -35,8 +35,10 @@ pub fn normalize(env_file: &str) -> Result<String> {
     // A .gitignore holds git's ignore rules, never secrets. At the project root the rule
     // that ignores the env file would go into the env file itself, and the secret write
     // would then replace that rule. The lock `ensure_gitignore` takes on a .gitignore would
-    // also be the env file's own lock, taken a second time, which waits forever.
-    if parts.last().is_some_and(|p| p == ".gitignore") {
+    // also be the env file's own lock, taken a second time, which waits forever. The match
+    // ignores case on every platform: on a case-insensitive filesystem (the macOS default)
+    // `.GITIGNORE` opens the same file.
+    if parts.last().is_some_and(|p| p.eq_ignore_ascii_case(".gitignore")) {
         anyhow::bail!("env_file must not be a .gitignore, but is '{env_file}'");
     }
     Ok(parts.join("/"))
