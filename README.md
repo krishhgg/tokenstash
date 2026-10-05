@@ -9,13 +9,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/kgarg2468/tokenstash/releases/latest"><strong>Download</strong></a> ·
+  <a href="https://github.com/krishhgg/tokenstash/releases/latest"><strong>Download</strong></a> ·
   <a href="SECURITY.md"><strong>Security</strong></a> ·
   <a href="CHANGELOG.md"><strong>Changelog</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/kgarg2468/tokenstash/actions/workflows/ci.yml"><img alt="Tests" src="https://github.com/kgarg2468/tokenstash/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/krishhgg/tokenstash/actions/workflows/ci.yml"><img alt="Tests" src="https://github.com/krishhgg/tokenstash/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="MIT" src="https://img.shields.io/badge/License-MIT-BF6A2B?style=flat-square">
   <img alt="macOS and Linux" src="https://img.shields.io/badge/macOS_·_Linux-2D2A26?style=flat-square">
   <img alt="CLI and agent skill" src="https://img.shields.io/badge/CLI-agent_skill-2D2A26?style=flat-square">
@@ -29,7 +29,7 @@
 ## Install
 
 ```bash
-brew install kgarg2468/tokenstash/tokenstash
+brew install krishhgg/tokenstash/tokenstash
 # or
 npm install -g tokenstash
 # or
@@ -51,10 +51,10 @@ tokenstash init
 bun add -g tokenstash
 pnpm add -g tokenstash
 pipx install tokenstash
-cargo install --locked --git https://github.com/kgarg2468/tokenstash tokenstash
+cargo install --locked --git https://github.com/krishhgg/tokenstash tokenstash
 ```
 
-Prebuilt binaries for macOS (Apple Silicon, Intel) and Linux (x64, arm64; static, any distribution) are on the [latest release](https://github.com/kgarg2468/tokenstash/releases/latest), with sha256 files and a build attestation you can check with `gh attestation verify tokenstash-<platform>.tar.gz --repo kgarg2468/tokenstash`. The npm and PyPI packages carry the same binary and run no install scripts.
+Prebuilt binaries for macOS (Apple Silicon, Intel) and Linux (x64, arm64; static, any distribution) are on the [latest release](https://github.com/krishhgg/tokenstash/releases/latest), with sha256 files and a build attestation you can check with `gh attestation verify tokenstash-<platform>.tar.gz --repo krishhgg/tokenstash`. The npm and PyPI packages carry the same binary and run no install scripts.
 
 </details>
 

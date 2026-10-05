@@ -6,7 +6,7 @@ members = ["crates/core", "crates/cli"]
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/kgarg2468/tokenstash"
+repository = "https://github.com/krishhgg/tokenstash"
 
 [workspace.dependencies]
 anyhow = "1"

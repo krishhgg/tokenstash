@@ -92,7 +92,7 @@ jobs:
           tar -C dist -czf tokenstash-${{ matrix.name }}.tar.gz tokenstash
           shasum -a 256 tokenstash-${{ matrix.name }}.tar.gz > tokenstash-${{ matrix.name }}.tar.gz.sha256
       # Signed provenance for the tarball itself: `gh attestation verify tokenstash-*.tar.gz
-      # --repo kgarg2468/tokenstash` proves it was built by this workflow from this commit.
+      # --repo krishhgg/tokenstash` proves it was built by this workflow from this commit.
       # npm and PyPI carry their own; the direct-download and brew paths had nothing.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with: { subject-path: "tokenstash-${{ matrix.name }}.tar.gz" }
@@ -171,7 +171,7 @@ jobs:
           # 200 = already there, 404 = not yet; anything else is crates.io or the network,
           # which must not be mistaken for "not published" and turned into a failing publish.
           published() {
-            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tokenstash-release (github.com/kgarg2468/tokenstash)' "https://crates.io/api/v1/crates/$1/$2")
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tokenstash-release (github.com/krishhgg/tokenstash)' "https://crates.io/api/v1/crates/$1/$2")
             case "$code" in 200) return 0 ;; 404) return 1 ;; *) echo "crates.io answered $code for $1 $2"; exit 1 ;; esac
           }
           published tokenstash-core "$v" || cargo publish -p tokenstash-core --locked
@@ -180,7 +180,7 @@ jobs:
   pypi:
     # Wheels are the release tarballs repacked (binary under .data/scripts, no Python code):
     # `pipx install tokenstash` / `uv tool install tokenstash`. Published with PyPI trusted
-    # publishing: a pending publisher for kgarg2468/tokenstash, workflow release.yml,
+    # publishing: a pending publisher for krishhgg/tokenstash, workflow release.yml,
     # environment `pypi`, creates the project on first use; no token. Gated on the repo
     # variable PYPI_TRUSTED_PUBLISHING=true so the run stays green until that is configured
     # (GitHub creates the environment on first reference, so the environment is no gate).
@@ -201,7 +201,7 @@ jobs:
         with: { packages-dir: dist, verbose: true, skip-existing: true }
   brew:
     # Formula from the release digests, attached to the release and handed to `publish`, which
-    # pushes it to the tap (kgarg2468/homebrew-tokenstash — must be public) only once the
+    # pushes it to the tap (krishhgg/homebrew-tokenstash — must be public) only once the
     # release is live. Draft assets 404 for everyone but us, so a formula pushed from here would
     # point `brew install` at files nobody can download whenever a later job failed. Never for
     # a pre-release tag.
@@ -264,7 +264,7 @@ jobs:
           b64=$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 -w0)
           echo "::add-mask::$b64"
           auth="AUTHORIZATION: basic $b64"
-          git -c http.extraheader="$auth" clone -q --depth 1 https://github.com/kgarg2468/homebrew-tokenstash.git /tmp/tap
+          git -c http.extraheader="$auth" clone -q --depth 1 https://github.com/krishhgg/homebrew-tokenstash.git /tmp/tap
           mkdir -p /tmp/tap/Formula && cp /tmp/formula/tokenstash.rb /tmp/tap/Formula/tokenstash.rb
           cd /tmp/tap && git add Formula/tokenstash.rb
           if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi

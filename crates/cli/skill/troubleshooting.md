@@ -4,7 +4,7 @@ Start with `tokenstash doctor`. Each section below starts from what you see. Wha
 
 ## `tokenstash: command not found`
 
-tokenstash is not installed, or not on this shell's `PATH`. The user installs it once with one of `brew install kgarg2468/tokenstash/tokenstash`, `npm install -g tokenstash` or `uv tool install tokenstash`, then `tokenstash init`. If they ask you to install it, you may run those commands. Until it is installed, name the variable the code needs, say what it is for, and continue with what does not need it.
+tokenstash is not installed, or not on this shell's `PATH`. The user installs it once with one of `brew install krishhgg/tokenstash/tokenstash`, `npm install -g tokenstash` or `uv tool install tokenstash`, then `tokenstash init`. If they ask you to install it, you may run those commands. Until it is installed, name the variable the code needs, say what it is for, and continue with what does not need it.
 
 ## `... is for a person at a terminal, not an agent`
 

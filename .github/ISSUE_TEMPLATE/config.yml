@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security report
-    url: https://github.com/kgarg2468/tokenstash/security/advisories/new
+    url: https://github.com/krishhgg/tokenstash/security/advisories/new
     about: A value reaching an agent, an approval that should not have happened, anything from SECURITY.md — privately, please.

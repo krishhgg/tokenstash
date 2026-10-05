@@ -6,7 +6,7 @@
 # downloaded. Usage: scripts/brew-formula.sh v0.1.0
 set -euo pipefail
 tag="${1:?usage: brew-formula.sh vX.Y.Z}"
-repo="${REPO:-${GITHUB_REPOSITORY:-kgarg2468/tokenstash}}"
+repo="${REPO:-${GITHUB_REPOSITORY:-krishhgg/tokenstash}}"
 version="${tag#v}"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 if [ -n "${SUMS_DIR:-}" ]; then

@@ -5,7 +5,7 @@ about: Something tokenstash did that it should not have, or did not do that it s
 
 **Never paste a key value here** — not even a "test" one, not even partially. If the bug is that
 a value showed up somewhere it should not have, that is a security report: use
-https://github.com/kgarg2468/tokenstash/security/advisories/new instead of an issue.
+https://github.com/krishhgg/tokenstash/security/advisories/new instead of an issue.
 
 - `tokenstash --version`:
 - OS and how you installed it (npm / brew / pipx / cargo / release tarball):

@@ -4,7 +4,7 @@ tokenstash holds API keys on your machine, so a defect here has real consequence
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting: **[Report a vulnerability](https://github.com/kgarg2468/tokenstash/security/advisories/new)** (Security → Advisories on the repository). That channel is private until a fix ships.
+Use GitHub's private vulnerability reporting: **[Report a vulnerability](https://github.com/krishhgg/tokenstash/security/advisories/new)** (Security → Advisories on the repository). That channel is private until a fix ships.
 
 Please don't open a public issue for anything that would let one of the guarantees below be broken.
 

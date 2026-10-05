@@ -9,7 +9,7 @@ render as 404s on the package page. Markdown links and HTML href/src both.
 import re
 import sys
 
-REPO = "https://github.com/kgarg2468/tokenstash"
+REPO = "https://github.com/krishhgg/tokenstash"
 
 
 def absolute_links(readme, repo=REPO):

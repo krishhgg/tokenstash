@@ -9,14 +9,14 @@ const arch = { x64: "x64", arm64: "arm64" }[process.arch];
 let bin = process.env.TOKENSTASH_BINARY;
 if (!bin) {
   if (!platform || !arch) {
-    console.error(`tokenstash: no prebuilt binary for ${process.platform}/${process.arch} (Windows is not supported). From source: cargo install --git https://github.com/kgarg2468/tokenstash tokenstash`);
+    console.error(`tokenstash: no prebuilt binary for ${process.platform}/${process.arch} (Windows is not supported). From source: cargo install --git https://github.com/krishhgg/tokenstash tokenstash`);
     process.exit(1);
   }
   const pkg = `tokenstash-${platform}-${arch}`;
   try {
     bin = require.resolve(`${pkg}/bin/tokenstash`);
   } catch {
-    console.error(`tokenstash: the platform package ${pkg} is not installed.\n  Optional dependencies were skipped (\`--no-optional\`, \`omit=optional\`, or an unsupported platform).\n  Reinstall with optional dependencies enabled, or from source: cargo install --git https://github.com/kgarg2468/tokenstash tokenstash`);
+    console.error(`tokenstash: the platform package ${pkg} is not installed.\n  Optional dependencies were skipped (\`--no-optional\`, \`omit=optional\`, or an unsupported platform).\n  Reinstall with optional dependencies enabled, or from source: cargo install --git https://github.com/krishhgg/tokenstash tokenstash`);
     process.exit(1);
   }
 }

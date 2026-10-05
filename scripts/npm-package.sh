@@ -96,7 +96,7 @@ for name in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
   "version": "$version",
   "description": "tokenstash binary for $os/$cpu. Install \`tokenstash\` instead.",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/kgarg2468/tokenstash.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/krishhgg/tokenstash.git" },
   "os": ["$os"],
   "cpu": ["$cpu"],
   "files": ["bin", "LICENSE"],
