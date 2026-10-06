@@ -15,23 +15,23 @@
 }
 ```
 
-- `name` — the exact env var developers use.
-- `url` — where a new user creates the key, as deep a link as possible.
-- `steps` — what to click, in order. Write them as if for someone who has never used the product.
-- `pattern` — regex for the key format, so a bad paste fails immediately. Optional but valuable.
-- `check` — one cheap authenticated request that returns 200 with a valid key and 401 without. Optional.
+- `name`: the exact env var developers use.
+- `url`: where a new user creates the key, as deep a link as possible.
+- `steps`: what to click, in order. Write them as if for someone who has never used the product.
+- `pattern`: regex for the key format, so a bad paste fails immediately. Optional but valuable.
+- `check`: one cheap authenticated request that returns 200 with a valid key and 401 without. Optional.
   `auth` is `bearer` | `header:<Name>` | `prefix:<Scheme>` | `basic-user` | `query:<param>`; `method` defaults to GET.
   403 is read as "live, lacks permission", never as a dead key; if the provider answers something
   other than 401 to a bad key (Google: 400), list it in `reject_status`. Set `at_use: true` only if
-  the request is free and read-only enough to run before every delivery — without it the check
+  the request is free and read-only enough to run before every delivery. Without it, the check
   runs at paste time only.
-- `sensitive: true` — live payment keys, cloud credentials, anything with unbounded spend. These,
+- `sensitive: true`: live payment keys, cloud credentials, anything with unbounded spend. These,
   and any name the registry does not know, get their own card per directory; the broad pairing
   button never covers them. Use `sensitive_pattern` when only some values are dangerous (e.g.
   Stripe live vs test).
-- `generate: "base64:32"` — for local secrets with no vendor (`AUTH_SECRET`), so no human is involved.
+- `generate: "base64:32"`: for local secrets with no vendor (`AUTH_SECRET`), so no human is involved.
 
-Run `cargo test` — `registry_is_sane` validates every entry.
+Run `cargo test`. `registry_is_sane` validates every entry.
 
 ## Code
 

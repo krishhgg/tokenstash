@@ -41,7 +41,7 @@
   <text class="m" x="472" y="120"><tspan class="ok">✓</tspan> OPENAI_API_KEY injected → .env.local</text>
   <text class="m" x="472" y="142"><tspan class="ok">✓</tspan> RESEND_API_KEY injected → .env.local</text>
   <g transform="translate(476.5,159.5)"><circle r="5.2" fill="none" stroke="#D29922" stroke-width="1.6"/><path d="M0,-2.8 V0 L2.2,1.4" fill="none" stroke="#D29922" stroke-width="1.4" stroke-linecap="round"/></g>
-  <text class="m" x="472" y="164"><tspan dx="0" fill-opacity="0">✓</tspan> <tspan class="wt">TAVUS_API_KEY pending</tspan> — task t_7fa2</text>
+  <text class="m" x="472" y="164"><tspan dx="0" fill-opacity="0">✓</tspan> <tspan class="wt">TAVUS_API_KEY pending</tspan>, card t_7fa2</text>
   <text class="m dim" x="488" y="186">→ http://127.0.0.1:7433/…</text>
   <text class="cap" x="472" y="242">Keys land in .env.local. The output never holds a key.</text>
 </svg>
