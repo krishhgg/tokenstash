@@ -7,7 +7,7 @@
 //! one key. Nothing is inferred from folders, remotes or repo names.
 //!
 //! A stash miss is self-gating (a human is asked). A stash hit is delivered when the
-//! workspace holds a grant for it — or when the workspace's env file already carries the
+//! workspace holds a grant for it, or when the workspace's env file already carries the
 //! same value (a copy that brought its `.env.local` along), which is a delivery check, not
 //! a grant: it opens this delivery of this key and nothing else.
 
@@ -62,7 +62,7 @@ pub fn broad_applies(sensitive: bool, registered: bool) -> bool {
 /// again is not a new decision. It is checked, never stored: it does not authorise future
 /// values (rotation follows grants only) and never applies to sensitive/unregistered keys.
 ///
-/// The file must be a regular file (no symlink — a hostile repo can commit
+/// The file must be a regular file (no symlink, because a hostile repo can commit
 /// `.env.local -> ../other/.env.local`), owned by this user, and not tracked by git.
 pub fn on_disk_equivalent(project: &Path, env_file: &str, name: &str, value: &SecretString) -> bool {
     let Ok(path) = crate::envfile::resolve(project, env_file) else { return false };

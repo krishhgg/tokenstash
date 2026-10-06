@@ -1,7 +1,7 @@
 //! The inbox handles one request at a time, so a client that never finishes sending its
 //! request must not be able to hold the line. Documented bound (see `cmd/inbox.rs`): a request
 //! has to arrive in full within 10 seconds and no single wait for bytes lasts longer than 5,
-//! so a dangling or trickling connection is cut off within 15 seconds — and while it dangles,
+//! so a dangling or trickling connection is cut off within 15 seconds, and while it dangles,
 //! the CLI's `/verify` probe and a human's paste still go through.
 //!
 //! Every test here runs a real `tokenstash inbox` on a free loopback port under a scratch
@@ -181,7 +181,7 @@ fn wait_closed(s: &mut TcpStream, within: Duration) -> bool {
 }
 
 /// The original bug: a POST whose body never arrives parked the single-threaded handler in
-/// `read_to_end`, and every later request — including the CLI's `/verify` probe — waited
+/// `read_to_end`, and every later request, including the CLI's `/verify` probe, waited
 /// behind it forever. Three danglers at once (one silent, one mid-headers, one mid-body) must
 /// leave the probe and a real paste unaffected, and each must be cut off within the bound.
 #[test]
@@ -258,8 +258,8 @@ fn a_trickled_body_is_cut_off_by_the_whole_request_deadline() {
     assert!(!proj.join(".env.local").exists(), "nothing was written");
 }
 
-/// A declared body over the cap is refused before a byte of it is read — so it can neither
-/// stall the reader nor be stored in part — with a 413 for a session holder and the usual
+/// A declared body over the cap is refused before a byte of it is read, so it can neither
+/// stall the reader nor be stored in part, with a 413 for a session holder and the usual
 /// bare 404 for anyone else.
 #[test]
 fn an_oversized_declared_body_is_refused_unread_and_stores_nothing() {

@@ -24,7 +24,7 @@ pub struct NeedOpts {
     pub force: bool,
     /// Never inject silently: route every hit through a fresh approval task, even if this
     /// project was approved before. Used when the request was derived from untrusted input
-    /// (a program's output in `run`) — each invocation needs its own human yes.
+    /// (a program's output in `run`), so each invocation needs its own human yes.
     pub require_approval: bool,
     /// Keys an agent asks for again after the person said no (`need --force` from an agent),
     /// as `NAME@identity`, each holding the one extra ask reserved for it. Only the "no" to a
@@ -87,7 +87,7 @@ pub(crate) fn generate(spec: &str) -> Option<SecretString> {
 
 /// The identity a generated secret is stored under: one per project directory.
 ///
-/// A generated value has no provider account behind it — it is this application's signing
+/// A generated value has no provider account behind it. It is this application's signing
 /// key. Stored under the plain `default` identity it would be one value shared by every
 /// project that asks, so a directory holding a broad grant would silently receive another
 /// application's `JWT_SECRET` and could mint sessions for it. The label is the directory
@@ -151,7 +151,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
             let mut meta = ctx.db.get_secret(name, &identity)?;
             if meta.is_none() {
                 // The stash is per-user; this index is per-TOKENSTASH_HOME. A key stored under
-                // another home is real and usable, but `list` here would deny it exists —
+                // another home is real and usable, but `list` here would deny it exists, and
                 // a stash that says "empty" and then injects is the worst kind of surprise.
                 // Adopt it into this index, visibly, before anything else happens.
                 // Sensitivity as a paste derives it: the registry tag, or the value
@@ -281,7 +281,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 continue;
             }
             // Adopt before generating. This project's env file may already hold a value
-            // under this name — one an earlier tokenstash generated under the old shared
+            // under this name, either one an earlier tokenstash generated under the old shared
             // identity, or one the human wrote by hand. Minting a new one would overwrite
             // it: every session signed with the old JWT_SECRET becomes invalid, and
             // anything encrypted with the old ENCRYPTION_KEY becomes unreadable.
@@ -298,7 +298,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
             }
         }
 
-        // Honor a recent refusal: "denied — do not ask again" must actually mean that.
+        // Honor a recent refusal: "denied; do not ask again" must actually mean that.
         if !force {
             let since = ctx.cfg.ttl_since();
             if let Some(d) = ctx.db.recent_denial(&pid, name, &identity, &since)? {
@@ -601,8 +601,8 @@ enum AtUse {
 }
 
 /// Hand a stash value to a project. Every path that writes a stored key into an env file
-/// after authorization goes through here — the plain hit, the after-approval inject, the
-/// after-answer inject — so neither verify-on-use nor the stale flag can be bypassed by
+/// after authorization goes through here, whether the plain hit, the after-approval inject or the
+/// after-answer inject, so neither verify-on-use nor the stale flag can be bypassed by
 /// taking a different door.
 #[allow(clippy::too_many_arguments)]
 pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, value: &SecretString, note: Option<&str>, grant: &str, budget: &mut ProbeBudget) -> Result<Delivery> {

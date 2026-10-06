@@ -13,8 +13,8 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// A home for every test, set once per process. Without it a test that never takes
-/// `env_lock` — `envfile::write` keeps its lock under `config_dir()/locks`, `FileStash::new`
-/// creates the config dir — writes into the developer's real `~/.config/tokenstash`. Locked
+/// `env_lock` writes into the developer's real `~/.config/tokenstash`, because `envfile::write`
+/// keeps its lock under `config_dir()/locks` and `FileStash::new` creates the config dir. Locked
 /// tests set their own home and restore this one instead of unsetting the variable, so an
 /// unlocked test running beside them never falls back to the real home either.
 fn base_home() -> PathBuf {
@@ -399,7 +399,7 @@ fn envfile_round_trips_adversarial_values() {
     }
     assert!(!s.contains("export "), "we never emit export");
     // One key per line, always: a value with a newline in it is escaped, not emitted raw.
-    // A raw newline would end the line for every one-line reader — including parse_line,
+    // A raw newline would end the line for every one-line reader, including parse_line,
     // which is what rotation uses to decide a project still holds the old value.
     assert_eq!(s.lines().count(), cases.len(), "one line per key\n{s}");
     for line in s.lines() {
@@ -490,7 +490,7 @@ fn require_approval_gates_even_hits() {
     let out = need::need(&ctx, &proj, "run", &["GROQ_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), other => panic!("expected approval, got {other:?}") };
     assert!(tid.starts_with("a_"));
-    // approval injects; but a later program-derived request must ask again — persisted
+    // approval injects; but a later program-derived request must ask again, because a persisted
     // approval never authorizes a fresh untrusted request
     tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
     assert!(envfile::has(&proj, ".env.local", "GROQ_API_KEY"));
@@ -1717,7 +1717,7 @@ fn approval_delivery_is_verified_too() {
     let pid = proj.to_string_lossy().to_string();
     let rt = db.open_secret_task(&pid, "OPENAI_API_KEY", "default").unwrap().expect("replacement card filed for this project");
     assert_eq!(rt.expects, tasks::EXPECTS_REPLACE);
-    // the agent's `wait` now sees the approval Answered — and must not inject the dead key
+    // the agent's `wait` now sees the approval Answered, and must not inject the dead key
     let mut outcomes = vec![need::Outcome::Pending { name: "OPENAI_API_KEY".into(), identity: "default".into(), task_id: tid.clone(), title: String::new(), url: None }];
     need::wait(&ctx, &proj, &mut outcomes, std::time::Duration::from_millis(10)).unwrap();
     match &outcomes[0] {
@@ -2266,7 +2266,7 @@ fn on_disk_equivalence_opens_one_delivery_and_is_not_a_grant() {
     // a copy that brought its .env.local along
     std::fs::write(proj.join(".env.local"), format!("OPENAI_API_KEY={v}\nSTRIPE_SECRET_KEY=sk_live_cccccccccccc\n")).unwrap();
     let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string(), "STRIPE_SECRET_KEY".to_string()], &need::NeedOpts::default()).unwrap();
-    assert!(matches!(out[0], need::Outcome::Injected { .. }), "same value on disk: no card — {out:?}");
+    assert!(matches!(out[0], need::Outcome::Injected { .. }), "same value on disk: no card, {out:?}");
     assert!(matches!(out[1], need::Outcome::Pending { .. }), "sensitive keys never use the on-disk check");
     let ws = db.find_workspace(&proj).unwrap().unwrap();
     assert!(db.grants_for(&ws.id).unwrap().is_empty(), "not a grant");
@@ -2651,7 +2651,7 @@ fn a_generated_secret_is_per_project() {
     let out = need::need(&ctx, &a, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
     assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
 
-    // B is paired and allowed broadly — the widest standing consent there is.
+    // B is paired and allowed broadly, the widest standing consent there is.
     let ws = db.workspace_for(&b).unwrap();
     for identity in ["default", &need::project_identity(&b)] {
         db.grant(&ws.id, "*", identity, db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
@@ -2716,7 +2716,7 @@ fn generating_a_secret_still_needs_the_run_approval() {
     assert!(!proj.join(".env.local").exists(), "nothing generated before the human said yes");
 
     // ...and saying yes completes it. The card gated a value that did not exist yet, so
-    // approving has to generate it — otherwise the card is answered and nothing arrives.
+    // approving has to generate it. Otherwise the card is answered and nothing arrives.
     let card = db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().into_iter().next().unwrap();
     tasks::answer_approval(&ctx, &card, tasks::Decision::Allow, Some(&card.names)).unwrap();
     let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
@@ -2935,7 +2935,7 @@ fn a_card_never_carries_agent_chosen_markup_or_links() {
     let req = tasks::SecretRequest { url: Some("https://openai-support.example/verify".to_string()), ..Default::default() };
     let t = tasks::create_secret_task(&ctx, &proj, "agent", "OPENAI_API_KEY", "default", &req).unwrap();
     assert_eq!(t.url.as_deref(), registry::lookup("OPENAI_API_KEY").map(|p| p.url.as_str()));
-    // An unregistered name keeps the agent's link — it is the only one there is — but only
+    // An unregistered name keeps the agent's link, since it is the only one there is, but only
     // if it is http(s).
     let req = tasks::SecretRequest { url: Some("https://internal.example/keys".to_string()), ..Default::default() };
     let t = tasks::create_secret_task(&ctx, &proj, "agent", "ANOTHER_INTERNAL_KEY", "default", &req).unwrap();
@@ -3025,7 +3025,7 @@ fn an_unverifiable_ignore_rule_refuses_the_write() {
     assert_eq!(std::fs::read_to_string(root.join(".gitignore")).unwrap(), "*.local\n", "the conclusive-looking local rule is not treated as git's verdict");
 }
 
-/// A card is closed once. Two answers racing must not let the loser overwrite the winner —
+/// A card is closed once. Two answers racing must not let the loser overwrite the winner,
 /// that is how a committed denial becomes an approval.
 #[test]
 fn a_card_that_is_already_answered_cannot_be_answered_again() {
@@ -3194,7 +3194,7 @@ fn every_auth_style_is_sent_the_way_the_registry_says() {
 
 /// The birth-time half of the directory fingerprint. Every existing test runs on a
 /// filesystem that hands out a fresh inode after a delete, so an implementation comparing
-/// only the inode passed all of them — and inode reuse is exactly what the birth time is
+/// only the inode passed all of them, and inode reuse is exactly what the birth time is
 /// there to catch.
 #[test]
 fn a_workspace_fingerprint_compares_more_than_the_inode() {
@@ -3260,7 +3260,7 @@ fn an_export_line_is_upserted_not_duplicated() {
 }
 
 /// A one-time approval records no grant, so the card is the only trace of the human's yes.
-/// If the delivery it authorised fails outright, the card has to come back — otherwise the
+/// If the delivery it authorised fails outright, the card has to come back. Otherwise the
 /// human said yes, received nothing, and must say yes again to a brand new card.
 #[test]
 fn a_one_time_approval_that_delivers_nothing_reopens_its_card() {
@@ -3364,7 +3364,7 @@ fn approving_a_once_card_keeps_the_env_files_value() {
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
-/// "No" to a pairing card for a key is a no for that key here — a broad grant given later
+/// "No" to a pairing card for a key is a no for that key here. A broad grant given later
 /// (allow-broad on some other card) must not turn into a silent delivery of it.
 #[test]
 fn a_denied_pairing_card_blocks_a_later_broad_delivery_of_that_key() {
@@ -3422,8 +3422,8 @@ fn an_approval_card_title_is_cleaned_of_the_directory_names_control_characters()
     std::env::set_var("TOKENSTASH_HOME", base_home());
 }
 
-/// A paste that other directories will receive — a Replace card, or a key they hold a grant
-/// for — is a decision about them; the agent's own link must not make it.
+/// A paste that other directories will receive, on a Replace card or for a key they hold a grant
+/// for, is a decision about them; the agent's own link must not make it.
 #[test]
 fn fans_out_when_another_directory_holds_a_grant_or_the_card_is_a_replacement() {
     let _g = env_lock();
@@ -3469,7 +3469,7 @@ fn fans_out_through_a_broad_grant_elsewhere_and_after_forget() {
     let sensitive = tasks::create_secret_task(&ctx, &proj_b, "agent", "TWILIO_AUTH_TOKEN", "default", &req).unwrap();
     assert!(!tasks::fans_out(&ctx, &sensitive).unwrap(), "a broad grant never covers a name the registry tags sensitive");
     // Sensitive by value pattern only (Stripe live vs test): the value is not known when this
-    // is judged, so the name counts as one a broad grant could deliver — the strict side.
+    // is judged, so the name counts as one a broad grant could deliver, which is the strict side.
     let by_pattern = tasks::create_secret_task(&ctx, &proj_b, "agent", "STRIPE_SECRET_KEY", "default", &req).unwrap();
     assert!(tasks::fans_out(&ctx, &by_pattern).unwrap(), "a pattern-sensitive name is judged before the value exists");
     let unregistered = tasks::create_secret_task(&ctx, &proj_b, "agent", "MY_INTERNAL_TOKEN", "default", &req).unwrap();
@@ -3584,7 +3584,7 @@ fn the_store_holds_one_writer_lock_through_stash_set_and_releases_it() {
         }
 
         // Both writes failed only because the first connection held its transaction. Once
-        // the operation returns — success or error — this connection can write immediately.
+        // the operation returns, with success or error, this connection can write immediately.
         other.grant(&recipient_ws.id, "LOCKED_STORE_KEY", "default", db::GRANT_KEY, db::GRANT_PAIRING).unwrap();
         assert!(other.close_task_if_open(&sibling.id, db::TaskStatus::Denied, None).unwrap());
     }
@@ -3665,7 +3665,7 @@ fn commit_failure_rolls_back_task_and_grant_and_restores_autocommit() {
 }
 
 /// The requester's paste is refused at the operation, with nothing stored, nothing written
-/// and the card still open — whichever surface forgot to hide the button. The refusal is
+/// and the card still open, whichever surface forgot to hide the button. The refusal is
 /// decided under the index write lock on the grants as they are then, so a grant given in
 /// another directory while the slow provider check ran is seen. A paste the shape or the
 /// provider refuses leaves the card and the stash as they were.
@@ -3755,7 +3755,7 @@ fn the_keyring_service_is_namespaced_by_a_non_default_home() {
     assert_eq!(s, again, "stable for the same home");
     std::env::set_var("TOKENSTASH_HOME", base_home());
     assert_ne!(stash::service(), s, "a different home is a different stash");
-    // The default home keeps the plain name — the half that protects every existing user's
+    // The default home keeps the plain name, the half that protects every existing user's
     // keys. `default_config_dir` is pure, so this is safe to assert without touching it.
     std::env::remove_var("TOKENSTASH_HOME");
     assert_eq!(stash::service(), "tokenstash");

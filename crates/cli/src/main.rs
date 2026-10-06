@@ -1,4 +1,4 @@
-//! tokenstash — Paste a key once. Approve each directory. Keep secrets out of status output.
+//! The tokenstash CLI. Paste a key once. Approve each directory. Keep secrets out of status output.
 
 mod cmd;
 mod guide;
@@ -105,12 +105,12 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Inbox(a) => cmd::inbox::serve(a),
         Cmd::Open => {
             // The URL below carries the full inbox session, which approves cards. Printed to
-            // a pipe it lands in an agent's context — the one place it must never be.
+            // a pipe it lands in an agent's context, the one place it must never be.
             util::require_human("open", "it prints the full inbox session, which can approve cards")?;
             let cfg = tokenstash_core::Config::load()?;
             let state = notify::ensure_inbox(&cfg);
             // `open` exists to put a person in front of the inbox, so it carries the session
-            // token — but only once ownership is proved. If something else holds the port we
+            // token, but only once ownership is proved. If something else holds the port we
             // launch no browser and print no URL: doing either would hand the squatter the
             // token (in the query string) and the human (into its paste form).
             if let Some(why) = util::inbox_unavailable(&cfg, state) {

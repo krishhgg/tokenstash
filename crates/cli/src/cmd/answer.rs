@@ -84,7 +84,7 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
                 AnswerResult::Stored { injected_to, sensitive, liveness, rotation } => {
                     if let Some(r) = &rotation {
                         for p in &r.rewritten { println!("  also updated → {}", tokenstash_core::project::short(std::path::Path::new(p))); }
-                        for (p, why) in &r.skipped { println!("  ! still holds the OLD value: {} — {why}", tokenstash_core::project::short(std::path::Path::new(p))); }
+                        for (p, why) in &r.skipped { println!("  ! still holds the OLD value: {}, {why}", tokenstash_core::project::short(std::path::Path::new(p))); }
                         if !r.skipped.is_empty() { println!("  fix those before revoking the old key"); }
                     }
                     println!("✓ {name} stored in the {} stash", app.stash.backend());
@@ -98,7 +98,7 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
         TaskKind::Approval => {
             // Approving is the human's decision and nothing else in the product. Without this
             // an agent with a shell reads the card id out of `tokenstash tasks --json` and
-            // runs `answer <id> --allow-broad` to grant itself the human's keys — the exact
+            // runs `answer <id> --allow-broad` to grant itself the human's keys, the exact
             // thing the inbox's paste-scope token exists to prevent. Denying stays open: it
             // can only close the agent's own request, never open one.
             util::require_human("answer --allow", "approving a card is your decision, not an agent's")?;
@@ -116,7 +116,7 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
             match tasks::answer_approval(&ctx, &task, decision, Some(&task.names))? {
                 AnswerResult::Approved { injected, replaced } => {
                     println!("✓ approved; injected {}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") });
-                    if !replaced.is_empty() { println!("  {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")); }
+                    if !replaced.is_empty() { println!("  {} rejected by the provider at delivery. A Replace card is waiting", replaced.join(", ")); }
                 }
                 AnswerResult::Denied => println!("✗ denied"),
                 _ => unreachable!(),

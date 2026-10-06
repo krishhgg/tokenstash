@@ -308,7 +308,7 @@ fn a_card_link_opens_its_card_and_nothing_else() {
     assert_eq!(cookie_value(&set, "tokenstash_card").as_deref(), Some(cred_b.as_str()));
     // Both cookies, card still pending: the scoped route is not elevated by the session,
     // never renders the session as its CSRF field, refuses approve/deny, and stays scoped
-    // across a reload — while the full route for the same card offers Allow.
+    // across a reload, while the full route for the same card offers Allow.
     let jar_both = [("tokenstash_card", cred_ap.as_str()), ("tokenstash_inbox", session.as_str())];
     for _ in 0..2 {
         let (st, _, _, page) = http(port, "GET", &path_ap, &jar_both, None);

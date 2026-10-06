@@ -217,7 +217,7 @@ pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcome
         &app.cfg,
         &format!("{} needs {}", tokenstash_core::project::short(project), pending.join(", ")),
         &format!("requested by {agent}"),
-        // The notification is read by the human and nothing else, so it is tokened — but only
+        // The notification is read by the human and nothing else, so it is tokened, but only
         // if `links.state` says we proved the port is ours. Otherwise it explains itself instead
         // of walking the human, and the token, into whatever is squatting there.
         &util::inbox_notice(&app.cfg, first_id.as_deref(), &links),
@@ -247,7 +247,7 @@ pub struct AskArgs {
     pub url: Option<String>,
     #[arg(long = "step")]
     pub steps: Vec<String>,
-    /// confirm | text. A `text` answer is returned to the agent — tell the human not to paste secrets into it.
+    /// confirm | text. A `text` answer is returned to the agent, so tell the human not to paste secrets into it.
     #[arg(long, default_value = "confirm")]
     pub expects: String,
     #[arg(long)]
@@ -290,7 +290,7 @@ pub fn ask(a: AskArgs) -> Result<i32> {
     if a.json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task, "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), &links) }))?);
     } else {
-        println!("{} {} — task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), &links));
+        println!("{} {}, task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), &links));
         if let Some(n) = &task.note {
             println!("  note: {n}");
         }

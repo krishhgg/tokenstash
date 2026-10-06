@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Print a Homebrew formula for a release, with per-platform sha256 taken from the *.sha256
 # sidecars (never recomputed locally). In the release workflow SUMS_DIR points at the build
-# artifacts of the same run — release assets are mutable, so a formula digested from them
+# artifacts of the same run. Release assets are mutable, so a formula digested from them
 # could bless a clobbered tarball. Without SUMS_DIR (a manual run) the release's assets are
 # downloaded. Usage: scripts/brew-formula.sh v0.1.0
 set -euo pipefail

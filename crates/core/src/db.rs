@@ -268,7 +268,7 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL")?;
         // WAL brings two sidecar files that SQLite creates at umask (0644 on most systems).
-        // They hold recently written rows — project paths, key names, identities, grants —
+        // They hold recently written rows, such as project paths, key names, identities and grants,
         // so they get the same 0600 as the database itself. The parent dir is already 0700;
         // this makes the files safe on their own if it ever is not.
         for suffix in ["-wal", "-shm"] {
@@ -394,7 +394,7 @@ impl Db {
 
     /// Data migration to trust v2, once, under one write lock (two processes opening a 0.1
     /// database at the same time must not both backfill). `user_version` 2 marks it done.
-    /// Backfills from `approvals` only — never from audit rows, which include one-time
+    /// Backfills from `approvals` only, never from audit rows, which include one-time
     /// `run` approvals that must not become standing grants.
     fn migrate_v2(&self) -> Result<()> {
         let v: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -634,7 +634,7 @@ impl Db {
 
     /// Was this key injected into this project by an approval answered at or after `since`?
     /// The audit row is written by `deliver` after the env file, so it is the proof that the
-    /// delivery finished — a value already sitting in the file proves nothing.
+    /// delivery finished. A value already sitting in the file proves nothing.
     pub fn injected_after_approval_since(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action='inject' AND detail='after-approval' AND ts >= ?4",
@@ -646,7 +646,7 @@ impl Db {
 
     /// (name, identity) pairs delivered into this project root strictly after `since` (the
     /// current workspace record's creation: an older directory's deliveries are not this
-    /// one's, and timestamps are second-resolution so an equal second is excluded too —
+    /// one's, and timestamps are second-resolution so an equal second is excluded too, since
     /// a delivery in the record's own creation second is covered by its grant).
     pub fn delivered_names(&self, project: &str, since: &str) -> Result<Vec<(String, String)>> {
         let mut st = self.conn.prepare("SELECT DISTINCT name, identity FROM audit WHERE project=?1 AND action IN ('inject','store') AND name IS NOT NULL AND ts > ?2")?;
@@ -734,7 +734,7 @@ impl Db {
 
     /// Resolve a task id: exact match, else a prefix of the id with or without its kind
     /// prefix ("7fa2" and "t_7fa2" both resolve `t_7fa2xx`). An empty or ambiguous prefix
-    /// is an error rather than a silent guess — callers answer, approve, or deny by id.
+    /// is an error rather than a silent guess, because callers answer, approve, or deny by id.
     pub fn find_task(&self, id_or_prefix: &str) -> Result<Option<Task>> {
         let q = id_or_prefix.trim();
         if q.is_empty() {
@@ -766,7 +766,7 @@ impl Db {
 
     /// `find_task`, but the search itself is confined to one project. `find_task` reports an
     /// ambiguous prefix by naming the tasks it matched, and those matches are drawn from
-    /// every project — so an agent passing a one-character prefix learns the task ids of
+    /// every project, so an agent passing a one-character prefix learns the task ids of
     /// projects it has nothing to do with. Callers that serve an agent use this.
     pub fn find_task_in(&self, project: &str, id_or_prefix: &str) -> Result<Option<Task>> {
         let q = id_or_prefix.trim();
@@ -842,7 +842,7 @@ impl Db {
     /// Close a card, but only while it is still open. The answer paths check the status of
     /// the `Task` they were handed, which was read some time ago: two answers racing (an
     /// inbox POST and a `tokenstash answer`, or two browser tabs) would both pass that check
-    /// and the second would overwrite the first — turning a committed *denial* into an
+    /// and the second would overwrite the first, turning a committed *denial* into an
     /// approval. Returns false when someone else already closed it.
     pub fn close_task_if_open(&self, id: &str, status: TaskStatus, note: Option<&str>) -> Result<bool> {
         let n = self.conn.execute(
@@ -1084,7 +1084,7 @@ impl Db {
     /// Find-or-create the workspace for a root, under the caller's write lock. The root is
     /// the identity; the fingerprint decides whether it is still the same directory: a
     /// mismatch (rm -rf + re-clone, a different mount) revokes the old grants and starts
-    /// over — the human never paired keys into THIS directory.
+    /// over, because the human never paired keys into THIS directory.
     fn workspace_for_locked(&self, root: &Path) -> Result<Option<Workspace>> {
         let Ok(root) = root.canonicalize() else { return Ok(None) };
         let Some(fp) = fingerprint(&root) else { return Ok(None) };
@@ -1097,7 +1097,7 @@ impl Db {
         if let Some(mut ws) = existing {
             ws.fingerprint_weak = ws.btime.is_none();
             // Same path, different directory (re-created, another mount, moved volumes):
-            // the grants were for the old one and do not apply — but an agent-callable
+            // the grants were for the old one and do not apply, but an agent-callable
             // path deletes nothing. `repair_workspace` (a human answering the new pairing
             // card) is what revokes and re-records.
             ws.fingerprint_ok = fingerprint_matches(&ws, &fp);
@@ -1222,7 +1222,7 @@ impl Db {
     }
 
     /// Every workspace holding a grant that would open the gate for (name, identity): an
-    /// exact grant, or — only for registry-confirmed non-sensitive keys — a broad one. The
+    /// exact grant, or a broad one for registry-confirmed non-sensitive keys only. The
     /// set a rotation may rewrite. On-disk equivalence and one-time approvals are not
     /// grants and never appear here.
     pub fn workspaces_granted(&self, name: &str, identity: &str, broad_applies: bool) -> Result<Vec<Workspace>> {
@@ -1236,7 +1236,7 @@ impl Db {
 
     /// Drop every grant (and binding) of a workspace. Values already written stay written.
     /// The v1 `approvals` table is left in place by the migration so a 0.1 binary can still
-    /// open this database. That also means a 0.1 binary still *honours* it — and it gates on
+    /// open this database. That also means a 0.1 binary still *honours* it, and it gates on
     /// approvals alone, with no fingerprint check. Revoking has to reach those rows too, or
     /// an older binary someone still has wired into an agent keeps delivering keys the human
     /// took back.
@@ -1389,7 +1389,7 @@ impl Db {
     /// so a per-directory limit would let a planted `NAME=guess` per directory turn the
     /// check into a value-equality oracle.
     pub fn recent_on_disk_miss(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<bool> {
-        // One miss closes the check here; a few misses anywhere close it everywhere — so
+        // One miss closes the check here; a few misses anywhere close it everywhere. So
         // neither a per-directory nor a global guess loop works, and one planted wrong value
         // in a hostile repo does not switch the feature off for every legitimate copy.
         let here: i64 = self.conn.query_row(

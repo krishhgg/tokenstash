@@ -17,7 +17,7 @@ impl App {
         // Accepted for compatibility, no longer honoured: agent links are scoped to one card
         // whatever this says. Said once per process, on stderr, with no value attached.
         if cfg.inbox_links == "full" {
-            eprintln!("tokenstash: inbox_links = \"full\" is deprecated and ignored — links printed to agents are scoped to one card; the full inbox is `tokenstash open` or the desktop notification");
+            eprintln!("tokenstash: inbox_links = \"full\" is deprecated and ignored. Links printed to agents are scoped to one card; the full inbox is `tokenstash open` or the desktop notification");
         }
         let db = Db::open_default()?;
         let stash = tokenstash_core::stash::open(&cfg)?;
@@ -149,7 +149,7 @@ fn is_terminal(stream: Stream) -> bool {
 /// `links` carries the state on purpose. The session is appended only when ownership
 /// of the port has been *proved* ([`Inbox::Ours`]). Handing `?t=` to a listener that failed
 /// the `/verify` challenge would give a squatter exactly the credential it needs to
-/// impersonate the inbox and collect whatever the human pastes next — the URL is the one
+/// impersonate the inbox and collect whatever the human pastes next. The URL is the one
 /// place the session leaves this process, so the check belongs here, where no new call site
 /// can forget it.
 /// Falls back to the bare URL otherwise; callers talking to a human should use
@@ -166,12 +166,12 @@ pub fn inbox_url_human(links: &Links, task_id: Option<&str>) -> String {
 /// and the inbox has proved it is ours. `tasks`, `doctor` and `run` print for a human but are
 /// also run by agents that capture the output; when the stream is not a TTY (a pipe, a file,
 /// an agent's capture buffer) they get the agent link. An agent that allocates a PTY can
-/// still see the session here — that is the known limit of a TTY heuristic, and the reason
+/// still see the session here. That is the known limit of a TTY heuristic, and the reason
 /// no unconditional surface ever prints it.
 ///
 /// Only a *proved* inbox gets a link at all, bare or tokened, on any stream: a loopback URL
 /// in front of a person is an invitation to paste a key into whatever answers there, and an
-/// agent relays the line verbatim. `Down` gets no link either — a squatter can bind the port
+/// agent relays the line verbatim. `Down` gets no link either, because a squatter can bind the port
 /// between our probe and the click.
 pub fn inbox_url_tty(cfg: &Config, db: Option<&Db>, task_id: Option<&str>, links: &Links, stream: Stream) -> String {
     if !matches!(links.state, Inbox::Ours) {
@@ -186,7 +186,7 @@ pub fn inbox_url_tty(cfg: &Config, db: Option<&Db>, task_id: Option<&str>, links
 
 /// Agent-facing: a link that WORKS when the person clicks it from the chat. It carries the
 /// card's own capability (open, answer or decline that one card; nothing else) and never
-/// the session — not for any config value: `inbox_links = "full"` is accepted and ignored,
+/// the session, not for any config value. `inbox_links = "full"` is accepted and ignored,
 /// because a session in the agent's context is a credential that approves. See
 /// `crate::inbox_auth` for why the scopes are split. Without a card there is nothing to
 /// scope a credential to, so the agent gets the bare URL: it opens for a browser that
@@ -225,7 +225,7 @@ pub fn inbox_unavailable(cfg: &Config, state: Inbox) -> Option<String> {
 
 /// The one line we put in front of a person telling them where to go: the session URL when
 /// ownership is proved, and why we are not sending them anywhere when it is not. Never a link
-/// to a listener that failed the proof — even a bare one would walk the human into an
+/// to a listener that failed the proof. Even a bare one would walk the human into an
 /// impostor's paste form.
 pub fn inbox_notice(cfg: &Config, task_id: Option<&str>, links: &Links) -> String {
     match inbox_unavailable(cfg, links.state) {
@@ -301,7 +301,7 @@ mod tests {
             assert!(ours.contains(&format!("?t={token}")), "{ours}");
             assert!(ours.contains("/t/t_abc"));
 
-            // Anything we could not prove is ours gets no session — a squatter on the port
+            // Anything we could not prove is ours gets no session, because a squatter on the port
             // must not be handed the credential that lets it impersonate the inbox.
             for state in [Inbox::Foreign, Inbox::Down] {
                 let url = inbox_url_human(&Links::new(&cfg, state), None);
@@ -354,7 +354,7 @@ mod tests {
             // No card, no credential: a bare URL, never a session minted for the occasion.
             let bare = inbox_url_agent(&cfg, Some(&db), None, &ours);
             assert_eq!(bare, inbox_url(&ours, None));
-            // A card that is not on file gets no credential either — nothing is signed over a
+            // A card that is not on file gets no credential either. Nothing is signed over a
             // guess.
             assert_eq!(inbox_url_agent(&cfg, Some(&db), Some("t_nothere"), &ours), inbox_url(&ours, Some("t_nothere")));
             assert_eq!(inbox_url_agent(&cfg, None, Some("t_abc123"), &ours), inbox_url(&ours, Some("t_abc123")));

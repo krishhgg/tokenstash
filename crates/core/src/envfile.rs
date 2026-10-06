@@ -84,7 +84,7 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
     let path = resolve(project, env_file)?;
     // Read-modify-write: two `need`s for different keys racing (a CLI run and the MCP
     // server, or two shells) would otherwise both read the same file and the second rename
-    // would drop the first key — a secret reported as delivered that is not in the file.
+    // would drop the first key, leaving a secret reported as delivered that is not in the file.
     let target = path.clone();
     crate::fsutil::with_lock_elsewhere(&target, move || upsert(project, env_file, name, value, path))
 }
@@ -154,7 +154,7 @@ fn upsert(project: &Path, env_file: &str, name: &str, value: &SecretString, path
 
 /// The value this project's env file already holds for NAME, if it can be trusted to be
 /// ours to read: a regular file (no symlink redirect), owned by this user, and not tracked
-/// by git. Used to adopt a value rather than overwrite it — never to authorise a delivery,
+/// by git. Used to adopt a value rather than overwrite it, never to authorise a delivery,
 /// which is [`crate::trust::on_disk_equivalent`]'s job.
 pub fn read_value(project: &Path, env_file: &str, name: &str) -> Option<SecretString> {
     let path = resolve(project, env_file).ok()?;
@@ -203,7 +203,7 @@ fn quote(v: &str) -> String {
         v.to_string()
     } else {
         // `\n` and `\r` are escaped, not emitted raw: a literal newline inside the quotes
-        // ends the line for every one-line-at-a-time reader — including our own parse_line,
+        // ends the line for every one-line-at-a-time reader, including our own parse_line,
         // which then reports the key as absent and makes rotation silently skip the project,
         // leaving a revoked key on disk. Multi-line secrets (PEM keys, service-account JSON)
         // are exactly the case that hits this. `\n` is decoded by parse_line and by
@@ -222,7 +222,7 @@ pub fn parse_line(line: &str) -> Option<(String, String)> {
     let (k, v) = line.split_once('=')?;
     let v = v.trim();
     // A quoted value ends at its closing quote; whatever follows (a trailing comment) is
-    // ignored. An unquoted value ends at a `#` that follows whitespace — a `#` inside a
+    // ignored. An unquoted value ends at a `#` that follows whitespace. A `#` inside a
     // token (a password in a URL) is part of the value, as dotenv reads it.
     let val = if let Some(inner) = v.strip_prefix('"') {
         let mut out = String::new();
@@ -357,7 +357,7 @@ pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
     git_trackedness(project, path).unwrap_or(true)
 }
 
-/// Nearest ancestor (or `start` itself) that holds a `.git` — plain detection, no policy.
+/// Nearest ancestor (or `start` itself) that holds a `.git`. Plain detection, no policy.
 /// Callers that decide where to WRITE use [`owned_git_root`].
 /// Is there a repository at `dir`? Any `.git` counts, exactly as before, except an empty
 /// directory. Codex's sandbox puts one into each writable root (the session's working directory,
@@ -450,7 +450,7 @@ unsafe fn libc_geteuid() -> u32 {
 
 /// If inside a git repo, make sure the env file is ignored. We add a rule to the root
 /// `.gitignore` if our own evaluation says it is not covered, then ask git itself
-/// (`git check-ignore`) for the effective answer — a nested `.gitignore` closer to the
+/// (`git check-ignore`) for the effective answer, because a nested `.gitignore` closer to the
 /// project can re-include the file. If git says it is still not ignored, a rule is added to
 /// the project's own `.gitignore` (closest wins) and re-verified; if that still fails, the
 /// caller must not write the secret. Symlinked ignore files are refused.
@@ -464,10 +464,10 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     // Two different questions. Which repo will commit this file (`git_root`, plain
     // detection) and which `.gitignore` we may write into (`owned_git_root`, which refuses
     // to adopt $HOME, /tmp and other shared roots). They diverge for a project that is not
-    // itself a repo but sits inside one — a dotfiles repo at $HOME being the common case.
+    // itself a repo but sits inside one, a dotfiles repo at $HOME being the common case.
     // Writing no rule at all there, which is what this used to do, left the secret sitting
     // unignored inside a real repo: `git add -A` from the root would commit it. The project
-    // gets its own .gitignore instead — the closest file wins, so it is enough.
+    // gets its own .gitignore instead. The closest file wins, so it is enough.
     let Some(root) = git_root(project) else { return Ok(false) };
     let ignore_dir = match owned_git_root(project)? {
         Some(owned) => owned,
@@ -511,7 +511,7 @@ fn verify_again(root: &Path, target: &Path) -> Result<()> {
     }
 }
 
-/// git could not answer (not installed, or it ran and failed — a broken `.git`, a repo it
+/// git could not answer (not installed, or it ran and failed on a broken `.git` or a repo it
 /// refuses as unsafe). We are inside a repo, so "cannot tell" is not "ignored".
 /// Our evaluator decides whether to append a rule, but it cannot replace git's effective
 /// answer: repository excludes and other ignore sources are outside that local model.
@@ -567,7 +567,7 @@ fn append_rule(gi: &Path, env_file: &str) -> Result<()> {
     if !s.is_empty() && !s.ends_with('\n') {
         s.push('\n');
     }
-    s.push_str("# added by tokenstash — never commit injected secrets\n");
+    s.push_str("# added by tokenstash. Never commit injected secrets.\n");
     s.push_str(env_file);
     s.push('\n');
     crate::fsutil::write_atomic(gi, &s)
@@ -590,7 +590,7 @@ fn add_rule_if_uncovered(gi: &Path, env_file: &str) -> Result<bool> {
     if !s.is_empty() && !s.ends_with('\n') {
         s.push('\n');
     }
-    s.push_str("# added by tokenstash — never commit injected secrets\n");
+    s.push_str("# added by tokenstash. Never commit injected secrets.\n");
     s.push_str(env_file);
     s.push('\n');
     crate::fsutil::write_atomic(gi, &s)?;

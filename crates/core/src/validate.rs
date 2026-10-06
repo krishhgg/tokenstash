@@ -39,8 +39,8 @@ pub const TIMEOUT_AT_USE: Duration = Duration::from_secs(4);
 /// One cheap authenticated request. Never logs the value. Network failure → Unknown (accept).
 ///
 /// Verdicts: 401 (or a status the registry lists in `reject_status`) → Rejected. 403 is
-/// "authenticated but not permitted" — a restricted Stripe/SendGrid key answers 403 on an
-/// endpoint outside its scope and is perfectly alive — so it is Unknown, never Rejected.
+/// "authenticated but not permitted". A restricted Stripe/SendGrid key answers 403 on an
+/// endpoint outside its scope and is perfectly alive, so it is Unknown, never Rejected.
 /// 429/5xx: the provider did not evaluate the key → Unknown. Redirects are never followed:
 /// `ureq` would forward custom auth headers (xi-api-key, X-Subscription-Token) to whatever
 /// origin the 3xx names, and strips Authorization so a redirected bearer probe would 401 on
@@ -254,7 +254,7 @@ pub fn looks_like_secret(text: &str) -> bool {
     if url_with_creds {
         return true;
     }
-    // A single long token with no digits at all is still a credential shape — a wordless
+    // A single long token with no digits at all is still a credential shape, because a wordless
     // passphrase ("correcthorsebatterystaple") is exactly what a human types when asked for
     // one. Plain URLs and paths are the answers that legitimately look like this.
     let single_token = tokens.len() == 1;

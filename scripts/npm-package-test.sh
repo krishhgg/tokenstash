@@ -3,7 +3,7 @@
 # for the `?write=true` documents and tarballs) and a fake `npm` on PATH (real `npm pack`;
 # `publish` and `view` recorded against the mock), and checks the two things the 0.2.0
 # incident was about:
-#   1. the launcher is published only after every platform package is SERVED — here each
+#   1. the launcher is published only after every platform package is SERVED. Here each
 #      platform package becomes visible a few seconds after `npm publish` returns;
 #   2. a platform package the registry serves with different contents stops the release
 #      before the launcher is published.
@@ -12,8 +12,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 real_npm="$(command -v npm)" || { echo "npm is required (for npm pack)" >&2; exit 2; }
 work="$(mktemp -d)"
-# Everything started here — the mock server, and the fake npm's visibility jobs, which
-# outlive the npm process that started them and are recorded in $reg/jobs — is stopped
+# Everything started here, meaning the mock server and the fake npm's visibility jobs, which
+# outlive the npm process that started them and are recorded in $reg/jobs, is stopped
 # before the fixtures go, so nothing writes into a directory being removed.
 cleanup() {
   local p
@@ -125,7 +125,7 @@ rm -rf "$reg"/* "$work/out"
 tampered="$work/tampered"; mkdir -p "$tampered"
 cat > "$work/bin/npm-tamper" <<SH
 #!/usr/bin/env bash
-# After the fake publish of linux-x64, replace its served tarball with something else —
+# After the fake publish of linux-x64, replace its served tarball with something else,
 # before returning, so the release script can never observe the original.
 "$work/bin/npm.real" "\$@"; status=\$?
 if [ "\$1" = publish ] && grep -q '"name": "tokenstash-linux-x64"' package.json; then

@@ -12,7 +12,7 @@
 //! something cheap for an offline brute force is caught before the KDF runs with them.
 //! Import additionally refuses parameters below a floor, so even a *valid* tag over weak
 //! parameters (a tampered exporter) is rejected. The header carries no names, counts or
-//! hostnames — nothing to learn without the passphrase. There is deliberately no plaintext
+//! hostnames, so there is nothing to learn without the passphrase. There is deliberately no plaintext
 //! export path, not even behind a flag.
 
 use anyhow::{bail, Context, Result};
@@ -165,7 +165,7 @@ pub fn seal(payload: &Payload_, passphrase: &SecretString) -> Result<Vec<u8>> {
 
 /// Decrypt a bundle. Refuses: bad magic, unknown major version, KDF parameters below the
 /// floor, a header that does not authenticate, a wrong passphrase (indistinguishable from
-/// tampering by design — both are "does not authenticate").
+/// tampering by design, because both are "does not authenticate").
 pub fn open(bytes: &[u8], passphrase: &SecretString) -> Result<Payload_> {
     if bytes.len() < HEADER_LEN + 16 {
         bail!("not a tokenstash bundle (too short)");

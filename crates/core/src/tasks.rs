@@ -18,7 +18,7 @@ pub struct Ctx<'a> {
     pub db: &'a Db,
     pub stash: &'a dyn Stash,
     /// How a liveness probe reaches the provider. `Network` in the binary; tests must use
-    /// `Off` or `Stub` — a unit test that sends a canary to api.openai.com is a bug.
+    /// `Off` or `Stub`, because a unit test that sends a canary to api.openai.com is a bug.
     pub probe: Probe<'a>,
 }
 
@@ -95,7 +95,7 @@ fn clean_text_opt(raw: Option<String>, max: usize) -> Option<String> {
 }
 
 /// A link an agent supplied. The inbox renders it as an `href` the human clicks, so the
-/// scheme is an allowlist: `javascript:` there would run in the inbox's own origin — the
+/// scheme is an allowlist: `javascript:` there would run in the inbox's own origin, the
 /// origin holding the session that approves grants. Whitespace and control characters are
 /// refused outright rather than stripped: a URL that needed cleaning is not one to trust.
 pub fn clean_url(raw: Option<String>) -> Option<String> {
@@ -425,7 +425,7 @@ pub enum Actor {
 /// "A standing grant elsewhere" is an exact grant for the name, or a broad grant that the
 /// gate would open for it. The value is not known yet, so whether it would be tagged
 /// sensitive at paste time (`sensitive_pattern`) is not either; sensitivity is judged on the
-/// name alone, which is the stricter reading — a value the pattern later tags is refused
+/// name alone, which is the stricter reading, since a value the pattern later tags is refused
 /// broad delivery by the gate anyway. Grants outlive the value (`forget` keeps them), so a
 /// re-paste after `forget` fans out exactly like the first paste did. A directory whose
 /// record no longer matches it (re-created) still counts: a record is a record.
@@ -433,7 +433,7 @@ pub enum Actor {
 /// Called under the index write lock by [`answer_secret_by`], so what it reads is what the
 /// store that follows will act on: a grant committed in another directory a moment earlier
 /// is seen, and one a moment later waits for the store to finish. It says nothing about
-/// grants given afterwards — a directory paired broadly next week receives whatever value
+/// grants given afterwards. A directory paired broadly next week receives whatever value
 /// is stored under a registry name then, whoever pasted it.
 pub fn fans_out(ctx: &Ctx, task: &Task) -> Result<bool> {
     if task.expects == EXPECTS_REPLACE {
@@ -458,7 +458,7 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
 /// stored. The shape and provider checks run first (a slow probe must not run under the
 /// lock); then the card and the grants are re-read under the index write lock, the gate is
 /// applied to what is there *now*, and the claim, the stash write and the record follow
-/// under the same lock — see [`store_and_inject`].
+/// under the same lock. See [`store_and_inject`].
 pub fn answer_secret_by(ctx: &Ctx, actor: Actor, task: &Task, value: SecretString, skip_liveness: bool) -> Result<AnswerResult> {
     if task.kind != TaskKind::Secret {
         bail!("task {} is not a secret task", task.id);
@@ -519,7 +519,7 @@ pub fn answer_secret_by(ctx: &Ctx, actor: Actor, task: &Task, value: SecretStrin
         },
     )?;
     // A replacement card's answer reaches every project that was ever given this key and
-    // does not already hold the new value — whichever old value it holds (the stash may
+    // does not already hold the new value, whichever old value it holds (the stash may
     // have changed between the stale mark and this answer).
     let rotation = if is_replacement { Some(rewrite_replaced_value(ctx, &name, &task.identity, &value, &task.project)?) } else { None };
     Ok(AnswerResult::Stored { injected_to, sensitive, liveness, rotation })
@@ -741,7 +741,7 @@ fn record_stored(ctx: &Ctx, name: &str, identity: &str, provider: Option<String>
         verify_off: verified == Verified::Skipped,
     })?;
     ctx.db.audit(Some(pid), Some(agent), "store", Some(name), Some(identity), None)?;
-    // The human just handled this key for this project: that is the grant — this key,
+    // The human just handled this key for this project: that is the grant, for this key,
     // this identity, this workspace, nothing broader.
     if project.is_dir() {
         // The directory the human is answering for: if its record no longer matches it,
@@ -863,7 +863,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
         let (n, identity) = split_identity(entry);
         // A card can gate a key that does not exist yet: a `run`-derived request for a
         // generatable name is approved *before* anything is generated, so the stash is
-        // empty here. Approving is the human saying yes to the delivery — generate it now,
+        // empty here. Approving is the human saying yes to the delivery, so generate it now,
         // or the card would be answered and nothing would ever arrive.
         let read_mark = ctx.db.audit_mark()?;
         let stashed = ctx.stash.get(&stash_key(n, identity))?;
@@ -872,7 +872,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
             None => match registry::lookup(n).and_then(|p| p.generate.clone()) {
                 Some(spec) if project.is_dir() => {
                     // Same rule as `need`: a value the env file already holds is kept, not
-                    // overwritten — minting a new JWT_SECRET over a live one logs every user out.
+                    // overwritten, because minting a new JWT_SECRET over a live one logs every user out.
                     let adopted = crate::need::adoptable(project, &ctx.cfg.env_file, n);
                     let source = if adopted.is_some() { crate::db::GRANT_ON_DISK } else { crate::db::GRANT_GENERATED };
                     match adopted.or_else(|| crate::need::generate(&spec)) {
@@ -917,12 +917,12 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
         // What the human has to do next depends entirely on what their answer recorded.
         // A pairing or sensitive approval wrote grants, so re-running `need` completes
         // silently. A one-time approval wrote none: the card is the only trace of the yes,
-        // so if nothing at all was delivered their decision bought nothing — put the card
+        // so if nothing at all was delivered their decision bought nothing. Put the card
         // back rather than make them approve the same request a second time.
         if kind == APPROVAL_ONCE {
             if injected.is_empty() && replaced.is_empty() {
                 let _ = ctx.db.reopen_task(&task.id);
-                bail!("approval recorded, but nothing could be delivered: {}. The card is still open — fix that and answer it again.", failures.join("; "));
+                bail!("approval recorded, but nothing could be delivered: {}. The card is still open, so fix that and answer it again.", failures.join("; "));
             }
             bail!("approval recorded, but {} failed. A one-time approval covers only this run, so re-running `need` asks again for what did not arrive.", failures.join("; "));
         }
@@ -968,7 +968,7 @@ pub fn deny(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<AnswerResult> 
 }
 
 /// After a key is replaced, every other project that was given this key and whose env
-/// file does not already hold the NEW value gets it — otherwise each of them fails next
+/// file does not already hold the NEW value gets it. Otherwise each of them fails next
 /// week and files its own card. The comparison happens here, value to value, and is never
 /// shown. Projects that no longer exist, or no longer have the variable at all, are left
 /// alone.
@@ -1018,7 +1018,7 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &Secre
         }
         // Both of these used to `continue` in silence. A project whose env file cannot be
         // resolved or read still holds the old value, and the human is about to revoke it
-        // on the strength of this report — so it has to be named, not dropped.
+        // on the strength of this report, so it has to be named, not dropped.
         let env_path = match crate::envfile::resolve(dir, &ctx.cfg.env_file) {
             Ok(p) => p,
             Err(e) => {
@@ -1035,7 +1035,7 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &Secre
         };
         let needs_update = text.lines().filter_map(crate::envfile::parse_line).any(|(k, v)| k == name && v != new.expose_secret());
         if !needs_update {
-            // A `NAME=` line we cannot parse is not "no old value here" — it is a value we
+            // A `NAME=` line we cannot parse is not "no old value here". It is a value we
             // cannot compare (an unterminated quote written by an older build). Say so
             // rather than counting the project as clean.
             let prefix = format!("{name}=");
@@ -1083,10 +1083,10 @@ pub enum ReportOutcome {
     MarkedStale,
 }
 
-/// An agent says a provider rejected a key. The agent is the only sensor tokenstash has —
-/// it is never in the request path — but its word is a claim, not a verdict:
+/// An agent says a provider rejected a key. The agent is the only sensor tokenstash has,
+/// since it is never in the request path, but its word is a claim, not a verdict:
 /// - only a project that actually received the key can report it (otherwise: ignored, and
-///   the caller cannot tell — no stash-existence oracle);
+///   the caller cannot tell, so there is no stash-existence oracle);
 /// - when the registry has a liveness check, the probe decides: a hostile repo cannot make
 ///   the provider reject a live key;
 /// - one report per (project, key) per task_ttl_hours; a probe that says Ok records a
@@ -1102,7 +1102,7 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
     if meta.stale {
         return Ok(ReportOutcome::Ignored); // already a miss; nothing to add
     }
-    // One report per (project, key) per TTL — but a report made BEFORE the current value
+    // One report per (project, key) per TTL, but a report made BEFORE the current value
     // was stored is about a previous value and must not shadow a report about this one.
     let ttl_since = ctx.cfg.ttl_since();
     let since = if meta.created > ttl_since { meta.created.clone() } else { ttl_since };
@@ -1145,7 +1145,7 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
         // No probe exists for this provider: the report stands, and the card says exactly
         // who made it and that it is unverified.
         None if !has_check => {
-            let reason = format!("reported rejected ({detail}) on {date} by {agent} in {} — unverified (no liveness check for this provider)", crate::project::short(project));
+            let reason = format!("reported rejected ({detail}) on {date} by {agent} in {}, unverified (no liveness check for this provider)", crate::project::short(project));
             ctx.db.mark_stale(name, identity, true, Some(&reason), Some(crate::db::STALE_REPORT))?;
             ctx.db.audit(Some(&pid), Some(agent), "report", Some(name), Some(identity), Some(&detail))?;
             Ok(ReportOutcome::MarkedStale)

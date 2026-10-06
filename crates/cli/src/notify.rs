@@ -11,7 +11,7 @@ use tokenstash_core::Config;
 /// "Something accepted a TCP connection" is not the same as "our inbox is running", and the
 /// difference matters: we are about to tell a human to paste an API key into whatever is
 /// there. `Ours` is only ever returned after the listener answers a fresh challenge with
-/// `HMAC(proof key, nonce)` — a proof it already holds this `TOKENSTASH_HOME`'s proof key.
+/// `HMAC(proof key, nonce)`, which proves it already holds this `TOKENSTASH_HOME`'s proof key.
 /// The key itself is never sent, so a squatter on the port learns nothing from being probed;
 /// and because the key is never in a URL either, a squatter that collected a stale link
 /// cannot answer with it.
@@ -94,7 +94,7 @@ fn challenge(s: &mut TcpStream, addr: &SocketAddr, nonce: &str) -> Option<String
 ///
 /// Returns what is on the port when we are done, and callers must act on it: this is the
 /// single point where the rest of the CLI learns whether it may hand out a credentialed URL.
-/// Warning and carrying on is not enough — a caller that then prints `?t=` has given the
+/// Warning and carrying on is not enough. A caller that then prints `?t=` has given the
 /// squatter the session, and the human a link straight to it.
 #[must_use]
 pub fn ensure_inbox(cfg: &Config) -> Inbox {
@@ -104,7 +104,7 @@ pub fn ensure_inbox(cfg: &Config) -> Inbox {
             // Do not spawn (the bind would fail) and, more importantly, do not send a human
             // to a URL owned by someone else. Nothing secret was disclosed getting here.
             eprintln!(
-                "tokenstash: port {} is held by another process — it failed the inbox ownership check, so nothing was sent to it.\n\
+                "tokenstash: port {} is held by another process. It failed the inbox ownership check, so nothing was sent to it.\n\
                  Stop that process or set inbox_port in {}.",
                 cfg.inbox_port,
                 tokenstash_core::config::config_path().display()
@@ -145,7 +145,7 @@ pub fn ensure_inbox(cfg: &Config) -> Inbox {
 pub fn describe(state: Inbox) -> &'static str {
     match state {
         Inbox::Ours => "running (ownership verified)",
-        Inbox::Foreign => "PORT HELD BY ANOTHER PROCESS — it failed the ownership check",
+        Inbox::Foreign => "PORT HELD BY ANOTHER PROCESS, which failed the ownership check",
         Inbox::Down => "not running (starts on demand)",
     }
 }

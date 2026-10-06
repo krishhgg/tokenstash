@@ -201,7 +201,7 @@ jobs:
         with: { packages-dir: dist, verbose: true, skip-existing: true }
   brew:
     # Formula from the release digests, attached to the release and handed to `publish`, which
-    # pushes it to the tap (krishhgg/homebrew-tokenstash — must be public) only once the
+    # pushes it to the tap (krishhgg/homebrew-tokenstash, which must be public) only once the
     # release is live. Draft assets 404 for everyone but us, so a formula pushed from here would
     # point `brew install` at files nobody can download whenever a later job failed. Never for
     # a pre-release tag.

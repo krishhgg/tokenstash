@@ -103,7 +103,7 @@ pub fn open(cfg: &crate::Config) -> Result<Box<dyn Stash>> {
         .unwrap_or_else(|| "auto".into());
     match backend.as_str() {
         "insecure-file" => {
-            eprintln!("tokenstash: WARNING — using insecure-file stash (plaintext, 0600). For CI/tests only.");
+            eprintln!("tokenstash: WARNING, using insecure-file stash (plaintext, 0600). For CI/tests only.");
             Ok(Box::new(FileStash::new()?))
         }
         "keyring" => Ok(Box::new(KeyringStash::os_store()?)),
@@ -210,8 +210,8 @@ impl Stash for KeyringStash {
 /// the agent's process tree) ends up holding a copy of its own: a key pasted from one session
 /// is shadowed in another by the copy that session read earlier, and that read links the old
 /// copy back into the persistent keyring over the new one. So a replaced key kept coming
-/// back. Here a read never prefers the session keyring — it is consulted only for keys that
-/// older code left nowhere else — and a write updates every copy it can reach, so a process
+/// back. Here a read never prefers the session keyring, which is consulted only for keys that
+/// older code left nowhere else, and a write updates every copy it can reach, so a process
 /// still running the old code and holding a session copy reads the new value too. Entries
 /// keep keyring-rs's description, `keyring-rs:<NAME@identity>@<service>`, so keys stored by
 /// older versions are found where they are.

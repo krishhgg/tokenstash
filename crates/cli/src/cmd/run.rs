@@ -3,7 +3,7 @@
 //!
 //! The program's own output chooses which key gets requested, and that output may be
 //! attacker-influenced. So requests that originate here are never silent: every stash hit
-//! goes through an approval task (`<program> wants OPENAI_API_KEY — allow?`) on every
+//! goes through an approval task (`<program> wants OPENAI_API_KEY. Allow?`) on every
 //! invocation, regardless of earlier approvals. The human authorizes the injection, not the
 //! child process. Once approved the key is in the env file, so a later run does not fail
 //! on it and nothing is re-asked in normal use.
@@ -51,7 +51,7 @@ pub fn run(a: RunArgs) -> Result<i32> {
             return Ok(code);
         }
         attempts += 1;
-        eprintln!("\ntokenstash: command failed and mentioned {} — asking you to approve it", missing.join(", "));
+        eprintln!("\ntokenstash: command failed and mentioned {}, asking you to approve it", missing.join(", "));
         // argv[0] only: arguments may carry secrets (curl -H "Authorization: ...") and `why`
         // is persisted and shown in task views.
         let program = std::path::Path::new(&a.command[0]).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| a.command[0].clone());
@@ -66,7 +66,7 @@ pub fn run(a: RunArgs) -> Result<i32> {
         let mut outcomes = need::need(&app.ctx(), &project, &agent, &missing, &opts)?;
         if outcomes.iter().any(|o| o.is_pending()) {
             let links = notify_pending(&app, &project, &agent, &outcomes);
-            // This line goes to STDERR, so the TTY check has to be stderr's — `run` is
+            // This line goes to STDERR, so the TTY check has to be stderr's. `run` is
             // routinely used with stdout redirected and stderr on the terminal, and the
             // reverse.
             eprintln!("tokenstash: waiting for you → {}", util::inbox_url_tty(&app.cfg, Some(&app.db), None, &links, util::Stream::Stderr));
@@ -98,7 +98,7 @@ fn load_env(path: &std::path::Path) -> HashMap<String, String> {
 ///
 /// Limitation, on purpose: this is line-level and defends against accidental echo only. The
 /// child holds the value by design, so a hostile child can always encode or fragment it.
-/// The defense against a hostile child is upstream — program-derived requests always need
+/// The defense against a hostile child is upstream. Program-derived requests always need
 /// a fresh human approval, so it cannot obtain a credential it was not granted.
 fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String)> {
     let mut redactor = Redactor::new();
@@ -179,7 +179,7 @@ fn should_redact_inherited(name: &str, value: &str) -> bool {
     // Redaction replaces the value wherever it appears as a substring, so a variable whose
     // value is an existing DIRECTORY (HOMEBREW_PREFIX=/opt/homebrew, JAVA_HOME, ...) would
     // garble every longer path that starts with it (PATH itself). A secret is never an
-    // existing directory, so directories — and colon-lists whose first entry is one — are
+    // existing directory, so directories, and colon-lists whose first entry is one, are
     // excluded. Files are not excluded: a path to a secret file is still redacted.
     let first = value.split(':').next().unwrap_or(value);
     let expanded = first.strip_prefix("~/").and_then(|rest| dirs::home_dir().map(|h| h.join(rest)));

@@ -29,12 +29,12 @@ registry="${NPM_REGISTRY_URL:-https://registry.npmjs.org}"
 settle_attempts="${NPM_SETTLE_ATTEMPTS:-60}"; settle_pause="${NPM_SETTLE_PAUSE:-15}"
 here="$(cd "$(dirname "$0")/.." && pwd)"
 # Skip a package already on the registry at this version so a re-run after a partial
-# failure finishes the set instead of dying on E403 — but only if what is there is OURS:
+# failure finishes the set instead of dying on E403, but only if what is there is OURS:
 # the published tarball, fully extracted, must be identical to what `npm pack` produces
-# from our directory (every file, package.json included — so no foreign scripts or
+# from our directory (every file, package.json included, so no foreign scripts or
 # dependencies can hide behind a familiar binary). Anything else stops the release.
 # Never unpublish: npm forbids re-using name@version forever and the launcher pins exact
-# versions — ship a patch release instead.
+# versions, so ship a patch release instead.
 # The tarball URL for name@version, from the registry's own document with the CDN cache
 # bypassed (`?write=true`): `npm view` reads through the CDN, which can serve a packument
 # up to five minutes stale. A version the registry does not serve yet is a miss.
@@ -53,8 +53,8 @@ same_package() { # <pkg dir>
      && tar -xzf "$tmp"/pack/*.tgz -C "$tmp/ours" && diff -r "$tmp/theirs" "$tmp/ours" >/dev/null; then ok=0; fi
   rm -rf "$tmp"; return $ok
 }
-# The registry can answer a version it accepted with a 404 for a while — writes and reads
-# take different paths, and 0.2.0 saw eleven minutes — so a package gets 60 attempts, 15 s
+# The registry can answer a version it accepted with a 404 for a while, because writes and reads
+# take different paths, and 0.2.0 saw eleven minutes. So a package gets 60 attempts, 15 s
 # apart (about fifteen minutes plus the lookups themselves), before it is judged. A package
 # that is there and differs still fails; it just fails after the wait.
 settled() { # <pkg dir>
@@ -76,7 +76,7 @@ publish() { # <pkg dir>
   local name; name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$1/package.json")
   if npm view "$name@$version" version >/dev/null 2>&1; then
     if same_package "$1"; then echo "$name@$version already published, identical; skipping"; return 0; fi
-    echo "$name@$version exists on the registry and DIFFERS from what we would publish — not ours; refusing to continue" >&2; exit 1
+    echo "$name@$version exists on the registry and DIFFERS from what we would publish, so it is not ours; refusing to continue" >&2; exit 1
   fi
   # --provenance on both paths: the OIDC path gets it automatically, the bootstrap token
   # path does not, and a first release nobody can verify is the one that matters most.
@@ -131,7 +131,7 @@ if [ "${NPM_PUBLISH:-}" = 1 ]; then
   name=tokenstash; settled "$main" || { echo "tokenstash@$version is missing or not ours" >&2; exit 1; }
   # What the registry actually did with the tags, in the job log: the only place the
   # "first publish takes latest" behaviour above is observable rather than assumed. Never
-  # fatal — every package is published and verified by this point, and a rate-limited
+  # fatal, because every package is published and verified by this point, and a rate-limited
   # diagnostic must not be what leaves the release sitting as a draft.
   npm view tokenstash dist-tags --json || echo "dist-tag lookup failed; packages are published"
 fi

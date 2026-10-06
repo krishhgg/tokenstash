@@ -4,7 +4,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 /// Values shorter than this are only redacted as whole tokens (surrounded by
 /// non-alphanumerics): replacing every "ab" inside other words would garble output.
-/// Defense in depth only — `tasks::MIN_SECRET_CHARS` keeps such values out of the stash
+/// Defense in depth only, because `tasks::MIN_SECRET_CHARS` keeps such values out of the stash
 /// in the first place, so nothing this short is ever a stored secret.
 const SHORT: usize = 4;
 

@@ -74,9 +74,9 @@ pub fn doctor() -> Result<i32> {
 
     check("registry", true, format!("{} providers", tokenstash_core::registry::count()));
     if !cfg.trust_roots.is_empty() {
-        check("trust roots", true, format!("{} in config, retired in 0.2 — each directory pairs once instead (`tokenstash workspaces`)", cfg.trust_roots.len()));
+        check("trust roots", true, format!("{} in config, retired in 0.2. Each directory pairs once instead (`tokenstash workspaces`)", cfg.trust_roots.len()));
     }
-    // "Not running" is normal — it starts on demand. Someone else holding the port is not:
+    // "Not running" is normal because it starts on demand. Someone else holding the port is not:
     // that is the case where a human could be sent to paste a key into another process.
     let inbox = notify::inbox_state(&cfg);
     ok &= check(
@@ -134,7 +134,7 @@ pub fn doctor() -> Result<i32> {
     };
     let refused = tokenstash_core::trust::refused_root(&project);
     check("this directory", refused.is_none(), format!("{}  {}", tokenstash_core::project::short(&project), match (refused, standing) {
-        (Some(why), _) => format!("is {why} — no keys are delivered here"),
+        (Some(why), _) => format!("is {why}, so no keys are delivered here"),
         (None, Some(n)) => format!("paired, {n} grant(s)"),
         (None, None) => "not paired yet → the first stored key asks once".into(),
     }));

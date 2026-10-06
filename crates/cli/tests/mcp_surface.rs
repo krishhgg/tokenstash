@@ -119,7 +119,7 @@ fn no_tool_result_ever_contains_a_value() {
     assert!(env.contains(canary), "the key was delivered to the project");
 }
 
-/// Task ids are scoped to the bound project — including the ambiguous-prefix path, which
+/// Task ids are scoped to the bound project, including the ambiguous-prefix path, which
 /// used to answer by naming other projects' cards.
 #[test]
 fn task_check_never_answers_for_another_project() {

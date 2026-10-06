@@ -80,7 +80,7 @@ pub fn summary(outcomes: &[Outcome], recheck: Recheck) -> &'static str {
         (true, _, Recheck::Mcp) => "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, call task_check later.",
         (true, _, Recheck::Cli) => "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, check later with `tokenstash tasks`.",
         (false, true, _) => "Not every key arrived: one or more were declined or expired. Follow each result's `next`; work that needs those keys is blocked.",
-        (false, false, _) => "Done — follow each result's `next`.",
+        (false, false, _) => "Done. Follow each result's `next`.",
     }
 }
 

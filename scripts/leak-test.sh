@@ -6,7 +6,7 @@ TS="$(cd "$(dirname "${1:-target/debug/tokenstash}")" 2>/dev/null && pwd)/$(base
 # `cargo test` does not build the CLI binary, so a default path can be missing or STALE (a
 # debug binary from an older commit passed for a "flake" once). Refuse rather than test the
 # wrong thing; the gate passes the freshly built release binary explicitly.
-[ -x "$TS" ] || { echo "leak test: no binary at $TS — build it, or pass the path as \$1"; exit 2; }
+[ -x "$TS" ] || { echo "leak test: no binary at $TS. Build it, or pass the path as \$1"; exit 2; }
 command -v script >/dev/null || { echo "leak test: needs script(1) from util-linux"; exit 2; }
 # A person at a terminal. The inventory commands show an agent only its own directory (list,
 # audit), file a card for it (forget), or refuse it (tasks --all, open), so the steps of this
@@ -17,14 +17,14 @@ command -v script >/dev/null || { echo "leak test: needs script(1) from util-lin
 HUMAN_ENV=(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT)
 # The insecure-file warning goes to stderr, which `script` folds into stdout; drop it so a
 # JSON reader sees JSON. `sed` (not `grep -v`) so an empty result is not a failure.
-human() { "${HUMAN_ENV[@]}" script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING — using insecure-file/d'; }
+human() { "${HUMAN_ENV[@]}" script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING, using insecure-file/d'; }
 export TOKENSTASH_HOME="$(mktemp -d)"
 export TOKENSTASH_STASH=insecure-file
 PROJ="$(mktemp -d)"; cd "$PROJ"; git init -q .
 OUT="$(mktemp -d)"
 # Browser-facing responses legitimately contain the inbox session (the hidden CSRF field),
 # so every curl body lands in $WEB. $OUT is the agent/CLI-facing surface, and the session
-# must never appear there — see assertion (d).
+# must never appear there. See assertion (d).
 WEB="$(mktemp -d)"
 JAR="$(mktemp)"
 CANARY="sk-LEAKCANARY-$(date +%s)-0123456789abcdef"
@@ -175,7 +175,7 @@ TOKEN_FILE="$TOKENSTASH_HOME/inbox.session"
 PROOF_FILE="$TOKENSTASH_HOME/inbox.proof.key"
 CAP_FILE="$TOKENSTASH_HOME/inbox.cap.key"
 for f in "$TOKEN_FILE" "$PROOF_FILE" "$CAP_FILE"; do
-  [ -s "$f" ] || { echo "FAIL: no credential at $f — the inbox is unauthenticated"; exit 1; }
+  [ -s "$f" ] || { echo "FAIL: no credential at $f, so the inbox is unauthenticated"; exit 1; }
   MODE="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f")"
   [ "$MODE" = 600 ] || { echo "FAIL: $f is $MODE, expected 600"; exit 1; }
 done
@@ -189,13 +189,13 @@ CAPKEY="$(cat "$CAP_FILE")"
 LEGACY_FULL="$(printf '1%.0s' $(seq 1 64))"; LEGACY_PASTE="$(printf '2%.0s' $(seq 1 64))"
 printf '%s' "$LEGACY_FULL" >"$TOKENSTASH_HOME/inbox.token"; printf '%s' "$LEGACY_PASTE" >"$TOKENSTASH_HOME/inbox.paste.token"
 
-# (a) the live exploit: an unauthenticated POST from any local process — or a loopback
-# CSRF from any page the user visits — must not be able to store a value.
+# (a) the live exploit: an unauthenticated POST from any local process, or a loopback
+# CSRF from any page the user visits, must not be able to store a value.
 "$TS" need EVIL_TARGET_KEY --agent ci --why "inbox auth test" >"$OUT/need-evil.txt" 2>&1 || true
 ETID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='EVIL_TARGET_KEY'][0]['id'])")
 code=$(curl -s -o "$WEB/exploit.txt" -w '%{http_code}' -X POST --data 'value=sk-EVIL-INJECTED&skip_check=1' "http://127.0.0.1:$PORT/t/$ETID")
 [ "$code" = 404 ] || { echo "FAIL: unauthenticated POST /t/<id> returned $code, expected 404"; exit 1; }
-[ -s "$WEB/exploit.txt" ] && { echo "FAIL: the 404 body is not empty — it reveals the inbox"; exit 1; }
+[ -s "$WEB/exploit.txt" ] && { echo "FAIL: the 404 body is not empty, so it reveals the inbox"; exit 1; }
 grep -q "sk-EVIL-INJECTED" "$PROJ/.env.local" && { echo "FAIL: an unauthenticated POST stored a value"; exit 1; }
 code=$(curl -s -o "$WEB/unauth-index.html" -w '%{http_code}' "http://127.0.0.1:$PORT/")
 [ "$code" = 404 ] || { echo "FAIL: unauthenticated GET / returned $code, expected 404"; exit 1; }
@@ -214,7 +214,7 @@ EXPECT="$(hmacof "$PROOF" "$VTAG$NONCE")"
 GOT="$(curl -fsS "http://127.0.0.1:$PORT/verify?c=$NONCE")"
 [ "$GOT" = "$EXPECT" ] || { echo "FAIL: /verify answered '$GOT', expected HMAC-SHA256(proof, tag||nonce) = '$EXPECT'"; exit 1; }
 [ "$GOT" != "$PROOF" ] && [ "$GOT" != "$TOKEN" ] || { echo "FAIL: /verify echoed a credential itself"; exit 1; }
-# an impostor holding a different key cannot produce that answer — that is the proof
+# an impostor holding a different key cannot produce that answer, and that is the proof
 [ "$GOT" != "$(hmacof "$(printf '0%.0s' $(seq 1 64))" "$VTAG$NONCE")" ] || { echo "FAIL: /verify is not bound to the proof key"; exit 1; }
 # ...nor can whoever captured the browser session, the card key, or a legacy token from a URL
 for k in "$TOKEN" "$CAPKEY" "$LEGACY_FULL" "$LEGACY_PASTE"; do
@@ -344,7 +344,7 @@ ATID=$(human "$TS" tasks --all --json | python3 -c "import json,sys;l=[t for t i
 [ -n "$ATID" ] || { echo "FAIL: a stash hit in an unpaired directory did not create an approval card"; sed -n 1,5p "$OUT/need-untrusted.txt"; exit 1; }
 # The CLI has the same guard the paste-scope link does: an agent with a shell can read this
 # card's id out of `tasks --json`, so `answer --allow` must refuse it. (Not a boundary on its
-# own — an agent that scrubs its env and allocates a PTY looks like a person — which is why
+# own, because an agent that scrubs its env and allocates a PTY looks like a person, which is why
 # the token scope above is the real control and this is the second lock on the same door.)
 TOKENSTASH_AGENT=claude-code "$TS" answer "$ATID" --allow >"$OUT/self-approve.txt" 2>&1 \
   && { echo "FAIL: an agent approved its own card from the shell"; exit 1; }
@@ -414,7 +414,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT/
 code=$(curl -s -o "$WEB/bad-with-session.html" -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT/p/$BTID?t=$BTID.$PMAC")
 [ "$code" = 404 ] || { echo "FAIL: a bad card credential passed because the browser held the session ($code)"; exit 1; }
 grep -q "no longer valid" "$WEB/bad-with-session.html" || { echo "FAIL: the refused credential did not get the recovery page"; exit 1; }
-# a fresh browser that follows a card link, then a full link, holds both — and the card
+# a fresh browser that follows a card link, then a full link, holds both, and the card
 # route stays scoped after the login
 UJAR="$WEB/upgrade.jar"; : >"$UJAR"
 curl -fsS -c "$UJAR" -b "$UJAR" -L -o /dev/null "$ALINK"
@@ -450,7 +450,7 @@ fail=0
 if grep -rl "$CANARY" "$OUT"; then echo "LEAK: canary found in CLI/MCP output"; fail=1; fi
 if grep -q "$CANARY" "$TOKENSTASH_HOME/config.toml" 2>/dev/null; then echo "LEAK: canary in config"; fail=1; fi
 # (d) the inbox session is a human credential and the two keys never travel at all: none may
-# reach a surface the model reads — MCP tool results, the audit log, or any other CLI output.
+# reach a surface the model reads, whether MCP tool results, the audit log, or any other CLI output.
 if grep -q "$TOKEN" "$OUT/mcp.txt"; then echo "LEAK: session token in MCP tool output"; fail=1; fi
 if grep -q "$TOKEN" "$OUT/audit.txt"; then echo "LEAK: session token in the audit log"; fail=1; fi
 if grep -rl "$TOKEN" "$OUT"; then echo "LEAK: session token found in agent-facing output"; fail=1; fi
@@ -701,7 +701,7 @@ kill "$INBOX_PID" 2>/dev/null || true
 wait "$INBOX_PID" 2>/dev/null || true
 cat > "$WEB/squat.py" <<'PY'
 # A plain HTTP listener that answers everything with 200 "hi". It does not know the proof key,
-# so it cannot answer /verify — which is exactly what the ownership proof is for.
+# so it cannot answer /verify, which is exactly what the ownership proof is for.
 import socket, sys, time
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -75,7 +75,7 @@ impl From<Mode> for AgentMode {
 }
 
 /// An MCP registration explicit mode took out that init had not made: the user's own
-/// `claude mcp add`, a Cursor entry written by hand. Undo puts the entry back — the entry,
+/// `claude mcp add`, a Cursor entry written by hand. Undo puts back only the entry,
 /// not the file, so nothing the user changed in that file since is lost.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Removed {
@@ -93,7 +93,7 @@ struct Removed {
 /// What `init` did to files it does not own, so `--undo` can put them back exactly.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Manifest {
-    /// (path, backup) — `backup` is `None` when the file did not exist before.
+    /// (path, backup), where `backup` is `None` when the file did not exist before.
     files: Vec<(PathBuf, Option<PathBuf>)>,
     /// Skill directories init created.
     dirs: Vec<PathBuf>,
@@ -111,7 +111,7 @@ struct Manifest {
 }
 
 /// The manifest records changes to the user's GLOBAL agent configs, so it lives in one fixed
-/// place — the default config dir — no matter what `TOKENSTASH_HOME` a given shell has set.
+/// place, the default config dir, no matter what `TOKENSTASH_HOME` a given shell has set.
 /// Otherwise an init run with a scratch home and an `--undo` run without it (or the other way
 /// round) never see each other's record, and undo reports "nothing to undo" over a fully
 /// wired machine.
@@ -175,7 +175,7 @@ impl Manifest {
         Ok(())
     }
     fn recorded(&self, p: &Path) -> bool { self.files.iter().any(|(q, _)| q == p) }
-    /// Back up `p`, run the mutation, and record the file ONLY if the mutation succeeded —
+    /// Back up `p`, run the mutation, and record the file ONLY if the mutation succeeded, because
     /// a failed merge changed nothing, so `--undo` must not later "restore" a stale copy
     /// over work the user did afterwards. The manifest is saved after every recorded
     /// change, so a crash mid-way still leaves an undo record for what was already done.
@@ -220,7 +220,7 @@ impl Manifest {
         Ok(())
     }
 
-    /// Put one recorded file back the way init found it — the backup, or nothing — and drop
+    /// Put one recorded file back the way init found it, which is the backup or nothing, and drop
     /// its record. For a file the other agent mode owns when modes switch: the file is
     /// tokenstash's own (a `tokenstash.md` prompt, a skill file), so restoring the original is
     /// the right move, unlike the shared configs where only the entry is taken out. A file
@@ -239,9 +239,9 @@ impl Manifest {
     }
 
     /// Init's entry is out of a shared config it held a whole-file record for, so the record
-    /// is retired: whatever else the file holds is the user's — put there before init or
-    /// after it — and restoring a copy would overwrite it. What init itself replaced — a
-    /// tokenstash entry the user had before init, a marked section in an AGENTS.md — comes
+    /// is retired: whatever else the file holds is the user's, put there before init or
+    /// after it, and restoring a copy would overwrite it. What init itself replaced, such as a
+    /// tokenstash entry the user had before init or a marked section in an AGENTS.md, comes
     /// back through an entry record instead. A file init created that holds nothing else is
     /// removed rather than left as a stub. A backup that cannot be read keeps the whole-file
     /// record: the only way back it offers is the one there is.
@@ -343,8 +343,8 @@ fn remove_skill_dir(d: &Path) -> Result<()> {
 
 
 /// Nothing but what init's own wiring leaves behind once its entry is gone: `{}` or
-/// `{"mcpServers": {}}`, a bare `[mcp_servers]` header, a blank AGENTS.md. Anything else —
-/// another key, an empty table of the user's, a comment — is theirs, and the file stays.
+/// `{"mcpServers": {}}`, a bare `[mcp_servers]` header, a blank AGENTS.md. Anything else, such as
+/// another key, an empty table of the user's or a comment, is theirs, and the file stays.
 fn effectively_empty(p: &Path) -> bool {
     match fs::read_to_string(p) {
         Ok(s) => effectively_empty_text(p, &s),
@@ -875,7 +875,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         let cj = w.claude_json();
         // The CLI registers cleanly when present. The desktop app ships without `claude`
         // on PATH, so fall back to writing the same user-scope entry into ~/.claude.json
-        // ourselves — otherwise a desktop-only user is left with a printed command.
+        // ourselves. Otherwise a desktop-only user is left with a printed command.
         let added = if w.claude_cli && !manifest.claude_mcp_registered && !manifest.recorded(&cj) && json_has_server(&cj, false) {
             // Already registered by someone else (the user, an older install): not ours
             // to remove on --undo, so no record is taken.
@@ -899,7 +899,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         } else {
             match manifest.mutate_entry(&cj, || merge_mcp_json_typed(&cj, &w.exe, true, w.ts_home.as_deref())) {
                 Ok(()) => { touched.push(cj); true }
-                Err(e) => { println!("! Claude Code: left {} untouched — {e}", cj.display()); false }
+                Err(e) => { println!("! Claude Code: left {} untouched, {e}", cj.display()); false }
             }
         };
         if added {
@@ -913,7 +913,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         let ctoml = codex.join("config.toml");
         match manifest.mutate_entry(&ctoml, || merge_codex_toml(&ctoml, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(ctoml.clone()); println!("✓ Codex: MCP server registered ({})", ctoml.display()) }
-            Err(e) => println!("! Codex: left {} untouched — {e}", ctoml.display()),
+            Err(e) => println!("! Codex: left {} untouched, {e}", ctoml.display()),
         }
     }
     let cursor = w.cursor();
@@ -921,7 +921,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         let cj = cursor.join("mcp.json");
         match manifest.mutate_entry(&cj, || merge_mcp_json(&cj, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(cj.clone()); println!("✓ Cursor: MCP server registered ({})", cj.display()) }
-            Err(e) => println!("! Cursor: left {} untouched — {e}", cj.display()),
+            Err(e) => println!("! Cursor: left {} untouched, {e}", cj.display()),
         }
     }
     let gemini = w.gemini();
@@ -929,7 +929,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         let gj = gemini.join("settings.json");
         match manifest.mutate_entry(&gj, || merge_mcp_json(&gj, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(gj.clone()); println!("✓ Gemini CLI: MCP server registered ({})", gj.display()) }
-            Err(e) => println!("! Gemini CLI: left {} untouched — {e}", gj.display()),
+            Err(e) => println!("! Gemini CLI: left {} untouched, {e}", gj.display()),
         }
     }
     Ok(touched)
@@ -948,7 +948,7 @@ fn unregister_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
     Ok(())
 }
 
-/// Take `tokenstash` out of a JSON config's `mcpServers` — and, for `~/.claude.json`, out of
+/// Take `tokenstash` out of a JSON config's `mcpServers` and, for `~/.claude.json`, out of
 /// every project's local-scope `mcpServers` too, which is where a plain `claude mcp add`
 /// puts it. Init's own entry just goes; anyone else's is recorded for undo. An entry that
 /// is already gone (an interrupted earlier run, the user) still settles the bookkeeping:
@@ -1486,7 +1486,7 @@ pub fn installed(home: &Path) -> Vec<Installed> {
 
 /// Set `mcp_servers.tokenstash` in Codex's config.toml with `toml_edit`, which preserves
 /// the user's comments and formatting and understands every header spelling (quoted keys,
-/// whitespace, inline tables, nested subtables) — an earlier line-scanning version got a
+/// whitespace, inline tables, nested subtables). An earlier line-scanning version got a
 /// steady stream of those wrong. An existing entry is replaced wholesale so the env
 /// (TOKENSTASH_HOME) is current. If the file cannot be parsed it is left untouched.
 fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<serde_json::Value> {
@@ -1528,7 +1528,7 @@ fn read_toml(p: &Path) -> Result<toml_edit::DocumentMut> {
 }
 
 /// Whether Codex's config holds a tokenstash entry. `Ok(false)` for a missing file; an
-/// unreadable or unparseable one is an error, not an absence — bookkeeping that treated it as
+/// unreadable or unparseable one is an error, not an absence, because bookkeeping that treated it as
 /// one would give up records over a file whose state is unknown.
 fn toml_server_state(p: &Path) -> Result<bool> {
     let s = match fs::read_to_string(p) {
@@ -1549,7 +1549,7 @@ fn merge_mcp_json(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<serde_js
     merge_mcp_json_typed(p, exe, false, ts_home)
 }
 
-/// Same, with `"type": "stdio"` — the shape Claude Code writes into `~/.claude.json`.
+/// Same, with `"type": "stdio"`, the shape Claude Code writes into `~/.claude.json`.
 /// Returns the entry written.
 fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool, ts_home: Option<&str>) -> Result<serde_json::Value> {
     let mut v = read_json(p)?;
@@ -1575,8 +1575,8 @@ fn read_json(p: &Path) -> Result<serde_json::Value> {
     })
 }
 
-/// A tokenstash entry under `mcpServers`, or — `~/.claude.json`, where `claude mcp add`
-/// without `-s user` puts it — under any project's `mcpServers`. Same contract as
+/// A tokenstash entry under `mcpServers`, or under any project's `mcpServers` in
+/// `~/.claude.json`, where `claude mcp add` without `-s user` puts it. Same contract as
 /// [`toml_server_state`]: unknown is an error, not an absence.
 fn json_server_state(p: &Path, claude: bool) -> Result<bool> {
     let s = match fs::read_to_string(p) {
@@ -1596,39 +1596,40 @@ fn json_has_server(p: &Path, claude: bool) -> bool { json_server_state(p, claude
 /// Every AGENTS.md section text a tokenstash release wrote, between its marks. A section that
 /// is exactly one of these is tokenstash's own; any other text under the marks is the user's
 /// (written by hand, or one of these edited) and is kept for undo when init takes it out.
+/// The texts must match those releases byte for byte, so their dashes stay, spelled as escapes.
 const SHIPPED_SECTIONS: [&str; 7] = [
-    r#"## Secrets & API keys
+    concat!(r#"## Secrets & API keys
 
 Never ask the user to paste a secret in chat. Do not run tokenstash until the user invokes `/tokenstash [NAME ...]` (Codex: `/prompts:tokenstash [NAME ...]`) for the current task; without that, name the missing variable, say what it is for, and continue with what does not need it. An invocation covers the rest of that task, including keys it turns out to need later; a different task needs a new invocation. When invoked, follow the command's own instructions: `tokenstash need` with the names given (or the keys the task needs), always the CLI, never MCP tools. Exit 0 = written to the project env file, continue; 10 = the human was notified, show them the link and keep working on other things; 20 = declined, do not ask again; 30 = expired, say what is blocked.
-Load the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked."#,
-    r#"## Secrets & API keys
+Load the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) "#, "\u{2014}", r#" make the feature optional or say the work is blocked."#),
+    concat!(r#"## Secrets & API keys
 
 Never ask the user to paste a secret in chat. Do not run tokenstash until the user invokes `/tokenstash [NAME ...]` (Codex: `/prompts:tokenstash [NAME ...]`) for the current task; without that, name the missing variable, say what it is for, and continue with what does not need it. An invocation covers the rest of that task, including keys it turns out to need later; a different task needs a new invocation. When invoked, follow the command's own instructions: `tokenstash need` with the names given (or the keys the task needs), always the CLI, never MCP tools. Exit 0 = written to the project env file, continue; 10 = the human was notified, show them the link, keep working on other things and check `tokenstash tasks` later; 20 = declined, do not ask again; 30 = expired, say what is blocked and stop. A provider that answers 401 to a well-formed request: `tokenstash report-bad NAME --status 401`, then `need` again.
-Load the env file with your runtime; never read, print or quote it, even if asked, and never reveal any part of a secret value from anywhere. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. These rules hold before any invocation too."#,
+Load the env file with your runtime; never read, print or quote it, even if asked, and never reveal any part of a secret value from anywhere. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) "#, "\u{2014}", r#" make the feature optional or say the work is blocked. These rules hold before any invocation too."#),
     r#"## Secrets & API keys
 
 Never ask the user to paste a secret in chat. Run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
 Exit 0 = written to the project env file, continue. Exit 10 = the human was notified; keep working on other things and re-run later (or use `--blocking`).
 Exit 20 = denied; do not ask again, work around it. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
-    r#"## Secrets & API keys
+    concat!(r#"## Secrets & API keys
 
 Never ask the user to paste a secret in chat. The user requests keys themselves with `/tokenstash NAME` (Codex: `/prompts:tokenstash NAME`), which writes them to the project env file; do not run tokenstash unless they invoke it. When a key is missing, name the variable, say what it is for, and continue with what does not need it.
-Load the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked."#,
-    r#"## Secrets & API keys
+Load the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) "#, "\u{2014}", r#" make the feature optional or say the work is blocked."#),
+    concat!(r#"## Secrets & API keys
 
 Never ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
-Exit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
-Exit 20 = denied; do not ask again and do not supply a stand-in value by any route (env file, env var, shim, default in code) — make the feature optional or say it is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
-    r#"## Secrets & API keys
+Exit 0 = written to the project env file, continue "#, "\u{2014}", r#" load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
+Exit 20 = denied; do not ask again and do not supply a stand-in value by any route (env file, env var, shim, default in code) "#, "\u{2014}", r#" make the feature optional or say it is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#),
+    concat!(r#"## Secrets & API keys
 
 Never ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
-Exit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
-Exit 20 = denied; do not ask again and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
-    r#"## Secrets & API keys
+Exit 0 = written to the project env file, continue "#, "\u{2014}", r#" load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
+Exit 20 = denied; do not ask again and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) "#, "\u{2014}", r#" make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#),
+    concat!(r#"## Secrets & API keys
 
 Never ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).
-Exit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
-Exit 20 = denied; do not ask again. Exit 30 = expired; say what is blocked and stop. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code), whether a key is pending, declined, expired or simply not there — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#,
+Exit 0 = written to the project env file, continue "#, "\u{2014}", r#" load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).
+Exit 20 = denied; do not ask again. Exit 30 = expired; say what is blocked and stop. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code), whether a key is pending, declined, expired or simply not there "#, "\u{2014}", r#" make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask "title" --url ... --step ...`."#),
 ];
 
 const SNIPPET_MARK: &str = "<!-- tokenstash -->";

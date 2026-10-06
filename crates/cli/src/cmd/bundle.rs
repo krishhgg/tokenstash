@@ -1,5 +1,5 @@
 //! `export` / `import`: move a stash between machines as one passphrase-encrypted file.
-//! Human-only, interactive: the passphrase is prompted (never a flag, never an env var — both
+//! Human-only, interactive: the passphrase is prompted (never a flag, never an env var, because both
 //! land in `ps`, shell history, crash reports), and the export is confirmed twice so a typo
 //! cannot brick the only copy.
 
@@ -17,7 +17,7 @@ pub struct ExportArgs {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
     /// Instead of writing a bundle: scan a directory tree for env files and import the keys
-    /// found there into the stash (onboarding). Interactive, for a person at a terminal — the
+    /// found there into the stash (onboarding). Interactive, for a person at a terminal. The
     /// table is an inventory of what you have, and a pty defeats the terminal check.
     #[arg(long, value_name = "DIR", conflicts_with = "out")]
     pub from_env: Option<PathBuf>,
@@ -61,7 +61,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
         // `require_human` above already proved stdout is a terminal, so the generated
         // passphrase cannot land in a file or a pipe.
         let g = bundle::generate_passphrase();
-        println!("\nGenerated passphrase — write it down now, it is shown once:\n\n    {}\n", g.expose_secret());
+        println!("\nGenerated passphrase. Write it down now, it is shown once:\n\n    {}\n", g.expose_secret());
         g
     } else {
         let again = rpassword::prompt_password("again: ")?;
@@ -94,7 +94,7 @@ fn refuse_bad_destination(p: &Path, env_file: &str) -> Result<PathBuf> {
         if tokenstash_core::envfile::is_git_tracked(&root, &resolved) {
             bail!("{} is tracked by git; refusing to write a bundle there", resolved.display());
         }
-        eprintln!("note: {} is inside a git repo — make sure the bundle is never committed", resolved.display());
+        eprintln!("note: {} is inside a git repo, so make sure the bundle is never committed", resolved.display());
     }
     Ok(resolved)
 }
@@ -153,7 +153,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
             Some(v) if v.expose_secret() == e.value => {
                 // Same value: nothing to store, but a rotation the user asked for on the
                 // other machine must not be lost here. Decided now, written in the apply
-                // step with everything else — planning changes nothing.
+                // step with everything else. Planning changes nothing.
                 if e.stale && e.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)
                     && !app.db.get_secret(&e.name, &e.identity)?.map(|m| m.stale).unwrap_or(false)
                 { Plan::CarryRotation } else { Plan::Skip }
@@ -161,7 +161,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
             Some(_) => {
                 if a.keep_existing { Plan::Skip } else if a.replace { Plan::Replace } else {
                     let local = app.db.get_secret(&e.name, &e.identity)?;
-                    print!("{}@{} differs from what this machine has (here: stored {}{}; bundle: stored {}{}) — replace it? [y/N] ",
+                    print!("{}@{} differs from what this machine has (here: stored {}{}; bundle: stored {}{}). Replace it? [y/N] ",
                         e.name, e.identity,
                         local.as_ref().map(|m| m.created.clone()).unwrap_or_default(), if local.as_ref().map(|m| m.stale).unwrap_or(false) { ", STALE" } else { "" },
                         e.created, if e.stale { ", stale" } else { "" });
@@ -175,7 +175,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
         };
         plan.push((p, e));
     }
-    // 3. apply: stash first (the value's home), then the index. No approvals — import is not
+    // 3. apply: stash first (the value's home), then the index. No approvals, because import is not
     //    per-project consent. No env-file writes.
     let (mut added, mut replaced, mut skipped) = (0, 0, 0);
     for (p, e) in &plan {
@@ -291,7 +291,7 @@ pub struct FromEnvArgs {
 }
 
 /// Onboarding: find the keys already scattered across a person's projects and stash the
-/// ones they tick. Human-only and interactive by design — the table is an inventory of
+/// ones they tick. Human-only and interactive by design, because the table is an inventory of
 /// what the person has, and ticking rows is consent. There is no MCP tool for this and
 /// no non-interactive switch.
 pub fn from_env(a: FromEnvArgs) -> Result<i32> {
@@ -318,15 +318,15 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         let ambiguous = is_ambiguous(&c.candidates, i);
         let (default_on, note) = match (&cand.confidence, &existing) {
             (_, Some(v)) if v.expose_secret() == cand.value.expose_secret() => (false, "already in the stash".to_string()),
-            (_, Some(_)) => (false, "DIFFERS from the stash — you will be asked before it replaces anything".to_string()),
-            (Confidence::Registry, None) if ambiguous => (false, format!("{} — several different values under this name; pick the real one", cand.provider.clone().unwrap_or_default())),
+            (_, Some(_)) => (false, "DIFFERS from the stash, and you will be asked before it replaces anything".to_string()),
+            (Confidence::Registry, None) if ambiguous => (false, format!("{}, several different values under this name; pick the real one", cand.provider.clone().unwrap_or_default())),
             (Confidence::Registry, None) => (true, cand.provider.clone().unwrap_or_default()),
-            (Confidence::RegistryShapeMismatch, None) => (false, format!("{} — does not look like a real key (placeholder?)", cand.provider.clone().unwrap_or_default())),
+            (Confidence::RegistryShapeMismatch, None) => (false, format!("{}, but it does not look like a real key (placeholder?)", cand.provider.clone().unwrap_or_default())),
             (Confidence::Heuristic, None) => (false, "unregistered; looks like a secret".to_string()),
         };
         ticked.push(default_on);
         differs.push(matches!((&cand.confidence, &existing), (_, Some(v)) if v.expose_secret() != cand.value.expose_secret()));
-        // The row is identified by its number, its name and where it was found — never by any
+        // The row is identified by its number, its name and where it was found, never by any
         // part of the value. A first-and-last-characters preview is still a piece of the key,
         // and this table is printed to a terminal an agent may be driving through a pty.
         let srcs: Vec<String> = cand.sources.iter().take(3).map(|p| short(p)).collect();
@@ -372,7 +372,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
     for &i in &chosen {
         let identity = tokenstash_core::envcrawl::identity_among(&c.candidates, i, &a.identity, |j| ticked[j]);
         let replaces = app.stash.get(&stash_key(&c.candidates[i].name, &identity))?.map(|v| v.expose_secret() != c.candidates[i].value.expose_secret()).unwrap_or(false);
-        println!("  {}@{}{}", c.candidates[i].name, identity, if replaces { "  (REPLACES the value in the stash — you will be asked)" } else { "" });
+        println!("  {}@{}{}", c.candidates[i].name, identity, if replaces { "  (REPLACES the value in the stash, and you will be asked)" } else { "" });
     }
     print!("proceed? [y/N] ");
     { use std::io::Write; std::io::stdout().flush()?; }
@@ -390,7 +390,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         bundle::validate_entry(&e).with_context(|| format!("row {} ({}@{})", i + 1, cand.name, identity))?;
         if let Some(pat) = tokenstash_core::registry::lookup(&e.name).and_then(|p| p.pattern.as_ref()) {
             if !tokenstash_core::validate::matches_pattern(pat, &cand.value)? {
-                println!("  {}@{}: skipped — the value does not look like a {} key (a paste would be refused too)", e.name, identity, cand.provider.clone().unwrap_or_default());
+                println!("  {}@{}: skipped because the value does not look like a {} key (a paste would be refused too)", e.name, identity, cand.provider.clone().unwrap_or_default());
                 continue;
             }
         }
@@ -413,7 +413,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
             // replacing a stash value is a per-key decision, and never a silent one
             let local = app.db.get_secret(&cand.name, &identity)?;
             if local.as_ref().map(|m| m.stale && m.stale_source.as_deref() == Some(tokenstash_core::db::STALE_ROTATE)).unwrap_or(false) {
-                println!("  {}@{}: skipped — you asked to rotate this key; paste the NEW one via `tokenstash rotate`, not an old env file", cand.name, identity);
+                println!("  {}@{}: skipped because you asked to rotate this key; paste the NEW one via `tokenstash rotate`, not an old env file", cand.name, identity);
                 continue;
             }
             print!("  {}@{} differs from the stash (stored {}); replace it with the value from {}? [y/N] ", cand.name, identity, local.map(|m| m.created).unwrap_or_default(), short(&cand.sources[0]));

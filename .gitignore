@@ -15,7 +15,7 @@ __pycache__/
 .codex/
 .agents/
 
-# internal, local-only planning docs — never publish
+# internal, local-only planning docs. Never publish them.
 /tokenstash.md
 /PRD.md
 

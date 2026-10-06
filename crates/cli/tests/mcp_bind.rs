@@ -1,5 +1,5 @@
 //! The MCP server serves one directory, decided once: the client's `roots` when offered
-//! and answered, else its cwd — never a tool argument — and refuses to serve from
+//! and answered, else its cwd, never a tool argument, and refuses to serve from
 //! directories that are not projects.
 
 use std::io::{BufRead, BufReader, Write};

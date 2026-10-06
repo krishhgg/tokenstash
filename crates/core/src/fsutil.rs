@@ -72,7 +72,7 @@ pub fn with_lock_elsewhere<T>(target: &Path, f: impl FnOnce() -> Result<T>) -> R
 /// Cross-process mutual exclusion for read-modify-write of a private file, via an OS
 /// advisory lock on a sibling `<name>.lock`. The kernel releases it when the holder exits
 /// or dies, so there is no stale-lock heuristic and a live (even suspended) holder is
-/// never preempted — contenders simply wait.
+/// never preempted. Contenders simply wait.
 pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let lock_path = path.with_extension("lock");
     let mut opts = fs::OpenOptions::new();

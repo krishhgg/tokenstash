@@ -198,7 +198,7 @@ pub fn trust(a: TrustArgs) -> Result<i32> {
     const NOTICE: &str = "trust roots are retired: the first time a directory asks for stored keys you approve exactly which ones (one card), and they are silent there afterwards. See `tokenstash workspaces`.";
     match a.cmd.unwrap_or(TrustCmd::List) {
         TrustCmd::Add { .. } => {
-            println!("nothing to add — {NOTICE}");
+            println!("nothing to add because {NOTICE}");
         }
         TrustCmd::Rm { path } => {
             let p = path.canonicalize().unwrap_or(path);
@@ -249,7 +249,7 @@ pub fn workspaces(a: WorkspacesArgs) -> Result<i32> {
         WorkspacesCmd::List => {
             let all = app.db.list_workspaces()?;
             if all.is_empty() {
-                println!("no paired directories yet — the first stored key a directory asks for pairs it (one card)");
+                println!("no paired directories yet. The first stored key a directory asks for pairs it (one card)");
                 return Ok(0);
             }
             for w in &all {
@@ -265,7 +265,7 @@ pub fn workspaces(a: WorkspacesArgs) -> Result<i32> {
             let Some(w) = app.db.find_workspace(&path)? else { bail!("{} is not a paired directory", path.display()) };
             let n = app.db.revoke_workspace(&w.id)?;
             app.db.audit(Some(&w.root), None, "workspace.revoke", None, None, Some(&format!("{n} grants")))?;
-            println!("✓ revoked {n} grant(s) for {} — values already in its env file stay there; its next request asks again", tokenstash_core::project::short(std::path::Path::new(&w.root)));
+            println!("✓ revoked {n} grant(s) for {}. Values already in its env file stay there; its next request asks again", tokenstash_core::project::short(std::path::Path::new(&w.root)));
         }
         WorkspacesCmd::Forget { path } => {
             let Some(w) = app.db.find_workspace(&path)? else { bail!("{} is not a paired directory", path.display()) };
@@ -378,7 +378,7 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
     let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, &identity)?;
     let links = util::Links::new(&app.cfg, crate::notify::ensure_inbox(&app.cfg));
     crate::notify::desktop(&app.cfg, &format!("Replace {}", a.name), "you asked to rotate it", &util::inbox_notice(&app.cfg, Some(&t.id), &links));
-    println!("⏳ {}@{identity} marked for rotation — task {} → {}", a.name, t.id, util::inbox_url_tty(&app.cfg, Some(&app.db), Some(&t.id), &links, util::Stream::Stdout));
+    println!("⏳ {}@{identity} marked for rotation, task {} → {}", a.name, t.id, util::inbox_url_tty(&app.cfg, Some(&app.db), Some(&t.id), &links, util::Stream::Stdout));
     println!("  paste the NEW key first; revoke the old one in the dashboard after it says stored");
     Ok(tokenstash_core::exit::PENDING)
 }
@@ -402,14 +402,14 @@ pub struct ReportBadArgs {
 /// counts from a project that received the key, and letting the caller name one would let a
 /// hostile repo borrow another project's standing. Always prints the same line whatever
 /// happened: the agent learns the outcome from its next `need` (card vs inject), never from
-/// here — otherwise this is a stash-existence oracle.
+/// here. Otherwise this is a stash-existence oracle.
 pub fn report_bad(a: ReportBadArgs) -> Result<i32> {
     let app = App::open()?;
     let project = tokenstash_core::project::current();
     let agent = util::agent_from(&None);
     let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
     let _ = tokenstash_core::tasks::report_bad(&app.ctx(), &project, &agent, &a.name, &identity, a.status)?;
-    println!("ok — run `tokenstash need {}` again; if the key is dead the user will be asked for a replacement", a.name);
+    println!("ok, run `tokenstash need {}` again; if the key is dead the user will be asked for a replacement", a.name);
     Ok(0)
 }
 
@@ -461,7 +461,7 @@ pub fn sweep(app: &App, names: &[String], stale_only: bool, print: bool) -> Resu
     sweep_where(app, Probe::Network, &|m| (names.is_empty() || names.contains(&m.name)) && (!stale_only || m.stale), print)
 }
 
-/// The sweep over exactly the (name, identity) pairs given — what `import` and
+/// The sweep over exactly the (name, identity) pairs given, which are what `import` and
 /// `--from-env` touched, and nothing else of the same name.
 pub fn sweep_pairs(app: &App, pairs: &[(String, String)], print: bool) -> Result<Vec<(String, String, String, bool)>> {
     sweep_where(app, Probe::Network, &|m| pairs.iter().any(|(n, i)| n == &m.name && i == &m.identity), print)
@@ -516,7 +516,7 @@ fn sweep_where(app: &App, probe: Probe, select: &dyn Fn(&tokenstash_core::db::Se
         println!("{:<36} {:<10} RESULT", "NAME", "IDENTITY");
         for (n, i, st, _) in &rows { println!("{n:<36} {i:<10} {st}"); }
         let stale = rows.iter().filter(|r| r.3).count();
-        if stale > 0 { println!("\n{stale} stale — the next `tokenstash need` for each asks for a replacement (or run `tokenstash rotate NAME`)"); }
+        if stale > 0 { println!("\n{stale} stale. The next `tokenstash need` for each asks for a replacement (or run `tokenstash rotate NAME`)"); }
     }
     Ok(rows)
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Thin launcher. The binary ships in a per-platform package selected by npm/bun/pnpm/yarn
-// through `optionalDependencies` + `os`/`cpu` — no lifecycle scripts, so package managers
+// through `optionalDependencies` + `os`/`cpu`, with no lifecycle scripts, so package managers
 // that refuse dependency postinstalls (bun, pnpm ≥ 10, `npm ci --ignore-scripts`) still
 // get a working install. TOKENSTASH_BINARY overrides (brew/cargo installs, tests).
 const path = require("path");

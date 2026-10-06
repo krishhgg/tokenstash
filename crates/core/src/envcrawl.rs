@@ -62,7 +62,7 @@ pub struct Candidate {
 pub struct Crawl {
     pub candidates: Vec<Candidate>,
     pub files_scanned: usize,
-    /// `path:line — reason`; never content.
+    /// A path or `path:line`, then the reason; never content.
     pub problems: Vec<String>,
 }
 
@@ -135,7 +135,7 @@ pub fn crawl(root: &Path) -> Crawl {
     let mut seen_files: std::collections::HashSet<PathBuf> = Default::default();
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { out.problems.push(format!("{} — unreadable directory", display_path(&dir))); continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else { out.problems.push(format!("{} is an unreadable directory", display_path(&dir))); continue };
         for entry in rd.flatten() {
             let path = entry.path();
             let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
@@ -144,24 +144,24 @@ pub fn crawl(root: &Path) -> Crawl {
             if md.is_dir() {
                 if !owned_by_me(&md) { continue; }
                 if SKIP_DIRS.contains(&fname.as_str()) { continue; }
-                if depth >= MAX_DEPTH { out.problems.push(format!("{} — deeper than {} levels, not scanned", display_path(&path), MAX_DEPTH)); continue; }
+                if depth >= MAX_DEPTH { out.problems.push(format!("{} is deeper than {} levels, not scanned", display_path(&path), MAX_DEPTH)); continue; }
                 stack.push((path, depth + 1));
                 continue;
             }
             if !md.is_file() || !is_env_file(&fname) { continue; }
-            if !owned_by_me(&md) { out.problems.push(format!("{} — not owned by you, skipped", display_path(&path))); continue; }
-            if md.len() > MAX_FILE_BYTES { out.problems.push(format!("{} — larger than {} bytes, skipped", display_path(&path), MAX_FILE_BYTES)); continue; }
+            if !owned_by_me(&md) { out.problems.push(format!("{} is not owned by you, skipped", display_path(&path))); continue; }
+            if md.len() > MAX_FILE_BYTES { out.problems.push(format!("{} is larger than {} bytes, skipped", display_path(&path), MAX_FILE_BYTES)); continue; }
             let canon = path.canonicalize().unwrap_or(path.clone());
             if !seen_files.insert(canon) { continue; }
             // A committed env file is a fixture or a plant, never the person's real secrets
             // (those are gitignored). Skip it and say so.
             if let Some(root) = crate::envfile::git_root(&dir) {
                 if crate::envfile::is_git_tracked(&root, &path) {
-                    out.problems.push(format!("{} — tracked by git, skipped (committed env files are fixtures or plants, not your secrets)", display_path(&path)));
+                    out.problems.push(format!("{} is tracked by git, skipped (committed env files are fixtures or plants, not your secrets)", display_path(&path)));
                     continue;
                 }
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { out.problems.push(format!("{} — not UTF-8 text, skipped", display_path(&path))); continue };
+            let Ok(text) = std::fs::read_to_string(&path) else { out.problems.push(format!("{} is not UTF-8 text, skipped", display_path(&path))); continue };
             let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_string();
             out.files_scanned += 1;
             let is_envrc = fname.starts_with(".envrc");
@@ -170,7 +170,7 @@ pub fn crawl(root: &Path) -> Crawl {
                 let Some((name, value)) = crate::envfile::parse_line(line) else { continue };
                 let Some((confidence, provider, sensitive)) = classify(&name, &value) else { continue };
                 if out.candidates.len() >= MAX_CANDIDATES {
-                    out.problems.push(format!("{}:{} — more than {} distinct values; the rest were not read", display_path(&path), i + 1, MAX_CANDIDATES));
+                    out.problems.push(format!("{}:{} has more than {} distinct values; the rest were not read", display_path(&path), i + 1, MAX_CANDIDATES));
                     break;
                 }
                 // One row per (value, registry name). The same value under two REGISTRY
@@ -207,7 +207,7 @@ pub fn crawl(root: &Path) -> Crawl {
             }
         }
     }
-    // deterministic order: registry first, then name, then the first source path — so the
+    // deterministic order: registry first, then name, then the first source path, so the
     // same tree always yields the same rows and the same identity numbering
     for c in &mut out.candidates { c.sources.sort(); }
     out.candidates.sort_by(|a, b| (a.confidence != Confidence::Registry).cmp(&(b.confidence != Confidence::Registry)).then(a.name.cmp(&b.name)).then(a.sources[0].cmp(&b.sources[0])));
@@ -230,7 +230,7 @@ pub fn identity_among(candidates: &[Candidate], idx: usize, default_identity: &s
 }
 
 /// Distinct values under one name in the same tree: ambiguity. Nothing is ticked by default
-/// for such a name — which one is the real key is the person's call.
+/// for such a name, because which one is the real key is the person's call.
 pub fn is_ambiguous(candidates: &[Candidate], idx: usize) -> bool {
     let name = &candidates[idx].name;
     candidates.iter().filter(|c| &c.name == name).count() > 1

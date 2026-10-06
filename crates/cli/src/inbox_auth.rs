@@ -7,7 +7,7 @@
 //! the port, and so can any web page the user happens to visit: a cross-origin `<form>`
 //! POST to `http://127.0.0.1:<port>/` is not blocked by CORS (the request is sent; only
 //! the *response* is hidden, and the attacker does not need the response). Without a
-//! credential, anything that can make an HTTP request can answer a task — which means it
+//! credential, anything that can make an HTTP request can answer a task, which means it
 //! can store a value of its choosing under a real key name and approve its own trust
 //! gates. The credentials below close that.
 //!
@@ -16,7 +16,7 @@
 //! - **The proof key** (`inbox.proof.key`, persistent) answers `/verify`. Before the CLI
 //!   reuses "something is listening on the inbox port", it has to know the listener is
 //!   *our* inbox for *this* `TOKENSTASH_HOME`. It must not find that out by sending a
-//!   credential — a hostile squatter on the port would simply collect it. Instead the CLI
+//!   credential, because a hostile squatter on the port would simply collect it. Instead the CLI
 //!   sends a fresh nonce and the server answers `HMAC-SHA256(proof, nonce)`: only a process
 //!   that already holds the proof key can produce it. The proof key is never put in a URL,
 //!   a cookie or a form field, so a link captured from a chat log, a notification tray or a
@@ -102,7 +102,7 @@ pub struct Tokens {
 
 impl Tokens {
     /// For a server that has just bound the port: a fresh session, and the two persistent
-    /// keys (created on first use). Only a process that owns the port may call this —
+    /// keys (created on first use). Only a process that owns the port may call this, because
     /// rotating the session from anywhere else would cut off the inbox that is serving.
     pub fn start() -> Result<Self> {
         let proof = ensure_proof_key()?;
@@ -123,7 +123,7 @@ impl Tokens {
 
     /// Classify a presented credential (cookie value, `?t=`, or CSRF field). The session is
     /// compared in constant time; a card credential is checked against the card it names,
-    /// which the caller looks up by exact id — nothing here is a prefix.
+    /// which the caller looks up by exact id. Nothing here is a prefix.
     pub fn scope_of(&self, presented: &str, lookup: impl FnOnce(&str) -> Option<Task>) -> Option<Scope> {
         if ct_eq(presented, &self.session) {
             return Some(Scope::Full);
@@ -441,7 +441,7 @@ mod tests {
         // A different challenge gives a different answer, so a recorded reply proves nothing.
         assert_ne!(verify_response(&proof, "n1"), verify_response(&proof, "n2"));
         // A different key gives a different answer, so another TOKENSTASH_HOME's inbox
-        // squatting the port fails the proof — and so does anyone holding only a session
+        // squatting the port fails the proof, and so does anyone holding only a session
         // token captured from a URL.
         assert_ne!(verify_response(&proof, "n1"), verify_response(&other, "n1"));
         // Deterministic: the prober can recompute it.

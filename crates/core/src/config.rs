@@ -26,7 +26,7 @@ pub struct Config {
     pub notifications: bool,
     /// Legacy. Agent-facing inbox links always carry a capability scoped to the one card the
     /// link is for; "full" used to make them carry the browser session and is now accepted
-    /// (so an old config still loads) but ignored with a warning — the full inbox is
+    /// (so an old config still loads) but ignored with a warning. The full inbox is
     /// `tokenstash open` or the desktop notification.
     #[serde(default = "default_links")]
     pub inbox_links: String,
