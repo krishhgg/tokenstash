@@ -272,18 +272,24 @@ fn original_entries(backup: &Path) -> Result<Vec<(String, String)>> {
     if name.ends_with(".toml") {
         let doc: toml_edit::DocumentMut = s.parse().map_err(|e| anyhow::anyhow!("{} does not parse: {e}", backup.display()))?;
         let Some(item) = doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).cloned() else { return Ok(vec![]) };
-        let mut snip = toml_edit::DocumentMut::new();
-        let mut t = toml_edit::Table::new();
-        t.set_implicit(true);
-        t.insert("tokenstash", item);
-        snip.insert("mcp_servers", toml_edit::Item::Table(t));
-        return Ok(vec![("mcp_servers".into(), snip.to_string())]);
+        return Ok(vec![("mcp_servers".into(), toml_snippet(item))]);
     }
     if name.ends_with(".json") {
         let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{} does not parse: {e}", backup.display()))?;
         return Ok(v.get("mcpServers").and_then(|m| m.get("tokenstash")).map(|e| ("mcpServers".into(), e.to_string())).into_iter().collect());
     }
     Ok(sections_of(&s).into_iter().map(|sec| ("section".into(), sec.to_string())).collect())
+}
+
+/// Codex's tokenstash entry as a TOML document holding just `[mcp_servers.tokenstash]`, so it
+/// can be put back later with its comments and formatting.
+fn toml_snippet(item: toml_edit::Item) -> String {
+    let mut snip = toml_edit::DocumentMut::new();
+    let mut t = toml_edit::Table::new();
+    t.set_implicit(true);
+    t.insert("tokenstash", item);
+    snip.insert("mcp_servers", toml_edit::Item::Table(t));
+    snip.to_string()
 }
 
 /// A marked section (marks included) holding exactly text a tokenstash release wrote.
@@ -759,6 +765,10 @@ impl Wiring {
     fn gemini(&self) -> PathBuf { self.home.join(".gemini") }
     /// Before 0.4: the explicit-mode command.
     fn gemini_command(&self) -> PathBuf { self.home.join(".gemini/commands/tokenstash.toml") }
+    /// Every shared config an MCP registration goes into, in the order init visits them.
+    fn mcp_configs(&self) -> [PathBuf; 4] {
+        [self.claude_json(), self.codex().join("config.toml"), self.cursor().join("mcp.json"), self.gemini().join("settings.json")]
+    }
 }
 
 /// Write a skill directory: SKILL.md, the reference files beside it, and, for the copy Codex
@@ -989,12 +999,7 @@ fn remove_toml_server(manifest: &mut Manifest, p: &Path) -> Result<()> {
         let mut doc = read_toml(p)?;
         let item = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()).and_then(|s| s.remove("tokenstash"));
         if let (Some(item), false) = (item, recorded) {
-            let mut snip = toml_edit::DocumentMut::new();
-            let mut t = toml_edit::Table::new();
-            t.set_implicit(true);
-            t.insert("tokenstash", item);
-            snip.insert("mcp_servers", toml_edit::Item::Table(t));
-            manifest.entries.push(Removed { file: p.to_path_buf(), key: "mcp_servers".into(), value: snip.to_string() });
+            manifest.entries.push(Removed { file: p.to_path_buf(), key: "mcp_servers".into(), value: toml_snippet(item) });
             manifest.save()?;
         }
         let out = doc.to_string();
@@ -1191,10 +1196,10 @@ pub fn apply_choice(mode: Option<AgentMode>, mcp: Option<bool>) -> Result<()> {
 
 /// [`apply_choice`] on a given machine. The setting is saved first and the agents rewired
 /// after. If the rewiring fails, the card goes back to pending for another try or a decline,
-/// so the setting goes back too and the agents are rewired for it. The skills return to the
-/// mode it names, and when the card changed the MCP setting, the registrations follow the
-/// restored one (an entry the failed run already took out is registered again). A card the
-/// person then declines has not changed how agents reach tokenstash.
+/// so the setting goes back too, and so does what the failed run changed. Each MCP config it
+/// reached gets its tokenstash entries back as they were ([`McpSnapshot`]), a config it never
+/// reached is not written, and the skills return to the restored mode. A card the person
+/// then declines has not changed how agents reach tokenstash.
 fn apply_choice_with(manifest: &mut Manifest, w: &Wiring, mode: Option<AgentMode>, mcp: Option<bool>) -> Result<()> {
     check_skill_home(w.ts_home.as_deref())?;
     let (before, chosen) = Config::update(|cfg| {
@@ -1213,12 +1218,15 @@ fn apply_choice_with(manifest: &mut Manifest, w: &Wiring, mode: Option<AgentMode
         }
         Ok((before, (cfg.agent_mode, cfg.mcp)))
     })?;
+    let snapshot = McpSnapshot::take(manifest, w);
     let Err(e) = wire(manifest, w, chosen.0, Some(chosen.1)) else { return Ok(()) };
     let back = match put_back_choice(before, chosen) {
         Ok(false) => return Err(e.context("the agents could not be rewired; the setting was changed again meanwhile and stays as it is now")),
-        // MCP registrations are touched only when the card changed that setting.
-        Ok(true) if before != chosen => wire(manifest, w, before.0, (before.1 != chosen.1).then_some(before.1)).map(|_| ()),
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            let mcp = snapshot.put_back(manifest);
+            let skills = if before.0 == chosen.0 { Ok(()) } else { wire(manifest, w, before.0, None).map(|_| ()) };
+            mcp.and(skills)
+        }
         Err(e2) => return Err(e.context(format!("the agents could not be rewired, and the setting could not be put back ({e2:#}); `tokenstash doctor` shows where it stands"))),
     };
     Err(match back {
@@ -1237,6 +1245,141 @@ fn put_back_choice(before: (AgentMode, bool), chosen: (AgentMode, bool)) -> Resu
         (cfg.agent_mode, cfg.mcp) = before;
         Ok(true)
     })
+}
+
+/// The tokenstash MCP entries one shared config holds, keyed the way [`Removed`] keys them:
+/// `mcpServers`, `projects/<path>` (`~/.claude.json` only) or `mcp_servers`.
+#[derive(Debug)]
+struct McpEntries {
+    existed: bool,
+    /// `~/.claude.json`, which also holds local-scope entries under `projects`.
+    claude: bool,
+    found: Vec<(String, serde_json::Value)>,
+    /// Codex's entry as [`toml_snippet`] writes it, so it goes back with its formatting.
+    toml: Option<String>,
+}
+
+impl McpEntries {
+    /// An unreadable or unparseable config is an error, not an empty one.
+    fn read(p: &Path, claude: bool) -> Result<Self> {
+        let existed = p.exists();
+        if p.file_name().is_some_and(|n| n == "config.toml") {
+            let toml = read_toml(p)?.get("mcp_servers").and_then(|m| m.get("tokenstash")).cloned().map(toml_snippet);
+            let found = mcp_entry(p)?.map(|e| ("mcp_servers".to_string(), e)).into_iter().collect();
+            return Ok(Self { existed, claude, found, toml });
+        }
+        let v = read_json(p)?;
+        let mut found: Vec<(String, serde_json::Value)> = v.get("mcpServers").and_then(|m| m.get("tokenstash")).map(|e| ("mcpServers".to_string(), e.clone())).into_iter().collect();
+        if claude {
+            if let Some(projects) = v.get("projects").and_then(|p| p.as_object()) {
+                found.extend(projects.iter().filter_map(|(path, proj)| proj.get("mcpServers").and_then(|m| m.get("tokenstash")).map(|e| (format!("projects/{path}"), e.clone()))));
+            }
+        }
+        Ok(Self { existed, claude, found, toml: None })
+    }
+
+    /// Make `p` hold exactly these tokenstash entries again, and leave everything else in it
+    /// alone. A config that did not exist and would hold nothing else is removed instead.
+    fn restore(&self, p: &Path) -> Result<()> {
+        let out = if p.file_name().is_some_and(|n| n == "config.toml") {
+            let mut doc = read_toml(p)?;
+            if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) {
+                servers.remove("tokenstash");
+            }
+            if let Some(snip) = &self.toml {
+                let snip: toml_edit::DocumentMut = snip.parse().map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
+                let item = snip.get("mcp_servers").and_then(|m| m.get("tokenstash")).cloned().ok_or_else(|| anyhow::anyhow!("the saved entry holds no mcp_servers.tokenstash"))?;
+                let Some(servers) = doc.entry("mcp_servers").or_insert(toml_edit::table()).as_table_like_mut() else { anyhow::bail!("mcp_servers is not a table") };
+                servers.insert("tokenstash", item);
+            }
+            let out = doc.to_string();
+            toml::from_str::<toml::Value>(&out).map_err(|e| anyhow::anyhow!("refusing to write: result would not parse ({e})"))?;
+            out
+        } else {
+            let mut v = read_json(p)?;
+            let root = v.as_object_mut().ok_or_else(|| anyhow::anyhow!("root is not a JSON object"))?;
+            if let Some(m) = root.get_mut("mcpServers").and_then(|s| s.as_object_mut()) { m.remove("tokenstash"); }
+            if self.claude {
+                for proj in root.get_mut("projects").and_then(|s| s.as_object_mut()).into_iter().flat_map(|ps| ps.values_mut()) {
+                    if let Some(m) = proj.get_mut("mcpServers").and_then(|s| s.as_object_mut()) { m.remove("tokenstash"); }
+                }
+            }
+            for (key, entry) in &self.found {
+                let scope = match key.strip_prefix("projects/") {
+                    Some(path) => root.entry("projects").or_insert(serde_json::json!({})).as_object_mut().ok_or_else(|| anyhow::anyhow!("projects is not an object"))?
+                        .entry(path).or_insert(serde_json::json!({})).as_object_mut().ok_or_else(|| anyhow::anyhow!("projects entry is not an object"))?,
+                    None => &mut *root,
+                };
+                let m = scope.entry("mcpServers").or_insert(serde_json::json!({})).as_object_mut().ok_or_else(|| anyhow::anyhow!("mcpServers is not an object"))?;
+                m.insert("tokenstash".into(), entry.clone());
+            }
+            serde_json::to_string_pretty(&v)?
+        };
+        if !self.existed && effectively_empty_text(p, &out) {
+            return remove_file_if_present(p);
+        }
+        write_file(p, out)
+    }
+}
+
+/// What a card's rewiring may change in the agents' MCP registrations, taken before it runs.
+/// That is each shared config's tokenstash entries and init's records of those configs. If
+/// the rewiring fails, [`McpSnapshot::put_back`] returns each config the failed run changed to
+/// this state, entry by entry, and writes nothing to a config whose entries are as they were.
+struct McpSnapshot {
+    /// `None` for a config that could not be read. The failed run stopped there or never got
+    /// that far, so it did not change it either.
+    configs: Vec<(PathBuf, Option<McpEntries>)>,
+    claude_json: PathBuf,
+    files: Vec<(PathBuf, Option<PathBuf>)>,
+    wrote: Vec<(PathBuf, serde_json::Value)>,
+    entries: Vec<Removed>,
+    claude_mcp_registered: bool,
+}
+
+impl McpSnapshot {
+    fn take(manifest: &Manifest, w: &Wiring) -> Self {
+        let configs = w.mcp_configs();
+        let ours = |p: &PathBuf| configs.contains(p);
+        Self {
+            configs: configs.iter().map(|p| (p.clone(), McpEntries::read(p, *p == w.claude_json()).ok())).collect(),
+            claude_json: w.claude_json(),
+            files: manifest.files.iter().filter(|(p, _)| ours(p)).cloned().collect(),
+            wrote: manifest.wrote.iter().filter(|(p, _)| ours(p)).cloned().collect(),
+            entries: manifest.entries.iter().filter(|e| ours(&e.file)).cloned().collect(),
+            claude_mcp_registered: manifest.claude_mcp_registered,
+        }
+    }
+
+    /// Put back each config whose tokenstash entries changed since the snapshot, and init's
+    /// records of it. A config that cannot be put back keeps the records that describe it now.
+    fn put_back(self, manifest: &mut Manifest) -> Result<()> {
+        let mut failed: Vec<(PathBuf, String)> = vec![];
+        for (p, then) in &self.configs {
+            let Some(then) = then else { continue };
+            if McpEntries::read(p, then.claude).is_ok_and(|now| now.found == then.found) {
+                continue;
+            }
+            if let Err(e) = then.restore(p) {
+                failed.push((p.clone(), format!("{}: {e:#}", p.display())));
+            }
+        }
+        let settled = |p: &Path| self.configs.iter().any(|(q, _)| q == p) && !failed.iter().any(|(q, _)| q == p);
+        manifest.files.retain(|(p, _)| !settled(p));
+        manifest.files.extend(self.files.iter().filter(|(p, _)| settled(p)).cloned());
+        manifest.wrote.retain(|(p, _)| !settled(p));
+        manifest.wrote.extend(self.wrote.iter().filter(|(p, _)| settled(p)).cloned());
+        manifest.entries.retain(|e| !settled(&e.file));
+        manifest.entries.extend(self.entries.iter().filter(|e| settled(&e.file)).cloned());
+        if settled(&self.claude_json) {
+            manifest.claude_mcp_registered = self.claude_mcp_registered;
+        }
+        manifest.save()?;
+        if failed.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!("the MCP registrations could not be put back in {}", failed.into_iter().map(|(_, e)| e).collect::<Vec<_>>().join("; "))
+    }
 }
 
 /// `init --undo` for a confirmed card. True when everything was put back.
@@ -2582,16 +2725,21 @@ mod tests {
     }
 
     /// Greptile on #74: a card turning the MCP server off takes Claude Code's entry out, then
-    /// stops at Codex's config, which cannot be read. The setting goes back to on, and so
-    /// does the entry already taken out, so a declined card leaves every agent connected.
+    /// stops at Codex's config, which cannot be read. The setting goes back to on, and so does
+    /// the entry already taken out. Cursor's entry, which the person edited and the run never
+    /// reached, stays byte for byte, and init's records come back, so undo still works.
     #[test]
-    fn a_failed_card_registers_again_what_it_took_out() {
+    fn a_failed_card_puts_back_only_what_it_took_out() {
         let _g = crate::inbox_auth::env_lock();
         let ts = scratch("card-mcp-fails-ts");
         std::env::set_var("TOKENSTASH_HOME", &ts);
         fs::write(ts.join("config.toml"), "mcp = true\n").unwrap();
         let (w, mut m) = machine("card-mcp-fails");
         wire(&mut m, &w, AgentMode::Auto, Some(true)).unwrap();
+        let cursor = "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/opt/tokenstash\",\"args\":[\"mcp\"],\"env\":{\"RUST_LOG\":\"debug\"}}}}";
+        write(&w.cursor().join("mcp.json"), cursor);
+        let gemini = read(&w.gemini().join("settings.json"));
+        let codex = read(&w.codex().join("config.toml"));
         let broken = "[mcp_servers.tokenstash\n";
         write(&w.codex().join("config.toml"), broken);
         let err = apply_choice_with(&mut m, &w, None, Some(false)).map_err(|e| format!("{e:#}"));
@@ -2601,7 +2749,43 @@ mod tests {
         assert!(err.contains("the setting is back to what it was") && err.contains("config.toml"), "{err}");
         assert!(after.mcp, "{after:?}");
         assert!(json_has_server(&w.claude_json(), true), "Claude Code's entry is back");
-        assert!(json_has_server(&w.cursor().join("mcp.json"), false) && json_has_server(&w.gemini().join("settings.json"), false));
+        assert_eq!(read(&w.cursor().join("mcp.json")), cursor, "never reached, so never written");
+        assert_eq!(read(&w.gemini().join("settings.json")), gemini);
         assert_eq!(read(&w.codex().join("config.toml")), broken, "left as found");
+        // Undo takes out init's entries, the one put back included, and keeps the edited one.
+        write(&w.codex().join("config.toml"), &codex);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        assert!(!w.claude_json().exists() && !w.codex().join("config.toml").exists() && !w.gemini().join("settings.json").exists());
+        assert_eq!(read(&w.cursor().join("mcp.json")), cursor);
+    }
+
+    /// Greptile on #74: a card turning the MCP server on, and with it auto mode, fails before
+    /// it registers anything, because the backup of a Codex policy file init replaced is gone.
+    /// The recovery takes out only what the run added, which is nothing. The person's own
+    /// registration in Cursor stays byte for byte, and the skills are explicit again.
+    #[test]
+    fn a_failed_card_turning_the_server_on_takes_out_nothing_it_did_not_add() {
+        let _g = crate::inbox_auth::env_lock();
+        let ts = scratch("card-mcp-on-fails-ts");
+        std::env::set_var("TOKENSTASH_HOME", &ts);
+        fs::write(ts.join("config.toml"), "agent_mode = \"explicit\"\n").unwrap();
+        let (w, mut m) = machine("card-mcp-on-fails");
+        let policy = w.agents_skill_dir().join(CODEX_POLICY);
+        write(&policy, "mine");
+        wire(&mut m, &w, AgentMode::Explicit, Some(false)).unwrap();
+        let backup = m.files.iter().find(|(p, _)| p == &policy).unwrap().1.clone().unwrap();
+        fs::remove_file(backup).unwrap();
+        let cursor = "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\",\"args\":[\"mcp\"]}}}";
+        write(&w.cursor().join("mcp.json"), cursor);
+        let err = apply_choice_with(&mut m, &w, Some(AgentMode::Auto), Some(true)).map_err(|e| format!("{e:#}"));
+        let after = Config::load().unwrap();
+        std::env::remove_var("TOKENSTASH_HOME");
+        let err = err.unwrap_err();
+        assert!(err.contains("the setting is back to what it was") && err.contains("missing"), "{err}");
+        assert!(after.agent_mode == AgentMode::Explicit && !after.mcp, "{after:?}");
+        assert_eq!(read(&w.cursor().join("mcp.json")), cursor);
+        assert!(!w.claude_json().exists() && !w.codex().join("config.toml").exists() && !w.gemini().join("settings.json").exists());
+        assert!(read(&w.claude_skill_dir().join("SKILL.md")).contains("disable-model-invocation: true"));
+        assert_eq!(read(&policy), CODEX_EXPLICIT);
     }
 }
