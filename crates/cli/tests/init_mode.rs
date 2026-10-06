@@ -7,7 +7,7 @@ mod common;
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const SKILL_MD: &str = include_str!("../skill/SKILL.md");
 
@@ -151,7 +151,7 @@ fn a_plain_init_refuses_a_home_that_could_add_skill_instructions() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_person_switches_modes_and_undoes_on_a_scratch_home() {
-    if !Command::new("script").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false) {
+    if !std::process::Command::new("script").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false) {
         eprintln!("skipped: util-linux `script` not available");
         return;
     }
@@ -174,7 +174,7 @@ fn a_person_switches_modes_and_undoes_on_a_scratch_home() {
     }
     let proj = tmp("pty-proj");
     let person = |args: &str| -> String {
-        let o = Command::new("script").args(["-qec", &format!("tokenstash {args}"), "/dev/null"])
+        let o = std::process::Command::new("script").args(["-qec", &format!("tokenstash {args}"), "/dev/null"])
             .current_dir(&proj).env_clear()
             .env("HOME", &user_home).env("PATH", &path).env("XDG_CONFIG_HOME", user_home.join(".config"))
             .env("TOKENSTASH_HOME", &ts_home).env("TOKENSTASH_STASH", "insecure-file")

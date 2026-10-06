@@ -1,6 +1,6 @@
 //! Localhost inbox: the human surface. One click from the notification to the vendor's page,
 //! paste, submit. Binds 127.0.0.1 only. Exits after 30 idle minutes with no open tasks, and
-//! once its home or the database in it is deleted.
+//! once its home or the database in it is deleted or made again.
 //!
 //! Loopback is not authentication. See `crate::inbox_auth` for the threat model. Every route
 //! except `/verify` requires a credential: the browser session (full scope) or one card's
@@ -69,6 +69,9 @@ pub struct InboxArgs {
 }
 
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
+/// How often the inbox checks that its home is still there and, in a debug build, that the
+/// process named by `TOKENSTASH_EXIT_WITH` is still running.
+const CHECK_EVERY: Duration = Duration::from_secs(1);
 
 /// Cap on a form post. Answers are pasted API keys, not uploads. Judged on the declared
 /// `Content-Length` before any of the body is read.
@@ -124,11 +127,15 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     // directory goes away.
     let (home, db) = (tokenstash_core::config::config_dir(), tokenstash_core::config::db_path());
     let (home, db) = (std::path::absolute(&home).unwrap_or(home), std::path::absolute(&db).unwrap_or(db));
+    // The database this inbox opened stands for its home. This process holds it open, so a
+    // database made in its place after a delete cannot get the same inode.
+    let opened = file_id(&db);
     let exit_with = exit_with();
     let (req_tx, requests) = mpsc::sync_channel::<Request>(READERS);
     spawn_readers(listener, false, req_tx.clone(), None);
     let mut tailnet_bound = None;
     let mut last_activity = Instant::now();
+    let mut last_check = Instant::now();
     loop {
         listen_tailnet(port, &mut tailnet_bound, &req_tx);
         match requests.recv_timeout(Duration::from_secs(1)) {
@@ -139,18 +146,6 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                // With the home or its database deleted there is nothing left to serve, and
-                // the port is better free: this inbox answers /verify with the proof key it
-                // read at start, so the next `need` in a recreated home would find it foreign
-                // and hand out no links. This holds with --keep too.
-                if !home.is_dir() || !db.is_file() {
-                    eprintln!("inbox: {} or its database is gone, exiting", home.display());
-                    return Ok(0);
-                }
-                if let Some(pid) = exit_with.filter(|&pid| !process_alive(pid)) {
-                    eprintln!("inbox: process {pid} has ended, exiting");
-                    return Ok(0);
-                }
                 if !a.keep && last_activity.elapsed() > IDLE_EXIT {
                     let _ = app.db.expire_overdue();
                     if app.db.list_tasks(None, true).map(|v| v.is_empty()).unwrap_or(true) {
@@ -161,7 +156,38 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
             }
             Err(RecvTimeoutError::Disconnected) => { eprintln!("inbox: the listener stopped"); return Ok(1); }
         }
+        // Once a second whether requests arrive or not, so a client asking more often than
+        // that cannot keep alive an inbox that should have gone.
+        if last_check.elapsed() >= CHECK_EVERY {
+            last_check = Instant::now();
+            // With the home deleted, or deleted and made again, this inbox has nothing left
+            // to serve, and the port is better free: it answers /verify with the proof key it
+            // read at start, so a `need` in a new home would find it foreign and hand out no
+            // links. This holds with --keep too.
+            let current = file_id(&db);
+            if !home.is_dir() || current.is_none() || current != opened {
+                eprintln!("inbox: {} was deleted or replaced, exiting", home.display());
+                return Ok(0);
+            }
+            if let Some(pid) = exit_with.filter(|&pid| !process_alive(pid)) {
+                eprintln!("inbox: process {pid} has ended, exiting");
+                return Ok(0);
+            }
+        }
     }
+}
+
+/// The file at `path`, as its device and inode. `None` when there is none.
+#[cfg(unix)]
+fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Without inodes, only whether there is a file at `path`.
+#[cfg(not(unix))]
+fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path).ok().map(|_| (0, 0))
 }
 
 /// The process this inbox ends with, from `TOKENSTASH_EXIT_WITH=<pid>`. Debug builds only;
