@@ -65,6 +65,9 @@ $SHA /dev/null >/dev/null 2>&1 || { echo "needs sha256sum, gsha256sum or shasum"
 # The scratch stash is a file from the very first tokenstash call: `init` must not probe the
 # developer's keyring on the way to choosing a backend.
 export TOKENSTASH_STASH=insecure-file
+# In a debug build, every inbox this run starts exits once this script has, including one a
+# `need` starts in the background. Release builds ignore the variable.
+export TOKENSTASH_EXIT_WITH=$$
 if grep -qs tokenstash "$HOME/.cursor/mcp.json"; then
     echo "note: ~/.cursor/mcp.json registers tokenstash globally; the project-local .cursor/mcp.json this suite writes has answered in every run so far, and the scenario grades (audit rows in the scratch home) would show if it did not" >&2
 fi

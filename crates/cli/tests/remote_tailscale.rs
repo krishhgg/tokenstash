@@ -6,6 +6,8 @@
 //! the address a request comes from.
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -52,7 +54,7 @@ struct World { home: PathBuf, proj: PathBuf, port: u16, tailscale: PathBuf }
 
 impl World {
     fn cmd(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tokenstash"));
+        let mut c = common::tokenstash();
         c.env("TOKENSTASH_HOME", &self.home).env("TOKENSTASH_STASH", "insecure-file").env("TOKENSTASH_TAILSCALE", &self.tailscale)
             .env("HOME", self.home.join("user-home")).env("XDG_CONFIG_HOME", self.home.join("user-home/.config"))
             .env_remove("CLAUDECODE").env_remove("TOKENSTASH_AGENT");

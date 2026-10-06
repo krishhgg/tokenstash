@@ -2,10 +2,12 @@
 //! and answered, else its cwd, never a tool argument, and refuses to serve from
 //! directories that are not projects.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
@@ -41,7 +43,7 @@ struct Client {
 impl Client {
     fn start(home: &Path, cwd: &Path, roots_capability: bool) -> Client {
         let log = home.join(format!("mcp-{}.log", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tokenstash"))
+        let mut child = common::tokenstash()
             .arg("mcp")
             .current_dir(cwd)
             .env("TOKENSTASH_HOME", home)
@@ -289,14 +291,14 @@ fn secrets_list_shows_only_what_this_directory_holds() {
     let home = home("home-list");
     let proj = tmp("proj-list");
     // a key in the stash that this directory never received
-    let seed = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["need", "GROQ_API_KEY", "--agent", "seed"]).current_dir(&proj)
+    let seed = common::tokenstash().args(["need", "GROQ_API_KEY", "--agent", "seed"]).current_dir(&proj)
         .env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE").output().unwrap();
     let _ = seed;
     // Seeded from the project directory: `tasks --all` and answering another directory's
     // card are a person's, and the seed is an agent-shaped process.
-    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["tasks", "--json"]).current_dir(&proj).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
+    let tasks = common::tokenstash().args(["tasks", "--json"]).current_dir(&proj).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     let tid = serde_json::from_slice::<serde_json::Value>(&tasks.stdout).unwrap().as_array().unwrap().iter().find(|t| t["name"] == "GROQ_API_KEY").unwrap()["id"].as_str().unwrap().to_string();
-    let mut ans = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["answer", &tid, "--stdin", "--skip-check"]).current_dir(&proj).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut ans = common::tokenstash().args(["answer", &tid, "--stdin", "--skip-check"]).current_dir(&proj).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     ans.stdin.take().unwrap().write_all(b"gsk_aaaaaaaaaaaaaaaaaaaa\n").unwrap();
     assert!(ans.wait().unwrap().success());
     // the directory that pasted it lists it; another directory lists nothing

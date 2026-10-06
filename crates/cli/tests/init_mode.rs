@@ -3,6 +3,8 @@
 //! MCP server and undoing refuse (the human gate), while a plain `init` still installs the
 //! skill. On Linux, a pty run switches a scratch home between the modes, turns the server on
 //! and off, and backs out with `--undo`, the way a person at a terminal would.
+mod common;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,7 +35,7 @@ fn home(name: &str) -> PathBuf {
 fn run(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
     let user_home = home.join("user-home");
     std::fs::create_dir_all(&user_home).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(args).current_dir(cwd)
+    common::tokenstash().args(args).current_dir(cwd)
         .env("HOME", &user_home).env("XDG_CONFIG_HOME", user_home.join(".config"))
         .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
         .stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
@@ -176,6 +178,7 @@ fn a_person_switches_modes_and_undoes_on_a_scratch_home() {
             .current_dir(&proj).env_clear()
             .env("HOME", &user_home).env("PATH", &path).env("XDG_CONFIG_HOME", user_home.join(".config"))
             .env("TOKENSTASH_HOME", &ts_home).env("TOKENSTASH_STASH", "insecure-file")
+            .env("TOKENSTASH_EXIT_WITH", std::process::id().to_string())
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap();
         assert!(o.status.success(), "tokenstash {args}: {}{}", out(&o), err(&o));
         out(&o)

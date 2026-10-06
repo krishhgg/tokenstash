@@ -9,12 +9,14 @@
 //! mints there are throwaways. The child is killed when the test's guard drops, including
 //! on a panic.
 
+mod common;
+
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 /// The whole-request deadline plus the per-wait timeout the inbox documents.
@@ -50,7 +52,7 @@ impl Inbox {
         let home = tmp(&format!("home-{name}"));
         let port = free_port();
         std::fs::write(home.join("config.toml"), format!("notifications = false\ninbox_port = {port}\nstash_backend = \"insecure-file\"\nverify_every = \"never\"\n")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_tokenstash"))
+        let child = common::tokenstash()
             .args(["inbox", "--port", &port.to_string()])
             .env("TOKENSTASH_HOME", &home)
             .env("TOKENSTASH_STASH", "insecure-file")
@@ -127,7 +129,7 @@ impl Inbox {
     }
 
     fn cli(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(args).current_dir(cwd)
+        common::tokenstash().args(args).current_dir(cwd)
             .env("TOKENSTASH_HOME", &self.home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
     }

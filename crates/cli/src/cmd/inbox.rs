@@ -1,5 +1,6 @@
 //! Localhost inbox: the human surface. One click from the notification to the vendor's page,
-//! paste, submit. Binds 127.0.0.1 only. Exits after 30 idle minutes with no open tasks.
+//! paste, submit. Binds 127.0.0.1 only. Exits after 30 idle minutes with no open tasks, and
+//! once its home or the database in it is deleted.
 //!
 //! Loopback is not authentication. See `crate::inbox_auth` for the threat model. Every route
 //! except `/verify` requires a credential: the browser session (full scope) or one card's
@@ -62,7 +63,7 @@ use tokenstash_core::tasks::{self, Actor, AnswerResult};
 pub struct InboxArgs {
     #[arg(long)]
     pub port: Option<u16>,
-    /// Never auto-exit.
+    /// Stay up when idle. The inbox still exits once its home is deleted.
     #[arg(long)]
     pub keep: bool,
 }
@@ -119,6 +120,11 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
         }
     };
     eprintln!("tokenstash inbox → http://127.0.0.1:{port}/");
+    // Absolute, so a relative TOKENSTASH_HOME still names the same place if the working
+    // directory goes away.
+    let (home, db) = (tokenstash_core::config::config_dir(), tokenstash_core::config::db_path());
+    let (home, db) = (std::path::absolute(&home).unwrap_or(home), std::path::absolute(&db).unwrap_or(db));
+    let exit_with = exit_with();
     let (req_tx, requests) = mpsc::sync_channel::<Request>(READERS);
     spawn_readers(listener, false, req_tx.clone(), None);
     let mut tailnet_bound = None;
@@ -133,6 +139,18 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                // With the home or its database deleted there is nothing left to serve, and
+                // the port is better free: this inbox answers /verify with the proof key it
+                // read at start, so the next `need` in a recreated home would find it foreign
+                // and hand out no links. This holds with --keep too.
+                if !home.is_dir() || !db.is_file() {
+                    eprintln!("inbox: {} or its database is gone, exiting", home.display());
+                    return Ok(0);
+                }
+                if let Some(pid) = exit_with.filter(|&pid| !process_alive(pid)) {
+                    eprintln!("inbox: process {pid} has ended, exiting");
+                    return Ok(0);
+                }
                 if !a.keep && last_activity.elapsed() > IDLE_EXIT {
                     let _ = app.db.expire_overdue();
                     if app.db.list_tasks(None, true).map(|v| v.is_empty()).unwrap_or(true) {
@@ -144,6 +162,39 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
             Err(RecvTimeoutError::Disconnected) => { eprintln!("inbox: the listener stopped"); return Ok(1); }
         }
     }
+}
+
+/// The process this inbox ends with, from `TOKENSTASH_EXIT_WITH=<pid>`. Debug builds only;
+/// release builds never read it. The test suites and scripts set it to their own pid, and
+/// `ensure_inbox` passes its environment to the inbox it starts, so an inbox that a test's
+/// `need` started ends with the test. Without it that inbox waits for its open cards, and no
+/// test answers them all.
+fn exit_with() -> Option<u32> {
+    #[cfg(debug_assertions)]
+    if let Some(pid) = std::env::var("TOKENSTASH_EXIT_WITH").ok().and_then(|p| p.trim().parse().ok()).filter(|&p| p != 0) {
+        return Some(pid);
+    }
+    None
+}
+
+/// Whether process `pid` is still running. When this cannot tell, it says yes.
+fn process_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") && std::path::Path::new("/proc/self/stat").exists() {
+        // A zombie keeps its /proc entry until it is reaped, but it has ended. The state
+        // letter follows the command name, which is in parentheses and may contain any byte.
+        return match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+            Err(e) => e.kind() != ErrorKind::NotFound,
+        };
+    }
+    // Elsewhere `kill -0`. It sends no signal, and fails when there is no such process or the
+    // process belongs to another user, which a test's own process never does.
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
 }
 
 fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
@@ -1172,6 +1223,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         assert!(link.starts_with(&format!("http://127.0.0.1:{port}/t/t_abc")), "{link}");
         assert!(tailnet.starts_with("http://box.tail1234.ts.net:"), "the listener passes the proof: {tailnet}");
+    }
+
+    /// A process counts as ended once it has exited. On Linux that includes a zombie its
+    /// parent has not reaped yet; `kill -0` elsewhere still finds a zombie.
+    #[test]
+    fn process_alive_follows_a_child_process() {
+        assert!(process_alive(std::process::id()));
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        assert!(process_alive(pid));
+        child.kill().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let until = Instant::now() + Duration::from_secs(5);
+            while process_alive(pid) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!process_alive(pid), "a zombie counts as ended");
+        }
+        child.wait().unwrap();
+        assert!(!process_alive(pid));
     }
 
     #[test]

@@ -2,10 +2,12 @@
 //! context: a value must never appear there, and one project's cards must never be visible
 //! from another. Malformed framing is answered, never fatal.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
@@ -33,7 +35,7 @@ struct Client { child: Child, stdin: ChildStdin, lines: Receiver<String> }
 
 impl Client {
     fn start(home: &Path, cwd: &Path) -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tokenstash"))
+        let mut child = common::tokenstash()
             .arg("mcp").current_dir(cwd)
             .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file")
             .env_remove("CLAUDECODE")
@@ -76,15 +78,15 @@ impl Drop for Client {
 
 /// Seed a stashed value the way a human would: file a card, answer it from the CLI.
 fn seed(home: &Path, proj: &Path, name: &str, value: &str) {
-    let out = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("need").arg(name)
+    let out = common::tokenstash().arg("need").arg(name)
         .current_dir(proj).env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file")
         .output().unwrap();
     assert!(out.status.code() == Some(10), "a first request is pending: {out:?}");
-    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("tasks").arg("--json")
+    let tasks = common::tokenstash().arg("tasks").arg("--json")
         .current_dir(proj).env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&tasks.stdout).unwrap();
     let id = v.as_array().unwrap().iter().find(|t| t["name"] == serde_json::json!(name)).expect("a card for the key")["id"].as_str().unwrap().to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("answer").arg(&id).arg("--stdin").arg("--skip-check")
+    let mut child = common::tokenstash().arg("answer").arg(&id).arg("--stdin").arg("--skip-check")
         .current_dir(proj).env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file")
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     child.stdin.as_mut().unwrap().write_all(format!("{value}\n").as_bytes()).unwrap();
@@ -128,10 +130,10 @@ fn task_check_never_answers_for_another_project() {
     let theirs = tmp("scope-theirs");
     seed(&home, &theirs, "RESEND_API_KEY", "re_theirs_00000000000000");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("need").arg("OPENAI_API_KEY")
+    let out = common::tokenstash().arg("need").arg("OPENAI_API_KEY")
         .current_dir(&theirs).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     assert_eq!(out.status.code(), Some(10));
-    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("tasks").arg("--json")
+    let tasks = common::tokenstash().arg("tasks").arg("--json")
         .current_dir(&theirs).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&tasks.stdout).unwrap();
     let their_id = v.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();

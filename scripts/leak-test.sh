@@ -20,6 +20,9 @@ HUMAN_ENV=(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX
 human() { "${HUMAN_ENV[@]}" script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING: using insecure-file/d'; }
 export TOKENSTASH_HOME="$(mktemp -d)"
 export TOKENSTASH_STASH=insecure-file
+# In a debug build, every inbox this run starts exits once this script has, including one a
+# `need` starts in the background. Release builds ignore the variable.
+export TOKENSTASH_EXIT_WITH=$$
 PROJ="$(mktemp -d)"; cd "$PROJ"; git init -q .
 OUT="$(mktemp -d)"
 # Browser-facing responses legitimately contain the inbox session (the hidden CSRF field),

@@ -5,6 +5,8 @@
 //! Every process started here is a child of the test and is killed when the test ends; the
 //! inbox is started by the test first so that `need` finds it and spawns nothing detached.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::net::TcpListener;
@@ -32,7 +34,7 @@ fn home(name: &str, port: u16) -> PathBuf {
 }
 
 fn bin() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tokenstash"));
+    let mut c = common::tokenstash();
     c.env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE").env_remove("TOKENSTASH_AGENT");
     c
 }

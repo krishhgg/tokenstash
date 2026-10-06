@@ -1,9 +1,11 @@
 //! `run` forwards the child's output to the agent through a redactor seeded with the values it
 //! injected. The child's output reaches that redactor one line at a time, so a multi-line value
 //! (a PEM key, a service-account JSON) has to be masked line by line too.
+mod common;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn tmp(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("tokenstash-runredact-{}-{}", name, std::process::id()));
@@ -25,7 +27,7 @@ fn home(name: &str) -> PathBuf {
 
 /// `tokenstash run -- sh -c SCRIPT` in `proj`, with `extra_env` set on tokenstash itself.
 fn run_sh(home: &Path, proj: &Path, script: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["run", "--", "sh", "-c", script]).current_dir(proj)
+    common::tokenstash().args(["run", "--", "sh", "-c", script]).current_dir(proj)
         .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
         .envs(extra_env.iter().copied())
         .stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()

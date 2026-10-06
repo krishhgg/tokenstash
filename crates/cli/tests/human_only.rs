@@ -1,9 +1,11 @@
 //! The commands that widen an agent's reach refuse when they cannot see a person: stdout is
 //! a pipe here, which is what an agent's shell looks like.
+mod common;
+
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn tmp(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("tokenstash-human-{}-{}", name, std::process::id()));
@@ -34,7 +36,7 @@ fn home(name: &str) -> PathBuf {
 fn run(home: &PathBuf, cwd: &PathBuf, args: &[&str]) -> std::process::Output {
     let user_home = home.join("user-home");
     std::fs::create_dir_all(&user_home).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(args).current_dir(cwd)
+    common::tokenstash().args(args).current_dir(cwd)
         .env("HOME", &user_home).env("XDG_CONFIG_HOME", user_home.join(".config"))
         .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
         .stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
@@ -58,7 +60,7 @@ fn widening_commands_refuse_a_pipe() {
 
 /// Paste a value into this directory's own card from a pipe, as an agent may.
 fn paste(home: &PathBuf, cwd: &PathBuf, id: &str, value: &str) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["answer", id, "--stdin", "--skip-check"]).current_dir(cwd)
+    let mut child = common::tokenstash().args(["answer", id, "--stdin", "--skip-check"]).current_dir(cwd)
         .env("HOME", home.join("user-home")).env("XDG_CONFIG_HOME", home.join("user-home/.config"))
         .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -244,7 +246,7 @@ fn an_agent_cannot_answer_another_directorys_card() {
     for (cwd, extra) in [(&mine, vec!["--stdin", "--skip-check"]), (&mine, vec!["--deny"])] {
         let mut args = vec!["answer", id.as_str()];
         args.extend(extra);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(&args).current_dir(cwd)
+        let mut child = common::tokenstash().args(&args).current_dir(cwd)
             .env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         child.stdin.take().unwrap().write_all(b"sk-proj-not-mine-0123456789abcdef0123456789\n").unwrap();
