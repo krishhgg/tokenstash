@@ -1,6 +1,6 @@
 {
   "name": "tokenstash",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Credential broker for coding agents: paste a key once, approve each directory, keep secrets out of status output.",
   "bin": { "tokenstash": "bin/tokenstash.js" },
   "files": ["bin", "README.md", "LICENSE"],
@@ -10,9 +10,9 @@
   "keywords": ["api-keys", "secrets", "agents", "claude-code", "codex", "cursor", "mcp"],
   "engines": { "node": ">=18" },
   "optionalDependencies": {
-    "tokenstash-darwin-arm64": "0.3.0",
-    "tokenstash-darwin-x64": "0.3.0",
-    "tokenstash-linux-arm64": "0.3.0",
-    "tokenstash-linux-x64": "0.3.0"
+    "tokenstash-darwin-arm64": "0.4.0",
+    "tokenstash-darwin-x64": "0.4.0",
+    "tokenstash-linux-arm64": "0.4.0",
+    "tokenstash-linux-x64": "0.4.0"
   }
 }
