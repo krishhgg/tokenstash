@@ -103,7 +103,7 @@ pub fn open(cfg: &crate::Config) -> Result<Box<dyn Stash>> {
         .unwrap_or_else(|| "auto".into());
     match backend.as_str() {
         "insecure-file" => {
-            eprintln!("tokenstash: WARNING, using insecure-file stash (plaintext, 0600). For CI/tests only.");
+            eprintln!("tokenstash: WARNING: using insecure-file stash (plaintext, 0600). For CI/tests only.");
             Ok(Box::new(FileStash::new()?))
         }
         "keyring" => Ok(Box::new(KeyringStash::os_store()?)),

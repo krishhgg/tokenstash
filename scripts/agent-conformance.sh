@@ -42,7 +42,7 @@ TS=$(cd "$(dirname "$TS")" && pwd)/$(basename "$TS")
 # as the person running the suite, under a pseudo-terminal with the agent markers cleared.
 human() {
   env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
-    script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING, using insecure-file/d'
+    script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING: using insecure-file/d'
 }
 # what `current_exe` reports for a respawned inbox: the fully resolved path
 TS_REAL=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$TS")

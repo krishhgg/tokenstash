@@ -899,7 +899,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         } else {
             match manifest.mutate_entry(&cj, || merge_mcp_json_typed(&cj, &w.exe, true, w.ts_home.as_deref())) {
                 Ok(()) => { touched.push(cj); true }
-                Err(e) => { println!("! Claude Code: left {} untouched, {e}", cj.display()); false }
+                Err(e) => { println!("! Claude Code: left {} untouched. {e}", cj.display()); false }
             }
         };
         if added {
@@ -913,7 +913,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         let ctoml = codex.join("config.toml");
         match manifest.mutate_entry(&ctoml, || merge_codex_toml(&ctoml, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(ctoml.clone()); println!("✓ Codex: MCP server registered ({})", ctoml.display()) }
-            Err(e) => println!("! Codex: left {} untouched, {e}", ctoml.display()),
+            Err(e) => println!("! Codex: left {} untouched. {e}", ctoml.display()),
         }
     }
     let cursor = w.cursor();
@@ -921,7 +921,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         let cj = cursor.join("mcp.json");
         match manifest.mutate_entry(&cj, || merge_mcp_json(&cj, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(cj.clone()); println!("✓ Cursor: MCP server registered ({})", cj.display()) }
-            Err(e) => println!("! Cursor: left {} untouched, {e}", cj.display()),
+            Err(e) => println!("! Cursor: left {} untouched. {e}", cj.display()),
         }
     }
     let gemini = w.gemini();
@@ -929,7 +929,7 @@ fn register_mcp(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
         let gj = gemini.join("settings.json");
         match manifest.mutate_entry(&gj, || merge_mcp_json(&gj, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => { touched.push(gj.clone()); println!("✓ Gemini CLI: MCP server registered ({})", gj.display()) }
-            Err(e) => println!("! Gemini CLI: left {} untouched, {e}", gj.display()),
+            Err(e) => println!("! Gemini CLI: left {} untouched. {e}", gj.display()),
         }
     }
     Ok(touched)

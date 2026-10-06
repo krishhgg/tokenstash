@@ -17,7 +17,7 @@ command -v script >/dev/null || { echo "leak test: needs script(1) from util-lin
 HUMAN_ENV=(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT)
 # The insecure-file warning goes to stderr, which `script` folds into stdout; drop it so a
 # JSON reader sees JSON. `sed` (not `grep -v`) so an empty result is not a failure.
-human() { "${HUMAN_ENV[@]}" script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING, using insecure-file/d'; }
+human() { "${HUMAN_ENV[@]}" script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING: using insecure-file/d'; }
 export TOKENSTASH_HOME="$(mktemp -d)"
 export TOKENSTASH_STASH=insecure-file
 PROJ="$(mktemp -d)"; cd "$PROJ"; git init -q .
