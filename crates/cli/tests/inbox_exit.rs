@@ -91,14 +91,20 @@ impl World {
         reply.starts_with(b"HTTP/1.1 ")
     }
 
-    /// True once nothing answers on the inbox's port, within [`EXIT_WITHIN`]. Asks every
-    /// 100 ms, so the inbox is never a second without a request: an exit check that waits
-    /// for an idle second would never run.
+    /// True once the inbox's port refuses connections, within [`EXIT_WITHIN`]. A reply that
+    /// fails or stalls does not count, since only a refused connection shows the port was let
+    /// go. It sends a request every 100 ms, so the inbox is never a second without one, and an
+    /// exit check that waited for an idle second would never run.
     fn inbox_exits(&self) -> bool {
         let started = Instant::now();
         while started.elapsed() < EXIT_WITHIN {
-            if !self.answers() {
-                return true;
+            match TcpStream::connect_timeout(&self.addr(), Duration::from_millis(200)) {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return true,
+                Err(_) => {}
+                Ok(probe) => {
+                    drop(probe);
+                    let _ = self.answers();
+                }
             }
             std::thread::sleep(Duration::from_millis(100));
         }
