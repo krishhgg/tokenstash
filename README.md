@@ -82,7 +82,7 @@ When code needs a key, the agent runs `tokenstash need OPENAI_API_KEY`. One of t
 - **Approval is per folder, and you choose how wide it goes.** The first time a folder asks for keys you already have, the card offers three answers. **Allow these** covers only the listed keys. **Allow these + any non-sensitive key here** also covers keys tokenstash knows and rates as non-sensitive, now and later. **Deny** says no, and tokenstash remembers that for 24 hours by default.
 - **Sensitive keys always ask.** Live Stripe secret keys, AWS credentials, deploy and package-registry tokens, and any key tokenstash doesn't recognise get their own approval in each folder. The broad answer never covers them.
 - **Local secrets are generated, not asked for.** tokenstash creates `AUTH_SECRET`, `JWT_SECRET`, `SESSION_SECRET` and similar values itself, one per folder.
-- **Keys are re-checked with the provider.** Before it hands over a key whose provider offers a free check, tokenstash asks the provider whether the key still works, at most once a day by default. A rejected key becomes a Replace card, so you paste a new one before your code gets a 401, the error a provider returns for a bad key. If the provider can't be reached, the key goes out unchecked.
+- **Keys are re-checked with the provider.** When a provider's check is safe to run unattended, tokenstash asks the provider whether the key still works before it hands the key over, at most once a day by default. A rejected key becomes a Replace card, so you paste a new one before your code gets a 401, the error a provider returns for a bad key. A key whose check is not safe to run unattended is checked only when you paste it. If the provider can't be reached, the key goes out unchecked.
 
 ## Where your key goes
 
