@@ -11,15 +11,15 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with: { toolchain: stable, components: clippy }
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --locked
       # The npm release script against a mock registry and a fake `npm`, with the node and npm
       # the `npm` job publishes with (keep the two in step). It runs before the draft release
       # exists, so a failure here stops every publish step below.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22 }
       - run: npm install -g npm@11.17.0 && npm --version
       - run: scripts/npm-package-test.sh
@@ -63,7 +63,7 @@ jobs:
     permissions: { contents: write, id-token: write, attestations: write }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with: { toolchain: stable, targets: "${{ matrix.target }}" }
       - if: matrix.musl
         # musl-tools installs <arch>-linux-musl-gcc; name it explicitly so cc-rs (bundled
@@ -101,7 +101,7 @@ jobs:
       # The same bytes, kept inside this run. Release assets are mutable by anyone holding
       # contents: write, so publishing from them would let a clobber in the window between
       # this upload and the npm/PyPI download ship an attacker's binary under our provenance.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: "binary-${{ matrix.name }}", path: "tokenstash-${{ matrix.name }}.tar.gz*", retention-days: 7 }
   npm:
     # Five packages: four platform packages (binary only, `os`/`cpu` pinned, no scripts) and
@@ -121,11 +121,11 @@ jobs:
     permissions: { contents: read, id-token: write }   # publishes; never writes to the repo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22 }   # no registry-url: it would write an .npmrc with an empty _authToken and break OIDC
       - run: npm install -g npm@11.17.0 && npm --version   # trusted publishing needs ≥ 11.5.1; pinned on purpose, and `test` pins the same
       - name: take the binaries from this run, not from the mutable release
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { pattern: "binary-*", merge-multiple: true, path: /tmp/dist }
       - name: npm publish gate
         id: gate
@@ -141,7 +141,7 @@ jobs:
       - name: assemble (and publish when gated on)
         env: { NPM_PUBLISH: "${{ steps.gate.outputs.publish == 'true' && '1' || '' }}" }
         run: scripts/npm-package.sh "${GITHUB_REF_NAME#v}" /tmp/dist /tmp/npm-out
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: npm-packages, path: /tmp/npm-out, retention-days: 14 }
   crates:
     # Gated on CARGO_REGISTRY_TOKEN (crates.io trusted publishing is not used here). Without
@@ -153,7 +153,7 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with: { toolchain: stable }
       - name: crates.io publish gate
         id: gate
@@ -192,12 +192,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: take the binaries from this run, not from the mutable release
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { pattern: "binary-*", merge-multiple: true, path: /tmp/dist }
       - run: python3 scripts/pypi-wheels.py "${GITHUB_REF_NAME#v}" /tmp/dist dist
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: wheels, path: dist, retention-days: 14 }
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with: { packages-dir: dist, verbose: true, skip-existing: true }
   brew:
     # Formula from the release digests, attached to the release and handed to `publish`, which
@@ -211,7 +211,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: take the digests from this run, not from the mutable release
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { pattern: "binary-*", merge-multiple: true, path: /tmp/dist }
       - env: { GH_TOKEN: "${{ github.token }}", SUMS_DIR: /tmp/dist }
         run: |
@@ -219,7 +219,7 @@ jobs:
           ruby -c tokenstash.rb
           cat tokenstash.rb
           gh release upload "$GITHUB_REF_NAME" tokenstash.rb --clobber
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: formula, path: tokenstash.rb, retention-days: 7 }
   publish:
     # Flip the draft to a real release only when everything that was supposed to run did.
@@ -241,7 +241,7 @@ jobs:
           echo "published $GITHUB_REF_NAME"
       - name: take the formula from this run, not from the mutable release
         if: needs.brew.result == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { name: formula, path: /tmp/formula }
       - name: push to the tap
         if: needs.brew.result == 'success'
